@@ -1,0 +1,14 @@
+[package]
+name = "snesmaker-validator"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+
+snesmaker-events = { path = "../snesmaker-events" }
+snesmaker-project = { path = "../snesmaker-project" }

@@ -1,0 +1,17 @@
+[package]
+name = "snesmaker-cli"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+camino.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+snesmaker-export = { path = "../snesmaker-export" }
+snesmaker-project = { path = "../snesmaker-project" }
+snesmaker-validator = { path = "../snesmaker-validator" }

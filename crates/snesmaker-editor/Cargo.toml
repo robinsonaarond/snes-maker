@@ -1,0 +1,16 @@
+[package]
+name = "snesmaker-editor"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+camino.workspace = true
+eframe.workspace = true
+egui.workspace = true
+
+snesmaker-export = { path = "../snesmaker-export" }
+snesmaker-project = { path = "../snesmaker-project" }
+snesmaker-validator = { path = "../snesmaker-validator" }

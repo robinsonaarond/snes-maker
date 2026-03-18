@@ -1,0 +1,36 @@
+[meta]
+name = "MegaMan Like Demo"
+slug = "megaman_like_demo"
+version = "0.1.0"
+default_genre = "SideScroller"
+
+[build]
+mapper = "LoRom"
+region = "Ntsc"
+rom_bank_count = 8
+output_dir = "build"
+
+[build.assembler]
+ca65_path = "ca65"
+ld65_path = "ld65"
+
+[editor]
+strict_mode = true
+show_budget_overlay = true
+preferred_emulator = "ares"
+
+[gameplay]
+entry_scene = "intro_stage"
+
+[[gameplay.physics_presets]]
+id = "megaman_like"
+family = "MegaManLike"
+gravity_fp = 72
+max_fall_speed_fp = 1024
+ground_accel_fp = 90
+air_accel_fp = 56
+max_run_speed_fp = 448
+jump_velocity_fp = -1050
+coyote_frames = 4
+jump_buffer_frames = 4
+ladder_speed_fp = 256

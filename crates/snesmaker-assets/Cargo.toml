@@ -1,0 +1,13 @@
+[package]
+name = "snesmaker-assets"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+camino.workspace = true
+image.workspace = true
+
+snesmaker-project = { path = "../snesmaker-project" }

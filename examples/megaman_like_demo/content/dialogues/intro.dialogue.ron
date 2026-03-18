@@ -1,0 +1,22 @@
+(
+    id: "intro",
+    opening_node: "greeting",
+    nodes: [
+        (
+            id: "greeting",
+            speaker: "Guide",
+            text: "This ROM now draws a real stage. Use Left and Right to pan across it.",
+            commands: [],
+            choices: [],
+            next: Some("hint"),
+        ),
+        (
+            id: "hint",
+            speaker: "Guide",
+            text: "The platforms, ladder, hazard stripes, and goal gate all come from the project data.",
+            commands: [],
+            choices: [],
+            next: None,
+        ),
+    ],
+)

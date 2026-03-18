@@ -1,0 +1,19 @@
+[package]
+name = "snesmaker-project"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+camino.workspace = true
+ron.workspace = true
+serde.workspace = true
+toml.workspace = true
+walkdir.workspace = true
+
+snesmaker-events = { path = "../snesmaker-events" }
+
+[dev-dependencies]
+tempfile.workspace = true

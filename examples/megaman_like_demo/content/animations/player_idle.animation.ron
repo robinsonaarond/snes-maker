@@ -1,0 +1,9 @@
+(
+    id: "player_idle",
+    frames: [
+        (
+            metasprite_id: "player_idle",
+            duration_frames: 12,
+        ),
+    ],
+)

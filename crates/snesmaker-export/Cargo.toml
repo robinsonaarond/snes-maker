@@ -1,0 +1,19 @@
+[package]
+name = "snesmaker-export"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+camino.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+snesmaker-platformer = { path = "../snesmaker-platformer" }
+snesmaker-project = { path = "../snesmaker-project" }
+snesmaker-validator = { path = "../snesmaker-validator" }
+
+[dev-dependencies]
+tempfile.workspace = true
