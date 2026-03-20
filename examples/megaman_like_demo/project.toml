@@ -34,3 +34,8 @@ jump_velocity_fp = -1050
 coyote_frames = 4
 jump_buffer_frames = 4
 ladder_speed_fp = 256
+
+[gameplay.player]
+max_health = 6
+starting_health = 2
+health_hud = "CellsTopCenter"

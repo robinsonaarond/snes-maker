@@ -1,25 +1,34 @@
 use std::fs;
 use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 use camino::{Utf8Path, Utf8PathBuf};
 use serde::{Deserialize, Serialize};
 use snesmaker_platformer::PlatformerGenreModule;
 use snesmaker_project::{
-    AnimationResource, CompiledScene, GenreModule, MetaspriteResource, PaletteResource,
-    ProjectBundle, SceneResource, Tile8, TileLayer, TilesetResource,
+    AnimationResource, CompiledScene, EntityAction, EntityKind, GenreModule, HealthHudStyle,
+    MetaspriteResource, MovementPattern, PaletteResource, ProjectBundle, SceneResource, Tile8,
+    TileLayer, TilesetResource,
 };
 use snesmaker_validator::{ValidationReport, validate_project};
 
 const DISPLAY_MAP_WIDTH_TILES: usize = 64;
 const DISPLAY_MAP_HEIGHT_TILES: usize = 32;
 const VISIBLE_SCREEN_WIDTH_TILES: usize = 32;
+const ENTITY_RUNTIME_BYTES: usize = 24;
+const ACTION_NONE: u8 = 0;
+const ACTION_HEAL_PLAYER: u8 = 1;
+const ACTION_SET_ENTITY_ACTIVE: u8 = 2;
+const MOVEMENT_NONE: u8 = 0;
+const MOVEMENT_PATROL: u8 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BuildOutcome {
     pub project_root: Utf8PathBuf,
     pub build_dir: Utf8PathBuf,
     pub rom_path: Utf8PathBuf,
+    pub stable_rom_path: Option<Utf8PathBuf>,
     pub report_path: Utf8PathBuf,
     pub rom_built: bool,
     pub validation: ValidationReport,
@@ -55,20 +64,34 @@ pub fn build_rom(
 
     let validation = validate_project(&bundle);
     let compiled_scenes = compile_scenes(&bundle)?;
-    let rom_path = build_dir.join(format!("{}.sfc", bundle.manifest.meta.slug));
+    let stable_rom_path = build_dir.join(format!("{}.sfc", bundle.manifest.meta.slug));
+    let linked_rom_path = build_dir.join(format!("{}.build.sfc", bundle.manifest.meta.slug));
     let report_path = build_dir.join("build-report.json");
 
     stage_runtime_files(&build_dir)?;
     write_generated_header(&build_dir, &bundle)?;
     write_generated_project_data(&build_dir, &bundle, &compiled_scenes)?;
 
-    let assembler_status = maybe_assemble_rom(&bundle, &build_dir, &rom_path)?;
+    let assembler_status = maybe_assemble_rom(&bundle, &build_dir, &linked_rom_path)?;
+    let rom_built =
+        assembler_status.ca65_found && assembler_status.ld65_found && linked_rom_path.exists();
+    let rom_path = if rom_built {
+        finalize_rom_artifacts(
+            &build_dir,
+            &bundle.manifest.meta.slug,
+            &linked_rom_path,
+            &stable_rom_path,
+        )?
+    } else {
+        stable_rom_path.clone()
+    };
     let outcome = BuildOutcome {
         project_root: project_root.to_owned(),
         build_dir: build_dir.clone(),
         rom_path: rom_path.clone(),
+        stable_rom_path: rom_built.then_some(stable_rom_path.clone()),
         report_path: report_path.clone(),
-        rom_built: assembler_status.ca65_found && assembler_status.ld65_found && rom_path.exists(),
+        rom_built,
         validation: validation.clone(),
         assembler_status,
         compiled_scenes: compiled_scenes
@@ -260,6 +283,24 @@ fn write_generated_project_data(
         &player_assets.obj_tile_bytes,
     ));
     text.push_str(&format!(
+        "PROJECT_VISUAL_HEADER_BYTE_LEN = {}\n",
+        player_assets.visual_header_bytes.len()
+    ));
+    text.push_str("PROJECT_VISUAL_HEADERS:\n");
+    text.push_str(&format_byte_directive(
+        "    .byte ",
+        &player_assets.visual_header_bytes,
+    ));
+    text.push_str(&format!(
+        "PROJECT_VISUAL_PIECE_BYTE_LEN = {}\n",
+        player_assets.visual_piece_bytes.len()
+    ));
+    text.push_str("PROJECT_VISUAL_PIECES:\n");
+    text.push_str(&format_byte_directive(
+        "    .byte ",
+        &player_assets.visual_piece_bytes,
+    ));
+    text.push_str(&format!(
         "PROJECT_PLAYER_START_X = {}\n",
         player_assets.start_x
     ));
@@ -280,12 +321,65 @@ fn write_generated_project_data(
         player_assets.player_max_x
     ));
     text.push_str(&format!(
-        "PROJECT_PLAYER_BASE_TILE = ${:02X}\n",
-        player_assets.player_base_tile
+        "PROJECT_PLAYER_VISUAL = ${:02X}\n",
+        player_assets.player_visual
     ));
     text.push_str(&format!(
-        "PROJECT_BULLET_TILE = ${:02X}\n",
-        player_assets.bullet_tile
+        "PROJECT_PLAYER_ALT_VISUAL = ${:02X}\n",
+        player_assets.player_alt_visual
+    ));
+    text.push_str(&format!(
+        "PROJECT_BULLET_VISUAL = ${:02X}\n",
+        player_assets.bullet_visual
+    ));
+    text.push_str(&format!(
+        "PROJECT_HUD_PIP_FULL_VISUAL = ${:02X}\n",
+        player_assets.hud_pip_full_visual
+    ));
+    text.push_str(&format!(
+        "PROJECT_HUD_PIP_EMPTY_VISUAL = ${:02X}\n",
+        player_assets.hud_pip_empty_visual
+    ));
+    text.push_str(&format!(
+        "PROJECT_HUD_HEART_FULL_VISUAL = ${:02X}\n",
+        player_assets.hud_heart_full_visual
+    ));
+    text.push_str(&format!(
+        "PROJECT_HUD_HEART_EMPTY_VISUAL = ${:02X}\n",
+        player_assets.hud_heart_empty_visual
+    ));
+    text.push_str(&format!(
+        "PROJECT_HUD_CELL_FULL_VISUAL = ${:02X}\n",
+        player_assets.hud_cell_full_visual
+    ));
+    text.push_str(&format!(
+        "PROJECT_HUD_CELL_EMPTY_VISUAL = ${:02X}\n",
+        player_assets.hud_cell_empty_visual
+    ));
+    text.push_str(&format!(
+        "PROJECT_PLAYER_MAX_HEALTH = {}\n",
+        player_assets.player_max_health
+    ));
+    text.push_str(&format!(
+        "PROJECT_PLAYER_STARTING_HEALTH = {}\n",
+        player_assets.player_starting_health
+    ));
+    text.push_str(&format!(
+        "PROJECT_HEALTH_HUD_STYLE = {}\n",
+        player_assets.hud_style
+    ));
+    text.push_str(&format!(
+        "PROJECT_ENTITY_COUNT = {}\n",
+        player_assets.entity_count
+    ));
+    text.push_str(&format!(
+        "PROJECT_ENTITY_BYTE_LEN = {}\n",
+        player_assets.entity_bytes.len()
+    ));
+    text.push_str("PROJECT_ENTITY_BYTES:\n");
+    text.push_str(&format_byte_directive(
+        "    .byte ",
+        &player_assets.entity_bytes,
     ));
 
     for (index, scene) in compiled_scenes.iter().enumerate() {
@@ -426,7 +520,7 @@ fn format_byte_directive(prefix: &str, bytes: &[u8]) -> String {
     text
 }
 
-fn patch_lorom_checksum(rom_path: &Utf8Path) -> Result<()> {
+fn patch_lorom_checksum(rom_path: &Utf8Path) -> Result<u16> {
     let mut rom = fs::read(rom_path).with_context(|| format!("failed to read ROM {}", rom_path))?;
     if rom.len() < 0x8000 {
         bail!("ROM {} is too small to contain a LoROM header", rom_path);
@@ -449,6 +543,90 @@ fn patch_lorom_checksum(rom_path: &Utf8Path) -> Result<()> {
     rom[checksum_offset..checksum_offset + 2].copy_from_slice(&checksum.to_le_bytes());
 
     fs::write(rom_path, rom).with_context(|| format!("failed to write ROM {}", rom_path))?;
+    Ok(checksum)
+}
+
+fn finalize_rom_artifacts(
+    build_dir: &Utf8Path,
+    slug: &str,
+    linked_rom_path: &Utf8Path,
+    stable_rom_path: &Utf8Path,
+) -> Result<Utf8PathBuf> {
+    let checksum = read_lorom_checksum(linked_rom_path)?;
+    let build_stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is set before the Unix epoch")?
+        .as_millis();
+    let versioned_rom_path = build_dir.join(format!("{slug}-{build_stamp}-{checksum:04X}.sfc"));
+
+    purge_old_versioned_roms(build_dir, slug, stable_rom_path, &versioned_rom_path)?;
+
+    if versioned_rom_path.exists() {
+        fs::remove_file(&versioned_rom_path).with_context(|| {
+            format!(
+                "failed to remove stale versioned ROM {}",
+                versioned_rom_path
+            )
+        })?;
+    }
+    if stable_rom_path.exists() {
+        fs::remove_file(stable_rom_path)
+            .with_context(|| format!("failed to remove stale ROM {}", stable_rom_path))?;
+    }
+
+    fs::rename(linked_rom_path, &versioned_rom_path).with_context(|| {
+        format!(
+            "failed to move linked ROM {} to {}",
+            linked_rom_path, versioned_rom_path
+        )
+    })?;
+    fs::copy(&versioned_rom_path, stable_rom_path).with_context(|| {
+        format!(
+            "failed to copy versioned ROM {} to {}",
+            versioned_rom_path, stable_rom_path
+        )
+    })?;
+
+    Ok(versioned_rom_path)
+}
+
+fn read_lorom_checksum(rom_path: &Utf8Path) -> Result<u16> {
+    let rom = fs::read(rom_path).with_context(|| format!("failed to read ROM {}", rom_path))?;
+    if rom.len() < 0x7FE0 {
+        bail!("ROM {} is too small to contain a LoROM checksum", rom_path);
+    }
+
+    Ok(u16::from_le_bytes([rom[0x7FDE], rom[0x7FDF]]))
+}
+
+fn purge_old_versioned_roms(
+    build_dir: &Utf8Path,
+    slug: &str,
+    stable_rom_path: &Utf8Path,
+    keep_path: &Utf8Path,
+) -> Result<()> {
+    for entry in fs::read_dir(build_dir)
+        .with_context(|| format!("failed to read build directory {}", build_dir))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        let Ok(path) = Utf8PathBuf::from_path_buf(path) else {
+            continue;
+        };
+        if path == stable_rom_path || path == keep_path {
+            continue;
+        }
+        let Some(file_name) = path.file_name() else {
+            continue;
+        };
+        if !file_name.starts_with(slug) || !file_name.ends_with(".sfc") || !file_name.contains('-')
+        {
+            continue;
+        }
+        fs::remove_file(&path)
+            .with_context(|| format!("failed to remove stale versioned ROM {}", path))?;
+    }
+
     Ok(())
 }
 
@@ -466,13 +644,41 @@ struct BgAssets {
 struct PlayerAssets {
     obj_palette_bytes: Vec<u8>,
     obj_tile_bytes: Vec<u8>,
-    player_base_tile: u8,
-    bullet_tile: u8,
+    visual_header_bytes: Vec<u8>,
+    visual_piece_bytes: Vec<u8>,
+    player_visual: u8,
+    player_alt_visual: u8,
+    bullet_visual: u8,
+    hud_pip_full_visual: u8,
+    hud_pip_empty_visual: u8,
+    hud_heart_full_visual: u8,
+    hud_heart_empty_visual: u8,
+    hud_cell_full_visual: u8,
+    hud_cell_empty_visual: u8,
+    hud_style: u8,
+    player_max_health: u8,
+    player_starting_health: u8,
+    entity_bytes: Vec<u8>,
+    entity_count: u8,
     start_x: usize,
     start_y: usize,
     ground_y: usize,
     world_width_pixels: usize,
     player_max_x: usize,
+}
+
+#[derive(Debug, Clone)]
+struct RuntimeVisualBuild {
+    pieces: Vec<RuntimeVisualPieceBuild>,
+    width_pixels: u8,
+}
+
+#[derive(Debug, Clone)]
+struct RuntimeVisualPieceBuild {
+    tile: Tile8,
+    x: i8,
+    y: i8,
+    attr: u8,
 }
 
 fn build_bg_assets(bundle: &ProjectBundle) -> Result<BgAssets> {
@@ -532,6 +738,13 @@ fn build_player_assets(bundle: &ProjectBundle) -> Result<PlayerAssets> {
                 bundle.manifest.gameplay.entry_scene
             )
         })?;
+    if scene.entities.len() > 16 {
+        bail!(
+            "scene '{}' has {} entities but the current runtime supports at most 16",
+            scene.id,
+            scene.entities.len()
+        );
+    }
     let spawn = scene
         .spawns
         .first()
@@ -541,7 +754,9 @@ fn build_player_assets(bundle: &ProjectBundle) -> Result<PlayerAssets> {
         .frames
         .first()
         .ok_or_else(|| anyhow!("animation '{}' has no frames", player_animation.id))?;
+    let alt_frame = player_animation.frames.get(1).unwrap_or(frame);
     let player_sprite = find_metasprite(bundle, &frame.metasprite_id)?;
+    let alt_player_sprite = find_metasprite(bundle, &alt_frame.metasprite_id)?;
     let shot_sprite = find_metasprite(bundle, "player_shot")?;
     let player_palette = bundle.palette(&player_sprite.palette_id).ok_or_else(|| {
         anyhow!(
@@ -550,55 +765,161 @@ fn build_player_assets(bundle: &ProjectBundle) -> Result<PlayerAssets> {
             player_sprite.palette_id
         )
     })?;
-    let source_tileset = find_tileset_for_sprites(bundle, player_sprite, shot_sprite)?;
-
-    let mut player_pieces = player_sprite.pieces.clone();
-    player_pieces.sort_by_key(|piece| (piece.y, piece.x));
-    if player_pieces.len() != 4 {
-        bail!(
-            "player metasprite '{}' must contain exactly 4 pieces for the demo runtime",
-            player_sprite.id
-        );
-    }
-    let expected_positions = [(0_i16, 0_i16), (8, 0), (0, 8), (8, 8)];
-    for (piece, (expected_x, expected_y)) in player_pieces.iter().zip(expected_positions) {
-        if piece.x != expected_x || piece.y != expected_y {
-            bail!(
-                "player metasprite '{}' must use a 2x2 8x8 layout at (0,0), (8,0), (0,8), (8,8)",
-                player_sprite.id
-            );
+    let runtime_palette_id = player_palette.id.as_str();
+    let mut runtime_tiles = vec![Tile8 {
+        pixels: vec![0; 64],
+    }];
+    let mut visual_header_bytes = Vec::new();
+    let mut visual_piece_bytes = Vec::new();
+    let mut append_visual = |visual: RuntimeVisualBuild| -> Result<u8> {
+        let visual_index = (visual_header_bytes.len() / 3) as u8;
+        let piece_start = (visual_piece_bytes.len() / 4) as u8;
+        visual_header_bytes.push(piece_start);
+        visual_header_bytes.push(visual.pieces.len() as u8);
+        visual_header_bytes.push(visual.width_pixels.max(8));
+        for piece in visual.pieces {
+            let tile_index = runtime_tiles.len();
+            if tile_index > u8::MAX as usize {
+                bail!("runtime OBJ tile count exceeded 255 tiles");
+            }
+            runtime_tiles.push(piece.tile);
+            visual_piece_bytes.push(tile_index as u8);
+            visual_piece_bytes.push(piece.x as u8);
+            visual_piece_bytes.push(piece.y as u8);
+            visual_piece_bytes.push(piece.attr);
         }
-        if piece.h_flip || piece.v_flip {
-            bail!(
-                "player metasprite '{}' pieces cannot use tile flips in the demo OBJ exporter",
-                player_sprite.id
-            );
+        Ok(visual_index)
+    };
+
+    let player_visual = append_visual(build_visual_from_metasprite(
+        bundle,
+        player_sprite,
+        runtime_palette_id,
+    )?)?;
+    let player_alt_visual = append_visual(build_visual_from_metasprite(
+        bundle,
+        alt_player_sprite,
+        runtime_palette_id,
+    )?)?;
+    let bullet_visual = append_visual(build_visual_from_metasprite(
+        bundle,
+        shot_sprite,
+        runtime_palette_id,
+    )?)?;
+
+    let mut entity_visuals = std::collections::BTreeMap::new();
+    for entity in &scene.entities {
+        if entity_visuals.contains_key(entity.archetype.as_str()) {
+            continue;
         }
+        let metasprite = resolve_archetype_metasprite(bundle, &entity.archetype)?;
+        let visual_index = append_visual(build_visual_from_metasprite(
+            bundle,
+            metasprite,
+            runtime_palette_id,
+        )?)?;
+        entity_visuals.insert(entity.archetype.clone(), visual_index);
     }
 
-    let bullet_piece = shot_sprite
-        .pieces
-        .first()
-        .ok_or_else(|| anyhow!("metasprite '{}' has no pieces", shot_sprite.id))?;
-    if bullet_piece.h_flip || bullet_piece.v_flip {
-        bail!(
-            "metasprite '{}' cannot use tile flips in the demo OBJ exporter",
-            shot_sprite.id
-        );
-    }
-    let obj_tile_bytes = encode_obj_tiles(source_tileset, &player_pieces, bullet_piece.tile_index)?;
+    let hud_pip_full_visual = append_visual(build_single_tile_visual(hud_pip_tile(true)))?;
+    let hud_pip_empty_visual = append_visual(build_single_tile_visual(hud_pip_tile(false)))?;
+    let hud_heart_full_visual = append_visual(build_single_tile_visual(hud_heart_tile(true)))?;
+    let hud_heart_empty_visual = append_visual(build_single_tile_visual(hud_heart_tile(false)))?;
+    let hud_cell_full_visual = append_visual(build_single_tile_visual(hud_cell_tile(true)))?;
+    let hud_cell_empty_visual = append_visual(build_single_tile_visual(hud_cell_tile(false)))?;
+
+    let obj_tileset = TilesetResource {
+        id: "generated_runtime_obj_tiles".to_string(),
+        palette_id: player_palette.id.clone(),
+        name: "Generated Runtime OBJ Tiles".to_string(),
+        tiles: runtime_tiles,
+    };
+    let obj_tile_bytes = encode_4bpp_tiles(&obj_tileset)?;
 
     let world_width_pixels = DISPLAY_MAP_WIDTH_TILES * 8;
     let scaled_x = scale_scene_x(scene, spawn.position.x);
     let scaled_y = scale_scene_y(scene, spawn.position.y);
     let ground_y = scaled_y.saturating_sub(16);
     let start_y = ground_y;
+    let entity_index_by_id = scene
+        .entities
+        .iter()
+        .enumerate()
+        .map(|(index, entity)| (entity.id.as_str(), index as u8))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let mut entity_bytes = Vec::with_capacity(scene.entities.len() * ENTITY_RUNTIME_BYTES);
+    for entity in &scene.entities {
+        let visual_index = *entity_visuals
+            .get(entity.archetype.as_str())
+            .ok_or_else(|| anyhow!("missing runtime visual for entity '{}'", entity.id))?;
+        let action = encode_entity_action(entity, &entity_index_by_id)?;
+        let (movement_kind, movement_speed, patrol_min_x, patrol_max_x) =
+            encode_entity_movement(scene, entity);
+        let scaled_hitbox_x = scale_scene_delta_x(scene, entity.hitbox.x) as i8;
+        let scaled_hitbox_y = scale_scene_delta_y(scene, entity.hitbox.y) as i8;
+        let scaled_hitbox_w = scale_scene_width(scene, entity.hitbox.width).max(1) as u8;
+        let scaled_hitbox_h = scale_scene_height(scene, entity.hitbox.height).max(1) as u8;
+        let scaled_entity_x = scale_scene_x(scene, entity.position.x) as u16;
+        let scaled_entity_y = scale_scene_y(scene, entity.position.y) as u16;
+        let flags = (u8::from(entity.active)) | (u8::from(entity.one_shot) << 1);
+
+        entity_bytes.push(match entity.kind {
+            EntityKind::Prop => 0,
+            EntityKind::Pickup => 1,
+            EntityKind::Enemy => 2,
+            EntityKind::Switch => 3,
+            EntityKind::Solid => 4,
+        });
+        entity_bytes.push(flags);
+        entity_bytes.push(visual_index);
+        entity_bytes.push(match entity.facing {
+            snesmaker_project::Facing::Right => 0,
+            snesmaker_project::Facing::Left => 1,
+        });
+        entity_bytes.push(scaled_hitbox_x as u8);
+        entity_bytes.push(scaled_hitbox_y as u8);
+        entity_bytes.push(scaled_hitbox_w);
+        entity_bytes.push(scaled_hitbox_h);
+        entity_bytes.push(entity.combat.contact_damage);
+        entity_bytes.push(entity.combat.max_health);
+        entity_bytes.push(action.0);
+        entity_bytes.push(action.1);
+        entity_bytes.push(action.2);
+        entity_bytes.push(movement_kind);
+        entity_bytes.push(movement_speed);
+        entity_bytes.push(0);
+        entity_bytes.extend(scaled_entity_x.to_le_bytes());
+        entity_bytes.extend(scaled_entity_y.to_le_bytes());
+        entity_bytes.extend(patrol_min_x.to_le_bytes());
+        entity_bytes.extend(patrol_max_x.to_le_bytes());
+    }
+    let player_settings = &bundle.manifest.gameplay.player;
 
     Ok(PlayerAssets {
         obj_palette_bytes: encode_obj_palette_bytes(player_palette),
         obj_tile_bytes,
-        player_base_tile: 0,
-        bullet_tile: 2,
+        visual_header_bytes,
+        visual_piece_bytes,
+        player_visual,
+        player_alt_visual,
+        bullet_visual,
+        hud_pip_full_visual,
+        hud_pip_empty_visual,
+        hud_heart_full_visual,
+        hud_heart_empty_visual,
+        hud_cell_full_visual,
+        hud_cell_empty_visual,
+        hud_style: match player_settings.health_hud {
+            HealthHudStyle::MegaPipsTopLeft => 0,
+            HealthHudStyle::HeartsTopRight => 1,
+            HealthHudStyle::CellsTopCenter => 2,
+        },
+        player_max_health: player_settings.max_health,
+        player_starting_health: player_settings
+            .starting_health
+            .min(player_settings.max_health),
+        entity_bytes,
+        entity_count: scene.entities.len() as u8,
         start_x: scaled_x,
         start_y,
         ground_y,
@@ -714,44 +1035,73 @@ fn encode_4bpp_tiles(tileset: &TilesetResource) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn encode_obj_tiles(
-    source_tileset: &TilesetResource,
-    player_pieces: &[snesmaker_project::SpriteTileRef],
-    bullet_tile_index: u16,
-) -> Result<Vec<u8>> {
-    let blank_tile = Tile8 {
-        pixels: vec![0; 64],
-    };
-    let mut obj_tiles = vec![blank_tile.clone(); 18];
+fn build_visual_from_metasprite(
+    bundle: &ProjectBundle,
+    metasprite: &MetaspriteResource,
+    expected_palette_id: &str,
+) -> Result<RuntimeVisualBuild> {
+    if metasprite.palette_id != expected_palette_id {
+        bail!(
+            "metasprite '{}' uses palette '{}' but the runtime expects palette '{}'",
+            metasprite.id,
+            metasprite.palette_id,
+            expected_palette_id
+        );
+    }
 
-    let tile_at = |index: u16| -> Result<Tile8> {
-        source_tileset
+    let tileset = find_tileset_for_metasprite(bundle, metasprite)?;
+    let width_pixels = metasprite
+        .pieces
+        .iter()
+        .map(|piece| (piece.x + 8).max(8))
+        .max()
+        .unwrap_or(8)
+        .clamp(8, 64) as u8;
+    let mut pieces = Vec::with_capacity(metasprite.pieces.len());
+    for piece in &metasprite.pieces {
+        let tile = tileset
             .tiles
-            .get(index as usize)
+            .get(piece.tile_index as usize)
             .cloned()
             .ok_or_else(|| {
                 anyhow!(
-                    "tileset '{}' is missing tile {} for OBJ export",
-                    source_tileset.id,
-                    index
+                    "tileset '{}' is missing tile {} for metasprite '{}'",
+                    tileset.id,
+                    piece.tile_index,
+                    metasprite.id
                 )
-            })
-    };
+            })?;
+        let mut attr = 0x30;
+        if piece.h_flip {
+            attr |= 0x40;
+        }
+        if piece.v_flip {
+            attr |= 0x80;
+        }
+        pieces.push(RuntimeVisualPieceBuild {
+            tile,
+            x: piece.x as i8,
+            y: piece.y as i8,
+            attr,
+        });
+    }
 
-    obj_tiles[0] = tile_at(player_pieces[0].tile_index)?;
-    obj_tiles[1] = tile_at(player_pieces[1].tile_index)?;
-    obj_tiles[2] = tile_at(bullet_tile_index)?;
-    obj_tiles[16] = tile_at(player_pieces[2].tile_index)?;
-    obj_tiles[17] = tile_at(player_pieces[3].tile_index)?;
+    Ok(RuntimeVisualBuild {
+        pieces,
+        width_pixels,
+    })
+}
 
-    let obj_tileset = TilesetResource {
-        id: "generated_obj_tiles".to_string(),
-        palette_id: source_tileset.palette_id.clone(),
-        name: "Generated OBJ Tiles".to_string(),
-        tiles: obj_tiles,
-    };
-
-    encode_4bpp_tiles(&obj_tileset)
+fn build_single_tile_visual(tile: Tile8) -> RuntimeVisualBuild {
+    RuntimeVisualBuild {
+        pieces: vec![RuntimeVisualPieceBuild {
+            tile,
+            x: 0,
+            y: 0,
+            attr: 0x30,
+        }],
+        width_pixels: 8,
+    }
 }
 
 fn build_display_tilemap(
@@ -809,6 +1159,26 @@ fn scale_scene_y(scene: &SceneResource, y: i16) -> usize {
     ((y.max(0) as usize) * DISPLAY_MAP_HEIGHT_TILES * 8) / source_height_pixels
 }
 
+fn scale_scene_delta_x(scene: &SceneResource, x: i16) -> i16 {
+    let source_width_pixels = (scene.size_tiles.width as i32).saturating_mul(8).max(1);
+    (((x as i32) * (DISPLAY_MAP_WIDTH_TILES as i32) * 8) / source_width_pixels) as i16
+}
+
+fn scale_scene_delta_y(scene: &SceneResource, y: i16) -> i16 {
+    let source_height_pixels = (scene.size_tiles.height as i32).saturating_mul(8).max(1);
+    (((y as i32) * (DISPLAY_MAP_HEIGHT_TILES as i32) * 8) / source_height_pixels) as i16
+}
+
+fn scale_scene_width(scene: &SceneResource, width: u16) -> u16 {
+    let source_width_pixels = (scene.size_tiles.width as usize).saturating_mul(8).max(1);
+    (((width as usize) * DISPLAY_MAP_WIDTH_TILES * 8) / source_width_pixels).max(1) as u16
+}
+
+fn scale_scene_height(scene: &SceneResource, height: u16) -> u16 {
+    let source_height_pixels = (scene.size_tiles.height as usize).saturating_mul(8).max(1);
+    (((height as usize) * DISPLAY_MAP_HEIGHT_TILES * 8) / source_height_pixels).max(1) as u16
+}
+
 fn find_animation<'a>(bundle: &'a ProjectBundle, id: &str) -> Result<&'a AnimationResource> {
     bundle
         .animations
@@ -825,23 +1195,28 @@ fn find_metasprite<'a>(bundle: &'a ProjectBundle, id: &str) -> Result<&'a Metasp
         .ok_or_else(|| anyhow!("metasprite '{}' is missing", id))
 }
 
-fn find_tileset_for_sprites<'a>(
+fn resolve_archetype_metasprite<'a>(
     bundle: &'a ProjectBundle,
-    player_sprite: &MetaspriteResource,
-    shot_sprite: &MetaspriteResource,
-) -> Result<&'a TilesetResource> {
-    if player_sprite.palette_id != shot_sprite.palette_id {
-        bail!(
-            "player metasprite '{}' and shot metasprite '{}' must share one palette for the demo runtime",
-            player_sprite.id,
-            shot_sprite.id
-        );
+    archetype: &str,
+) -> Result<&'a MetaspriteResource> {
+    if let Some(animation) = bundle.animation(archetype) {
+        let frame = animation
+            .frames
+            .first()
+            .ok_or_else(|| anyhow!("animation '{}' has no frames", animation.id))?;
+        return find_metasprite(bundle, &frame.metasprite_id);
     }
 
-    let max_tile_index = player_sprite
+    find_metasprite(bundle, archetype)
+}
+
+fn find_tileset_for_metasprite<'a>(
+    bundle: &'a ProjectBundle,
+    metasprite: &MetaspriteResource,
+) -> Result<&'a TilesetResource> {
+    let max_tile_index = metasprite
         .pieces
         .iter()
-        .chain(shot_sprite.pieces.iter())
         .map(|piece| piece.tile_index)
         .max()
         .unwrap_or(0) as usize;
@@ -850,15 +1225,150 @@ fn find_tileset_for_sprites<'a>(
         .tilesets
         .iter()
         .find(|tileset| {
-            tileset.palette_id == player_sprite.palette_id && tileset.tiles.len() > max_tile_index
+            tileset.palette_id == metasprite.palette_id && tileset.tiles.len() > max_tile_index
         })
         .ok_or_else(|| {
             anyhow!(
-                "no tileset with palette '{}' contains the player/shot tiles up to index {}",
-                player_sprite.palette_id,
+                "no tileset with palette '{}' contains metasprite '{}' up to tile {}",
+                metasprite.palette_id,
+                metasprite.id,
                 max_tile_index
             )
         })
+}
+
+fn encode_entity_action(
+    entity: &snesmaker_project::EntityPlacement,
+    entity_index_by_id: &std::collections::BTreeMap<&str, u8>,
+) -> Result<(u8, u8, u8)> {
+    match &entity.action {
+        EntityAction::None => Ok((ACTION_NONE, 0, u8::MAX)),
+        EntityAction::HealPlayer { amount } => Ok((ACTION_HEAL_PLAYER, *amount, u8::MAX)),
+        EntityAction::SetEntityActive {
+            target_entity_id,
+            active,
+        } => Ok((
+            ACTION_SET_ENTITY_ACTIVE,
+            u8::from(*active),
+            *entity_index_by_id
+                .get(target_entity_id.as_str())
+                .ok_or_else(|| {
+                    anyhow!(
+                        "entity '{}' references unknown target entity '{}'",
+                        entity.id,
+                        target_entity_id
+                    )
+                })?,
+        )),
+    }
+}
+
+fn encode_entity_movement(
+    scene: &SceneResource,
+    entity: &snesmaker_project::EntityPlacement,
+) -> (u8, u8, u16, u16) {
+    match entity.movement {
+        MovementPattern::None => {
+            let x = scale_scene_x(scene, entity.position.x) as u16;
+            (MOVEMENT_NONE, 0, x, x)
+        }
+        MovementPattern::Patrol {
+            left_offset,
+            right_offset,
+            speed,
+        } => {
+            let base_x = scale_scene_x(scene, entity.position.x) as i32;
+            let left = base_x + scale_scene_delta_x(scene, left_offset) as i32;
+            let right = base_x + scale_scene_delta_x(scene, right_offset) as i32;
+            let min_x = left.min(right).max(0) as u16;
+            let max_x = left.max(right).max(0) as u16;
+            (MOVEMENT_PATROL, speed.max(1), min_x, max_x)
+        }
+    }
+}
+
+fn hud_pip_tile(filled: bool) -> Tile8 {
+    tile_from_rows(if filled {
+        &[
+            [0, 0, 0, 0, 0, 0, 0, 0],
+            [0, 6, 6, 6, 6, 6, 6, 0],
+            [0, 6, 2, 2, 2, 2, 6, 0],
+            [0, 6, 2, 6, 6, 2, 6, 0],
+            [0, 6, 2, 6, 6, 2, 6, 0],
+            [0, 6, 2, 2, 2, 2, 6, 0],
+            [0, 6, 6, 6, 6, 6, 6, 0],
+            [0, 0, 0, 0, 0, 0, 0, 0],
+        ]
+    } else {
+        &[
+            [0, 0, 0, 0, 0, 0, 0, 0],
+            [0, 3, 3, 3, 3, 3, 3, 0],
+            [0, 3, 0, 0, 0, 0, 3, 0],
+            [0, 3, 0, 0, 0, 0, 3, 0],
+            [0, 3, 0, 0, 0, 0, 3, 0],
+            [0, 3, 0, 0, 0, 0, 3, 0],
+            [0, 3, 3, 3, 3, 3, 3, 0],
+            [0, 0, 0, 0, 0, 0, 0, 0],
+        ]
+    })
+}
+
+fn hud_heart_tile(filled: bool) -> Tile8 {
+    tile_from_rows(if filled {
+        &[
+            [0, 7, 7, 0, 0, 7, 7, 0],
+            [7, 7, 7, 7, 7, 7, 7, 7],
+            [7, 2, 7, 7, 7, 7, 2, 7],
+            [7, 7, 7, 7, 7, 7, 7, 7],
+            [0, 7, 7, 7, 7, 7, 7, 0],
+            [0, 0, 7, 7, 7, 7, 0, 0],
+            [0, 0, 0, 7, 7, 0, 0, 0],
+            [0, 0, 0, 0, 0, 0, 0, 0],
+        ]
+    } else {
+        &[
+            [0, 3, 3, 0, 0, 3, 3, 0],
+            [3, 0, 0, 3, 3, 0, 0, 3],
+            [3, 0, 0, 0, 0, 0, 0, 3],
+            [0, 3, 0, 0, 0, 0, 3, 0],
+            [0, 0, 3, 0, 0, 3, 0, 0],
+            [0, 0, 0, 3, 3, 0, 0, 0],
+            [0, 0, 0, 0, 0, 0, 0, 0],
+            [0, 0, 0, 0, 0, 0, 0, 0],
+        ]
+    })
+}
+
+fn hud_cell_tile(filled: bool) -> Tile8 {
+    tile_from_rows(if filled {
+        &[
+            [0, 0, 1, 1, 1, 1, 0, 0],
+            [0, 1, 2, 2, 2, 2, 1, 0],
+            [1, 2, 2, 2, 2, 2, 2, 1],
+            [1, 2, 1, 1, 1, 1, 2, 1],
+            [1, 2, 1, 1, 1, 1, 2, 1],
+            [1, 2, 2, 2, 2, 2, 2, 1],
+            [0, 1, 2, 2, 2, 2, 1, 0],
+            [0, 0, 1, 1, 1, 1, 0, 0],
+        ]
+    } else {
+        &[
+            [0, 0, 3, 3, 3, 3, 0, 0],
+            [0, 3, 0, 0, 0, 0, 3, 0],
+            [3, 0, 0, 0, 0, 0, 0, 3],
+            [3, 0, 0, 0, 0, 0, 0, 3],
+            [3, 0, 0, 0, 0, 0, 0, 3],
+            [3, 0, 0, 0, 0, 0, 0, 3],
+            [0, 3, 0, 0, 0, 0, 3, 0],
+            [0, 0, 3, 3, 3, 3, 0, 0],
+        ]
+    })
+}
+
+fn tile_from_rows(rows: &[[u8; 8]; 8]) -> Tile8 {
+    Tile8 {
+        pixels: rows.iter().flat_map(|row| row.iter().copied()).collect(),
+    }
 }
 
 fn snes_color(r: u8, g: u8, b: u8) -> u16 {
@@ -911,10 +1421,44 @@ mod tests {
         rom[1] = 2;
         std::fs::write(&rom_path, rom).expect("write rom");
 
-        patch_lorom_checksum(&rom_path).expect("patch checksum");
+        let checksum = patch_lorom_checksum(&rom_path).expect("patch checksum");
         let patched = std::fs::read(&rom_path).expect("read rom");
         let complement = u16::from_le_bytes([patched[0x7FDC], patched[0x7FDD]]);
-        let checksum = u16::from_le_bytes([patched[0x7FDE], patched[0x7FDF]]);
-        assert_eq!(checksum ^ complement, 0xFFFF);
+        let stored_checksum = u16::from_le_bytes([patched[0x7FDE], patched[0x7FDF]]);
+        assert_eq!(checksum, stored_checksum);
+        assert_eq!(stored_checksum ^ complement, 0xFFFF);
+    }
+
+    #[test]
+    fn finalizes_rom_into_versioned_and_stable_artifacts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let build_dir =
+            camino::Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("utf8 build dir");
+        let linked_rom_path = build_dir.join("demo.build.sfc");
+        let stable_rom_path = build_dir.join("demo.sfc");
+        let mut rom = vec![0_u8; 0x8000];
+        rom[0] = 7;
+        rom[1] = 9;
+        std::fs::write(&linked_rom_path, rom).expect("write linked rom");
+        patch_lorom_checksum(&linked_rom_path).expect("patch checksum");
+
+        let versioned_rom_path =
+            finalize_rom_artifacts(&build_dir, "demo", &linked_rom_path, &stable_rom_path)
+                .expect("finalize rom");
+
+        assert!(versioned_rom_path.exists());
+        assert!(stable_rom_path.exists());
+        assert_ne!(versioned_rom_path, stable_rom_path);
+        assert!(
+            versioned_rom_path
+                .file_name()
+                .expect("versioned file name")
+                .starts_with("demo-")
+        );
+        assert!(!linked_rom_path.exists());
+        assert_eq!(
+            std::fs::read(&versioned_rom_path).expect("read versioned rom"),
+            std::fs::read(&stable_rom_path).expect("read stable rom")
+        );
     }
 }

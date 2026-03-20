@@ -11,6 +11,7 @@ use walkdir::WalkDir;
 
 pub const FIXED_POINT_SHIFT: i32 = 8;
 pub const NTSC_FPS: u32 = 60;
+pub const PROJECT_SPRITE_SOURCE_DIR: &str = "content/sprite_sources";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub enum GenreKind {
@@ -83,6 +84,33 @@ pub struct GameplaySettings {
     pub entry_scene: String,
     #[serde(default)]
     pub physics_presets: Vec<PhysicsProfile>,
+    #[serde(default)]
+    pub player: PlayerSettings,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PlayerSettings {
+    pub max_health: u8,
+    pub starting_health: u8,
+    pub health_hud: HealthHudStyle,
+}
+
+impl Default for PlayerSettings {
+    fn default() -> Self {
+        Self {
+            max_health: 6,
+            starting_health: 6,
+            health_hud: HealthHudStyle::MegaPipsTopLeft,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum HealthHudStyle {
+    #[default]
+    MegaPipsTopLeft,
+    HeartsTopRight,
+    CellsTopCenter,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -189,6 +217,60 @@ pub struct EntityPlacement {
     pub archetype: String,
     pub position: PointI16,
     pub facing: Facing,
+    #[serde(default)]
+    pub kind: EntityKind,
+    #[serde(default = "default_entity_hitbox")]
+    pub hitbox: RectI16,
+    #[serde(default)]
+    pub movement: MovementPattern,
+    #[serde(default)]
+    pub combat: CombatProfile,
+    #[serde(default)]
+    pub action: EntityAction,
+    #[serde(default = "default_true")]
+    pub active: bool,
+    #[serde(default)]
+    pub one_shot: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum EntityKind {
+    #[default]
+    Prop,
+    Pickup,
+    Enemy,
+    Switch,
+    Solid,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum MovementPattern {
+    #[default]
+    None,
+    Patrol {
+        left_offset: i16,
+        right_offset: i16,
+        speed: u8,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct CombatProfile {
+    pub max_health: u8,
+    pub contact_damage: u8,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum EntityAction {
+    #[default]
+    None,
+    HealPlayer {
+        amount: u8,
+    },
+    SetEntityActive {
+        target_entity_id: String,
+        active: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -218,6 +300,19 @@ pub struct RectI16 {
     pub y: i16,
     pub width: u16,
     pub height: u16,
+}
+
+pub fn default_true() -> bool {
+    true
+}
+
+pub fn default_entity_hitbox() -> RectI16 {
+    RectI16 {
+        x: 0,
+        y: 0,
+        width: 16,
+        height: 16,
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -327,6 +422,7 @@ impl Default for ProjectManifest {
             gameplay: GameplaySettings {
                 entry_scene: "intro_stage".to_string(),
                 physics_presets: vec![default_megaman_like_physics()],
+                player: PlayerSettings::default(),
             },
         }
     }
@@ -376,12 +472,13 @@ impl ProjectBundle {
         {
             let path = Utf8PathBuf::from_path_buf(entry.into_path())
                 .map_err(|_| anyhow!("non-utf8 content path"))?;
-            let text = fs::read_to_string(&path)
-                .with_context(|| format!("failed to read content resource {}", path))?;
 
             if path.extension() != Some("ron") {
                 continue;
             }
+
+            let text = fs::read_to_string(&path)
+                .with_context(|| format!("failed to read content resource {}", path))?;
 
             let file_name = path
                 .file_name()
@@ -425,6 +522,7 @@ impl ProjectBundle {
         fs::create_dir_all(project_root.join("content/tilesets"))?;
         fs::create_dir_all(project_root.join("content/metasprites"))?;
         fs::create_dir_all(project_root.join("content/animations"))?;
+        fs::create_dir_all(project_root.join(PROJECT_SPRITE_SOURCE_DIR))?;
 
         let slug = slugify(name);
         let mut bundle = demo_bundle();
@@ -480,6 +578,71 @@ impl ProjectBundle {
         self.tilesets.iter().find(|tileset| tileset.id == id)
     }
 
+    pub fn metasprite(&self, id: &str) -> Option<&MetaspriteResource> {
+        self.metasprites
+            .iter()
+            .find(|metasprite| metasprite.id == id)
+    }
+
+    pub fn animation(&self, id: &str) -> Option<&AnimationResource> {
+        self.animations.iter().find(|animation| animation.id == id)
+    }
+
+    pub fn save(&self, project_root: impl AsRef<Utf8Path>) -> Result<()> {
+        let project_root = project_root.as_ref();
+        fs::create_dir_all(project_root.join("content/scenes"))?;
+        fs::create_dir_all(project_root.join("content/dialogues"))?;
+        fs::create_dir_all(project_root.join("content/palettes"))?;
+        fs::create_dir_all(project_root.join("content/tilesets"))?;
+        fs::create_dir_all(project_root.join("content/metasprites"))?;
+        fs::create_dir_all(project_root.join("content/animations"))?;
+        fs::create_dir_all(project_root.join(PROJECT_SPRITE_SOURCE_DIR))?;
+
+        fs::write(
+            project_root.join("project.toml"),
+            toml::to_string_pretty(&self.manifest)?,
+        )?;
+
+        rewrite_ron_group(
+            &project_root.join("content/scenes"),
+            ".scene.ron",
+            &self.scenes,
+            |scene| &scene.id,
+        )?;
+        rewrite_ron_group(
+            &project_root.join("content/dialogues"),
+            ".dialogue.ron",
+            &self.dialogues,
+            |dialogue| &dialogue.id,
+        )?;
+        rewrite_ron_group(
+            &project_root.join("content/palettes"),
+            ".palette.ron",
+            &self.palettes,
+            |palette| &palette.id,
+        )?;
+        rewrite_ron_group(
+            &project_root.join("content/tilesets"),
+            ".tileset.ron",
+            &self.tilesets,
+            |tileset| &tileset.id,
+        )?;
+        rewrite_ron_group(
+            &project_root.join("content/metasprites"),
+            ".metasprite.ron",
+            &self.metasprites,
+            |metasprite| &metasprite.id,
+        )?;
+        rewrite_ron_group(
+            &project_root.join("content/animations"),
+            ".animation.ron",
+            &self.animations,
+            |animation| &animation.id,
+        )?;
+
+        Ok(())
+    }
+
     pub fn unique_ids(&self) -> BTreeSet<&str> {
         let mut ids = BTreeSet::new();
 
@@ -500,6 +663,35 @@ impl ProjectBundle {
 
         ids
     }
+}
+
+fn rewrite_ron_group<T: Serialize>(
+    directory: &Utf8Path,
+    suffix: &str,
+    items: &[T],
+    id_for: impl Fn(&T) -> &str,
+) -> Result<()> {
+    if directory.exists() {
+        for entry in fs::read_dir(directory)? {
+            let entry = entry?;
+            let path = Utf8PathBuf::from_path_buf(entry.path())
+                .map_err(|_| anyhow!("non-utf8 resource path in {}", directory))?;
+            let Some(file_name) = path.file_name() else {
+                continue;
+            };
+            if file_name.ends_with(suffix) {
+                fs::remove_file(&path)
+                    .with_context(|| format!("failed to remove stale resource {}", path))?;
+            }
+        }
+    }
+
+    for item in items {
+        let file_name = format!("{}{}", slugify(id_for(item)), suffix);
+        write_ron(&directory.join(file_name), item)?;
+    }
+
+    Ok(())
 }
 
 pub fn default_megaman_like_physics() -> PhysicsProfile {
@@ -601,12 +793,33 @@ pub fn demo_bundle() -> ProjectBundle {
                     archetype: "met_enemy".to_string(),
                     position: PointI16 { x: 120, y: 96 },
                     facing: Facing::Left,
+                    kind: EntityKind::Enemy,
+                    hitbox: default_entity_hitbox(),
+                    movement: MovementPattern::Patrol {
+                        left_offset: -24,
+                        right_offset: 24,
+                        speed: 1,
+                    },
+                    combat: CombatProfile {
+                        max_health: 3,
+                        contact_damage: 1,
+                    },
+                    action: EntityAction::None,
+                    active: true,
+                    one_shot: false,
                 },
                 EntityPlacement {
                     id: "npc_guide".to_string(),
                     archetype: "guide_bot".to_string(),
                     position: PointI16 { x: 48, y: 96 },
                     facing: Facing::Right,
+                    kind: EntityKind::Prop,
+                    hitbox: default_entity_hitbox(),
+                    movement: MovementPattern::None,
+                    combat: CombatProfile::default(),
+                    action: EntityAction::None,
+                    active: true,
+                    one_shot: false,
                 },
             ],
             triggers: vec![
@@ -788,6 +1001,41 @@ mod tests {
         assert_eq!(loaded.manifest.meta.name, "Test Project");
         assert!(loaded.scene("intro_stage").is_some());
         assert!(loaded.dialogue("intro").is_some());
+    }
+
+    #[test]
+    fn saves_and_loads_bundle_round_trip() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("utf8 tempdir");
+        let bundle = demo_bundle();
+
+        bundle.save(&root).expect("save bundle");
+        let loaded = ProjectBundle::load(&root).expect("load saved bundle");
+
+        assert_eq!(loaded.manifest, bundle.manifest);
+        assert_eq!(loaded.scenes, bundle.scenes);
+        assert_eq!(loaded.dialogues, bundle.dialogues);
+        assert_eq!(loaded.palettes, bundle.palettes);
+        assert_eq!(loaded.tilesets, bundle.tilesets);
+        assert_eq!(loaded.metasprites, bundle.metasprites);
+        assert_eq!(loaded.animations, bundle.animations);
+    }
+
+    #[test]
+    fn ignores_non_ron_content_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("utf8 tempdir");
+        ProjectBundle::write_template_project(&root, "Test Project").expect("write project");
+        let sprite_dir = root.join(PROJECT_SPRITE_SOURCE_DIR);
+        std::fs::create_dir_all(&sprite_dir).expect("create sprite dir");
+        std::fs::write(
+            sprite_dir.join("player_idle_sheet.png"),
+            [0_u8, 159, 146, 150],
+        )
+        .expect("write sprite sheet");
+
+        let loaded = ProjectBundle::load(&root).expect("load project with binary asset");
+        assert!(loaded.animation("player_idle").is_some());
     }
 
     #[test]

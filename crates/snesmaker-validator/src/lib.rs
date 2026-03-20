@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 use snesmaker_events::{EventCommand, reserved_unimplemented_commands};
-use snesmaker_project::{GenreKind, ProjectBundle, SceneResource};
+use snesmaker_project::{EntityAction, EntityKind, GenreKind, ProjectBundle, SceneResource};
 
 pub const MAX_COLORS_PER_PALETTE: usize = 16;
 pub const MAX_PALETTES: usize = 8;
@@ -179,6 +179,35 @@ impl Validator for ManifestValidator {
                 Severity::Warning,
                 "manifest.megaman_preset_missing",
                 "the default milestone expects a 'megaman_like' preset to exist",
+                Some("project.toml".to_string()),
+            );
+        }
+
+        let player = &bundle.manifest.gameplay.player;
+        if player.max_health == 0 {
+            report.push(
+                Severity::Error,
+                "manifest.player_health_zero",
+                "gameplay.player.max_health must be at least 1",
+                Some("project.toml".to_string()),
+            );
+        }
+        if player.starting_health == 0 {
+            report.push(
+                Severity::Error,
+                "manifest.player_starting_health_zero",
+                "gameplay.player.starting_health must be at least 1",
+                Some("project.toml".to_string()),
+            );
+        }
+        if player.starting_health > player.max_health {
+            report.push(
+                Severity::Error,
+                "manifest.player_starting_health_overflow",
+                format!(
+                    "gameplay.player.starting_health ({}) cannot exceed gameplay.player.max_health ({})",
+                    player.starting_health, player.max_health
+                ),
                 Some("project.toml".to_string()),
             );
         }
@@ -419,6 +448,83 @@ fn validate_scene_shape(scene: &SceneResource, report: &mut ValidationReport) {
             ),
             Some(format!("scene:{}", scene.id)),
         );
+    }
+
+    let entity_ids: BTreeSet<&str> = scene
+        .entities
+        .iter()
+        .map(|entity| entity.id.as_str())
+        .collect();
+    for entity in &scene.entities {
+        if entity.hitbox.width == 0 || entity.hitbox.height == 0 {
+            report.push(
+                Severity::Error,
+                "scene.entity_hitbox_invalid",
+                format!(
+                    "scene '{}' entity '{}' must have a non-zero hitbox",
+                    scene.id, entity.id
+                ),
+                Some(format!("scene:{}", scene.id)),
+            );
+        }
+
+        match entity.kind {
+            EntityKind::Enemy => {
+                if entity.combat.max_health == 0 {
+                    report.push(
+                        Severity::Error,
+                        "scene.enemy_health_invalid",
+                        format!(
+                            "scene '{}' enemy '{}' must have combat.max_health >= 1",
+                            scene.id, entity.id
+                        ),
+                        Some(format!("scene:{}", scene.id)),
+                    );
+                }
+                if entity.combat.contact_damage == 0 {
+                    report.push(
+                        Severity::Warning,
+                        "scene.enemy_damage_zero",
+                        format!(
+                            "scene '{}' enemy '{}' has zero contact damage",
+                            scene.id, entity.id
+                        ),
+                        Some(format!("scene:{}", scene.id)),
+                    );
+                }
+            }
+            EntityKind::Pickup | EntityKind::Switch => {
+                if matches!(entity.action, EntityAction::None) {
+                    report.push(
+                        Severity::Warning,
+                        "scene.entity_action_missing",
+                        format!(
+                            "scene '{}' entity '{}' is {:?} but has no action configured",
+                            scene.id, entity.id, entity.kind
+                        ),
+                        Some(format!("scene:{}", scene.id)),
+                    );
+                }
+            }
+            EntityKind::Prop | EntityKind::Solid => {}
+        }
+
+        if let EntityAction::SetEntityActive {
+            target_entity_id, ..
+        } = &entity.action
+        {
+            if !entity_ids.contains(target_entity_id.as_str()) {
+                report.push(
+                    Severity::Error,
+                    "scene.entity_target_missing",
+                    format!(
+                        "scene '{}' entity '{}' targets missing entity '{}'",
+                        scene.id, entity.id, target_entity_id
+                    ),
+                    Some(format!("scene:{}", scene.id)),
+                );
+            }
+        }
     }
 }
 

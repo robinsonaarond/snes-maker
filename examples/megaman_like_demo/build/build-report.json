@@ -1,18 +1,19 @@
 {
   "project_root": "examples/megaman_like_demo",
   "build_dir": "examples/megaman_like_demo/build",
-  "rom_path": "examples/megaman_like_demo/build/megaman_like_demo.sfc",
+  "rom_path": "examples/megaman_like_demo/build/megaman_like_demo-1773964243360-B1C0.sfc",
+  "stable_rom_path": "examples/megaman_like_demo/build/megaman_like_demo.sfc",
   "report_path": "examples/megaman_like_demo/build/build-report.json",
   "rom_built": true,
   "validation": {
     "errors": [],
     "warnings": [],
     "budgets": {
-      "unique_tiles": 15,
+      "unique_tiles": 29,
       "palette_colors": 9,
       "scene_count": 1,
       "metasprite_piece_peak": 4,
-      "estimated_rom_bytes": 19297,
+      "estimated_rom_bytes": 20277,
       "estimated_rom_banks": 1
     }
   },
@@ -24,11 +25,11 @@
   "compiled_scenes": [
     {
       "scene_id": "intro_stage",
-      "byte_len": 268,
+      "byte_len": 286,
       "metadata": {
         "chunk_height": "8",
         "chunk_width": "16",
-        "entity_count": "2"
+        "entity_count": "5"
       }
     }
   ]

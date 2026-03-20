@@ -80,6 +80,9 @@ fn main() -> Result<()> {
             println!("Build report: {}", outcome.report_path);
             if outcome.rom_built {
                 println!("ROM: {}", outcome.rom_path);
+                if let Some(stable_rom_path) = &outcome.stable_rom_path {
+                    println!("Stable ROM alias: {}", stable_rom_path);
+                }
             } else {
                 println!("ROM not built yet:");
                 for warning in outcome.assembler_status.warnings {

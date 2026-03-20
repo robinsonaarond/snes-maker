@@ -1,9 +1,9 @@
 (
-    id: "player_idle",
+    id: "guide_bot",
     palette_id: "default_palette",
     pieces: [
         (
-            tile_index: 10,
+            tile_index: 17,
             x: 0,
             y: 0,
             palette_slot: 0,
@@ -11,7 +11,7 @@
             v_flip: false,
         ),
         (
-            tile_index: 11,
+            tile_index: 18,
             x: 8,
             y: 0,
             palette_slot: 0,
@@ -19,7 +19,7 @@
             v_flip: false,
         ),
         (
-            tile_index: 12,
+            tile_index: 19,
             x: 0,
             y: 8,
             palette_slot: 0,
@@ -27,7 +27,7 @@
             v_flip: false,
         ),
         (
-            tile_index: 13,
+            tile_index: 20,
             x: 8,
             y: 8,
             palette_slot: 0,

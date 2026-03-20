@@ -10,7 +10,10 @@ anyhow.workspace = true
 camino.workspace = true
 eframe.workspace = true
 egui.workspace = true
+image.workspace = true
+rfd.workspace = true
 
 snesmaker-export = { path = "../snesmaker-export" }
+snesmaker-events = { path = "../snesmaker-events" }
 snesmaker-project = { path = "../snesmaker-project" }
 snesmaker-validator = { path = "../snesmaker-validator" }

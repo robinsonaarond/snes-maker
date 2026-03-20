@@ -3,7 +3,11 @@
     frames: [
         (
             metasprite_id: "player_idle",
-            duration_frames: 12,
+            duration_frames: 20,
+        ),
+        (
+            metasprite_id: "player_idle_blink",
+            duration_frames: 6,
         ),
     ],
 )

@@ -1,0 +1,22 @@
+(
+    id: "blast_door",
+    palette_id: "default_palette",
+    pieces: [
+        (
+            tile_index: 27,
+            x: 0,
+            y: 0,
+            palette_slot: 0,
+            h_flip: false,
+            v_flip: false,
+        ),
+        (
+            tile_index: 28,
+            x: 0,
+            y: 8,
+            palette_slot: 0,
+            h_flip: false,
+            v_flip: false,
+        ),
+    ],
+)

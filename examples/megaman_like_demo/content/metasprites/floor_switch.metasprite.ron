@@ -1,9 +1,9 @@
 (
-    id: "player_shot",
+    id: "floor_switch",
     palette_id: "default_palette",
     pieces: [
         (
-            tile_index: 14,
+            tile_index: 26,
             x: 0,
             y: 0,
             palette_slot: 0,

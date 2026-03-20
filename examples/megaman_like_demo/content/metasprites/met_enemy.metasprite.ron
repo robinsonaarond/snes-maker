@@ -1,0 +1,38 @@
+(
+    id: "met_enemy",
+    palette_id: "default_palette",
+    pieces: [
+        (
+            tile_index: 21,
+            x: 0,
+            y: 0,
+            palette_slot: 0,
+            h_flip: false,
+            v_flip: false,
+        ),
+        (
+            tile_index: 22,
+            x: 8,
+            y: 0,
+            palette_slot: 0,
+            h_flip: false,
+            v_flip: false,
+        ),
+        (
+            tile_index: 23,
+            x: 0,
+            y: 8,
+            palette_slot: 0,
+            h_flip: false,
+            v_flip: false,
+        ),
+        (
+            tile_index: 24,
+            x: 8,
+            y: 8,
+            palette_slot: 0,
+            h_flip: false,
+            v_flip: false,
+        ),
+    ],
+)
