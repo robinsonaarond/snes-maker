@@ -5,6 +5,10 @@ use anyhow::{Context, Result};
 use camino::{Utf8Path, Utf8PathBuf};
 use ron::ser::PrettyConfig;
 use serde::{Deserialize, Serialize};
+use snesmaker_project::{
+    Checkpoint, CollisionLayer, EntityPlacement, GridSize, SceneKind, SpawnPoint, TileLayer,
+    TriggerVolume,
+};
 
 const WORKSPACE_DIR_NAME: &str = ".snesmaker";
 const WORKSPACE_FILE_NAME: &str = "editor-workspace.ron";
@@ -177,10 +181,6 @@ impl DockLayout {
             .find(|area| self.slot(*area).tabs.contains(&tab))
     }
 
-    pub fn active_tab(&self, area: DockArea) -> Option<DockTab> {
-        self.slot(area).active_tab()
-    }
-
     pub fn set_active_tab(&mut self, area: DockArea, index: usize) {
         let slot = self.slot_mut(area);
         if !slot.tabs.is_empty() {
@@ -270,6 +270,185 @@ pub struct SavedDockLayout {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct EditorFavorites {
+    #[serde(default)]
+    pub scenes: Vec<String>,
+    #[serde(default)]
+    pub palettes: Vec<String>,
+    #[serde(default)]
+    pub tilesets: Vec<String>,
+    #[serde(default)]
+    pub metasprites: Vec<String>,
+    #[serde(default)]
+    pub animations: Vec<String>,
+    #[serde(default)]
+    pub dialogues: Vec<String>,
+    #[serde(default)]
+    pub sprite_sources: Vec<String>,
+}
+
+impl EditorFavorites {
+    pub fn normalize(&mut self) {
+        normalize_name_list(&mut self.scenes);
+        normalize_name_list(&mut self.palettes);
+        normalize_name_list(&mut self.tilesets);
+        normalize_name_list(&mut self.metasprites);
+        normalize_name_list(&mut self.animations);
+        normalize_name_list(&mut self.dialogues);
+        normalize_name_list(&mut self.sprite_sources);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SavedSceneSnippet {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub source_scene_id: Option<String>,
+    #[serde(default)]
+    pub scene_kind: SceneKind,
+    #[serde(default)]
+    pub size_tiles: GridSize,
+    #[serde(default)]
+    pub layers: Vec<TileLayer>,
+    #[serde(default = "default_collision_layer")]
+    pub collision: CollisionLayer,
+    #[serde(default)]
+    pub spawns: Vec<SpawnPoint>,
+    #[serde(default)]
+    pub checkpoints: Vec<Checkpoint>,
+    #[serde(default)]
+    pub entities: Vec<EntityPlacement>,
+    #[serde(default)]
+    pub triggers: Vec<TriggerVolume>,
+}
+
+impl SavedSceneSnippet {
+    pub fn normalize(&mut self) {
+        self.name = self.name.trim().to_string();
+        self.source_scene_id = self
+            .source_scene_id
+            .as_ref()
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_string());
+
+        for layer in &mut self.layers {
+            layer.id = layer.id.trim().to_string();
+            layer.tileset_id = layer.tileset_id.trim().to_string();
+        }
+
+        for spawn in &mut self.spawns {
+            spawn.id = spawn.id.trim().to_string();
+        }
+        for checkpoint in &mut self.checkpoints {
+            checkpoint.id = checkpoint.id.trim().to_string();
+        }
+        for entity in &mut self.entities {
+            entity.id = entity.id.trim().to_string();
+            entity.archetype = entity.archetype.trim().to_string();
+        }
+        for trigger in &mut self.triggers {
+            trigger.id = trigger.id.trim().to_string();
+            trigger.script_id = trigger.script_id.trim().to_string();
+        }
+
+        let tile_count = self.size_tiles.tile_count();
+        if tile_count > 0 {
+            for layer in &mut self.layers {
+                resize_or_pad(&mut layer.tiles, tile_count, 0);
+            }
+            resize_or_pad(&mut self.collision.solids, tile_count, false);
+            resize_or_pad(&mut self.collision.ladders, tile_count, false);
+            resize_or_pad(&mut self.collision.hazards, tile_count, false);
+        }
+    }
+}
+
+impl Default for SavedSceneSnippet {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            source_scene_id: None,
+            scene_kind: SceneKind::default(),
+            size_tiles: GridSize::default(),
+            layers: Vec::new(),
+            collision: default_collision_layer(),
+            spawns: Vec::new(),
+            checkpoints: Vec::new(),
+            entities: Vec::new(),
+            triggers: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct SavedTileBrush {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub size_tiles: GridSize,
+    #[serde(default)]
+    pub tiles: Vec<u16>,
+    #[serde(default)]
+    pub solids: Vec<bool>,
+    #[serde(default)]
+    pub ladders: Vec<bool>,
+    #[serde(default)]
+    pub hazards: Vec<bool>,
+}
+
+impl SavedTileBrush {
+    pub fn normalize(&mut self) {
+        self.name = self.name.trim().to_string();
+        let tile_count = self.size_tiles.tile_count();
+        if tile_count > 0 {
+            resize_or_pad(&mut self.tiles, tile_count, 0);
+            resize_or_pad(&mut self.solids, tile_count, false);
+            resize_or_pad(&mut self.ladders, tile_count, false);
+            resize_or_pad(&mut self.hazards, tile_count, false);
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct SceneSnippetLibrary {
+    #[serde(default)]
+    pub snippets: Vec<SavedSceneSnippet>,
+    #[serde(default)]
+    pub brushes: Vec<SavedTileBrush>,
+}
+
+impl SceneSnippetLibrary {
+    pub fn normalize(&mut self) {
+        self.snippets
+            .retain(|snippet| !snippet.name.trim().is_empty());
+        for snippet in &mut self.snippets {
+            snippet.name = snippet.name.trim().to_string();
+        }
+        self.snippets
+            .sort_by(|left, right| left.name.cmp(&right.name));
+        self.snippets
+            .dedup_by(|left, right| left.name.eq_ignore_ascii_case(&right.name));
+        for snippet in &mut self.snippets {
+            snippet.normalize();
+        }
+
+        self.brushes.retain(|brush| !brush.name.trim().is_empty());
+        for brush in &mut self.brushes {
+            brush.name = brush.name.trim().to_string();
+        }
+        self.brushes
+            .sort_by(|left, right| left.name.cmp(&right.name));
+        self.brushes
+            .dedup_by(|left, right| left.name.eq_ignore_ascii_case(&right.name));
+        for brush in &mut self.brushes {
+            brush.normalize();
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct WorkspaceFile {
     #[serde(default)]
     pub current_layout: DockLayout,
@@ -282,27 +461,57 @@ pub struct WorkspaceFile {
 impl WorkspaceFile {
     pub fn normalize(&mut self) {
         self.current_layout.normalize();
-        self.saved_layouts.retain(|layout| !layout.name.trim().is_empty());
-        self.saved_layouts.sort_by(|left, right| left.name.cmp(&right.name));
+        self.saved_layouts
+            .retain(|layout| !layout.name.trim().is_empty());
+        for layout in &mut self.saved_layouts {
+            layout.name = layout.name.trim().to_string();
+        }
+        self.saved_layouts
+            .sort_by(|left, right| left.name.cmp(&right.name));
         self.saved_layouts
             .dedup_by(|left, right| left.name.eq_ignore_ascii_case(&right.name));
         for layout in &mut self.saved_layouts {
             layout.layout.normalize();
         }
-        if let Some(active) = &self.active_saved_layout {
-            if self
-                .saved_layouts
-                .iter()
-                .all(|layout| !layout.name.eq_ignore_ascii_case(active))
+        if let Some(active) = self.active_saved_layout.take() {
+            let active = active.trim().to_string();
+            if !active.is_empty()
+                && self
+                    .saved_layouts
+                    .iter()
+                    .any(|layout| layout.name.eq_ignore_ascii_case(&active))
             {
-                self.active_saved_layout = None;
+                self.active_saved_layout = Some(active);
             }
         }
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct WorkspaceAddons {
+    #[serde(default)]
+    pub editor_favorites: EditorFavorites,
+    #[serde(default)]
+    pub scene_library: SceneSnippetLibrary,
+}
+
+impl WorkspaceAddons {
+    pub fn normalize(&mut self) {
+        self.editor_favorites.normalize();
+        self.scene_library.normalize();
+    }
+}
+
 pub fn workspace_state_path(project_root: &Utf8Path) -> Utf8PathBuf {
-    project_root.join(WORKSPACE_DIR_NAME).join(WORKSPACE_FILE_NAME)
+    project_root
+        .join(WORKSPACE_DIR_NAME)
+        .join(WORKSPACE_FILE_NAME)
+}
+
+pub fn workspace_addons_path(project_root: &Utf8Path) -> Utf8PathBuf {
+    project_root
+        .join(WORKSPACE_DIR_NAME)
+        .join("editor-addons.ron")
 }
 
 pub fn load_workspace_file(project_root: &Utf8Path) -> Result<Option<WorkspaceFile>> {
@@ -313,6 +522,19 @@ pub fn load_workspace_file(project_root: &Utf8Path) -> Result<Option<WorkspaceFi
 
     let text = fs::read_to_string(&path).with_context(|| format!("failed to read {}", path))?;
     let mut file: WorkspaceFile =
+        ron::from_str(&text).with_context(|| format!("failed to parse {}", path))?;
+    file.normalize();
+    Ok(Some(file))
+}
+
+pub fn load_workspace_addons(project_root: &Utf8Path) -> Result<Option<WorkspaceAddons>> {
+    let path = workspace_addons_path(project_root);
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let text = fs::read_to_string(&path).with_context(|| format!("failed to read {}", path))?;
+    let mut file: WorkspaceAddons =
         ron::from_str(&text).with_context(|| format!("failed to parse {}", path))?;
     file.normalize();
     Ok(Some(file))
@@ -333,16 +555,47 @@ pub fn save_workspace_file(project_root: &Utf8Path, workspace: &WorkspaceFile) -
     Ok(())
 }
 
+pub fn save_workspace_addons(project_root: &Utf8Path, addons: &WorkspaceAddons) -> Result<()> {
+    let mut addons = addons.clone();
+    addons.normalize();
+
+    let path = workspace_addons_path(project_root);
+    let parent = path
+        .parent()
+        .context("workspace addon path is missing a parent directory")?;
+    fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent))?;
+
+    let text = ron::ser::to_string_pretty(&addons, PrettyConfig::new())?;
+    fs::write(&path, text).with_context(|| format!("failed to write {}", path))?;
+    Ok(())
+}
+
 pub fn copy_workspace_file(project_root: &Utf8Path, export_root: &Utf8Path) -> Result<()> {
     let source = workspace_state_path(project_root);
     if !source.exists() {
-        return Ok(());
+        return copy_workspace_addons(project_root, export_root);
     }
 
     let destination = workspace_state_path(export_root);
     let parent = destination
         .parent()
         .context("workspace export path is missing a parent directory")?;
+    fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent))?;
+    fs::copy(&source, &destination)
+        .with_context(|| format!("failed to copy {} to {}", source, destination))?;
+    copy_workspace_addons(project_root, export_root)
+}
+
+pub fn copy_workspace_addons(project_root: &Utf8Path, export_root: &Utf8Path) -> Result<()> {
+    let source = workspace_addons_path(project_root);
+    if !source.exists() {
+        return Ok(());
+    }
+
+    let destination = workspace_addons_path(export_root);
+    let parent = destination
+        .parent()
+        .context("workspace export addon path is missing a parent directory")?;
     fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent))?;
     fs::copy(&source, &destination)
         .with_context(|| format!("failed to copy {} to {}", source, destination))?;
@@ -357,8 +610,35 @@ fn default_center_slot() -> DockSlot {
     DockSlot::new(0.0, vec![DockTab::Scene], 0)
 }
 
+fn default_collision_layer() -> CollisionLayer {
+    CollisionLayer {
+        solids: Vec::new(),
+        ladders: Vec::new(),
+        hazards: Vec::new(),
+    }
+}
+
+fn normalize_name_list(values: &mut Vec<String>) {
+    let mut normalized = values
+        .iter()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>();
+    normalized.sort_by(|left, right| left.to_ascii_lowercase().cmp(&right.to_ascii_lowercase()));
+    normalized.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+    *values = normalized;
+}
+
+fn resize_or_pad<T: Clone>(values: &mut Vec<T>, len: usize, fill: T) {
+    values.resize(len, fill);
+}
+
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
     use super::{DockArea, DockLayout, DockTab, WorkspaceFile};
 
     #[test]
@@ -400,5 +680,163 @@ mod tests {
 
         assert_eq!(workspace.saved_layouts.len(), 1);
         assert_eq!(workspace.active_saved_layout.as_deref(), Some("animation"));
+    }
+
+    #[test]
+    fn workspace_file_loads_older_shapes_with_default_persistence_fields() {
+        let workspace: WorkspaceFile = ron::from_str(
+            r#"
+            (
+                saved_layouts: [],
+                active_saved_layout: None,
+            )
+            "#,
+        )
+        .expect("parse legacy workspace");
+
+        assert!(workspace.saved_layouts.is_empty());
+        assert!(workspace.active_saved_layout.is_none());
+        assert!(
+            super::load_workspace_addons(&camino::Utf8PathBuf::from("/tmp/does-not-exist"))
+                .expect("load missing addons")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn workspace_addons_normalize_favorites_and_libraries() {
+        let mut addons = super::WorkspaceAddons {
+            editor_favorites: super::EditorFavorites {
+                scenes: vec![
+                    " intro_stage ".to_string(),
+                    "INTRO_STAGE".to_string(),
+                    "boss_room".to_string(),
+                ],
+                tilesets: vec![" default_tiles ".to_string(), "DEFAULT_TILES".to_string()],
+                ..Default::default()
+            },
+            scene_library: super::SceneSnippetLibrary {
+                snippets: vec![
+                    super::SavedSceneSnippet {
+                        name: "  Shared Room  ".to_string(),
+                        source_scene_id: Some(" intro_stage ".to_string()),
+                        size_tiles: super::GridSize {
+                            width: 2,
+                            height: 1,
+                        },
+                        layers: vec![super::TileLayer {
+                            id: " layer_a ".to_string(),
+                            tileset_id: " default_tiles ".to_string(),
+                            visible: true,
+                            parallax_x: 1,
+                            parallax_y: 1,
+                            tiles: vec![7],
+                        }],
+                        collision: super::CollisionLayer {
+                            solids: vec![true],
+                            ladders: vec![],
+                            hazards: vec![],
+                        },
+                        spawns: vec![],
+                        checkpoints: vec![],
+                        entities: vec![],
+                        triggers: vec![],
+                        ..Default::default()
+                    },
+                    super::SavedSceneSnippet {
+                        name: "shared room".to_string(),
+                        ..Default::default()
+                    },
+                ],
+                brushes: vec![
+                    super::SavedTileBrush {
+                        name: "  Accent Brush ".to_string(),
+                        size_tiles: super::GridSize {
+                            width: 1,
+                            height: 2,
+                        },
+                        tiles: vec![1],
+                        solids: vec![true, false, true],
+                        ladders: vec![false],
+                        hazards: vec![],
+                    },
+                    super::SavedTileBrush {
+                        name: "accent brush".to_string(),
+                        ..Default::default()
+                    },
+                ],
+            },
+        };
+
+        addons.normalize();
+
+        assert_eq!(
+            addons.editor_favorites.scenes,
+            vec!["boss_room", "intro_stage"]
+        );
+        assert_eq!(addons.editor_favorites.tilesets, vec!["default_tiles"]);
+        assert_eq!(addons.scene_library.snippets.len(), 1);
+        assert_eq!(addons.scene_library.snippets[0].name, "Shared Room");
+        assert_eq!(
+            addons.scene_library.snippets[0].source_scene_id.as_deref(),
+            Some("intro_stage")
+        );
+        assert_eq!(addons.scene_library.snippets[0].layers[0].id, "layer_a");
+        assert_eq!(
+            addons.scene_library.snippets[0].layers[0].tileset_id,
+            "default_tiles"
+        );
+        assert_eq!(addons.scene_library.snippets[0].layers[0].tiles, vec![7, 0]);
+        assert_eq!(
+            addons.scene_library.snippets[0].collision.solids,
+            vec![true, false]
+        );
+        assert_eq!(addons.scene_library.brushes.len(), 1);
+        assert_eq!(addons.scene_library.brushes[0].name, "Accent Brush");
+        assert_eq!(addons.scene_library.brushes[0].tiles, vec![1, 0]);
+        assert_eq!(addons.scene_library.brushes[0].solids, vec![true, false]);
+    }
+
+    #[test]
+    fn workspace_addons_round_trips_new_persistence_fields() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("monotonic clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("snes-maker-workspace-test-{}", unique));
+        fs::create_dir_all(&root).expect("create temp root");
+        let project_root = camino::Utf8PathBuf::from_path_buf(root.clone()).expect("utf8 root");
+
+        let addons = super::WorkspaceAddons {
+            editor_favorites: super::EditorFavorites {
+                scenes: vec!["intro_stage".to_string()],
+                palettes: vec!["default_palette".to_string()],
+                ..Default::default()
+            },
+            scene_library: super::SceneSnippetLibrary {
+                brushes: vec![super::SavedTileBrush {
+                    name: "platform".to_string(),
+                    size_tiles: super::GridSize {
+                        width: 1,
+                        height: 1,
+                    },
+                    tiles: vec![2],
+                    solids: vec![true],
+                    ladders: vec![false],
+                    hazards: vec![false],
+                }],
+                ..Default::default()
+            },
+        };
+
+        super::save_workspace_addons(&project_root, &addons).expect("save addons");
+        let loaded = super::load_workspace_addons(&project_root)
+            .expect("load workspace")
+            .expect("workspace file present");
+
+        assert_eq!(loaded.editor_favorites.scenes, vec!["intro_stage"]);
+        assert_eq!(loaded.editor_favorites.palettes, vec!["default_palette"]);
+        assert_eq!(loaded.scene_library.brushes.len(), 1);
+        assert_eq!(loaded.scene_library.brushes[0].name, "platform");
     }
 }

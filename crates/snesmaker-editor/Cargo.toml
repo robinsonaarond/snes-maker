@@ -18,5 +18,6 @@ serde_json.workspace = true
 
 snesmaker-export = { path = "../snesmaker-export" }
 snesmaker-events = { path = "../snesmaker-events" }
+snesmaker-platformer = { path = "../snesmaker-platformer" }
 snesmaker-project = { path = "../snesmaker-project" }
 snesmaker-validator = { path = "../snesmaker-validator" }

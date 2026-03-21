@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -12,22 +12,27 @@ use eframe::egui::{
 };
 use image::RgbaImage;
 use rfd::FileDialog;
-use snesmaker_events::TriggerKind;
+use snesmaker_events::{DialogueGraph, EventCommand, EventScript, TriggerKind};
 use snesmaker_export::{BuildOutcome, build_rom};
+use snesmaker_platformer::{InputFrame, PlaytestSession, simulate_trace};
 use snesmaker_project::{
     default_entity_hitbox, slugify, AnimationFrame, AnimationResource, Checkpoint, CombatProfile,
     EntityAction, EntityKind, EntityPlacement, Facing, HealthHudStyle, MetaspriteResource,
     MovementPattern, PaletteResource, PointI16, ProjectBundle, RectI16, RgbaColor, SceneResource,
-    SpawnPoint, SpriteTileRef, Tile8, TileLayer, TilesetResource, TriggerVolume,
+    SpawnPoint, SpriteTileRef, Tile8, TileLayer, TilesetResource, TriggerVolume, PhysicsProfile,
     PROJECT_SPRITE_SOURCE_DIR,
 };
-use snesmaker_validator::{validate_project, Severity, ValidationReport};
+use snesmaker_validator::{
+    Diagnostic, MAX_COLORS_PER_PALETTE, MAX_METASPRITE_TILES_HARD, MAX_METASPRITE_TILES_WARN,
+    MAX_PALETTES, MAX_TILESET_TILES, ROM_BANK_SIZE, Severity, ValidationReport, validate_project,
+};
 
 mod workspace;
 
 use workspace::{
-    DockArea, DockLayout, DockSlot, DockTab, SavedDockLayout, WorkspaceFile, copy_workspace_file,
-    load_workspace_file, save_workspace_file,
+    DockArea, DockLayout, DockSlot, DockTab, SavedDockLayout, SavedSceneSnippet, SavedTileBrush,
+    WorkspaceAddons, WorkspaceFile, copy_workspace_file, load_workspace_addons,
+    load_workspace_file, save_workspace_addons, save_workspace_file,
 };
 
 const HISTORY_LIMIT: usize = 64;
@@ -78,6 +83,64 @@ enum SelectionAction {
     SetSolid(bool),
     SetLadder(bool),
     SetHazard(bool),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SceneObjectGroup {
+    Spawns,
+    Checkpoints,
+    Entities,
+    Triggers,
+    Scripts,
+}
+
+impl SceneObjectGroup {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Spawns => "Spawns",
+            Self::Checkpoints => "Checkpoints",
+            Self::Entities => "Entities",
+            Self::Triggers => "Triggers",
+            Self::Scripts => "Scripts",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum DiagnosticGrouping {
+    #[default]
+    Severity,
+    Code,
+    Path,
+}
+
+impl DiagnosticGrouping {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Severity => "Severity",
+            Self::Code => "Code",
+            Self::Path => "Path",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct DiagnosticsViewState {
+    search: String,
+    show_errors: bool,
+    show_warnings: bool,
+    grouping: DiagnosticGrouping,
+}
+
+impl DiagnosticsViewState {
+    fn new() -> Self {
+        Self {
+            search: String::new(),
+            show_errors: true,
+            show_warnings: true,
+            grouping: DiagnosticGrouping::Severity,
+        }
+    }
 }
 
 impl EditorTool {
@@ -264,9 +327,55 @@ struct SaveLayoutState {
     name: String,
 }
 
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlaytestStartMode {
+    SceneStart,
+    SelectedSpawn,
+    SelectedCheckpoint,
+}
+
+impl PlaytestStartMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::SceneStart => "Scene Start",
+            Self::SelectedSpawn => "Selected Spawn",
+            Self::SelectedCheckpoint => "Selected Checkpoint",
+        }
+    }
+}
+
 struct PlaytestState {
     last_status: String,
+    session: Option<PlaytestSession>,
+    playing: bool,
+    speed_multiplier: f32,
+    accumulated_seconds: f32,
+    selected_physics_id: String,
+    start_mode: PlaytestStartMode,
+    show_camera_bounds: bool,
+    show_spawns: bool,
+    show_checkpoints: bool,
+    show_triggers: bool,
+    show_entities: bool,
+}
+
+impl Default for PlaytestState {
+    fn default() -> Self {
+        Self {
+            last_status: String::new(),
+            session: None,
+            playing: false,
+            speed_multiplier: 1.0,
+            accumulated_seconds: 0.0,
+            selected_physics_id: String::new(),
+            start_mode: PlaytestStartMode::SceneStart,
+            show_camera_bounds: true,
+            show_spawns: true,
+            show_checkpoints: true,
+            show_triggers: true,
+            show_entities: true,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -403,12 +512,18 @@ struct EditorApp {
     new_project_state: NewProjectState,
     workspace_preset: WorkspacePreset,
     workspace: WorkspaceState,
+    workspace_addons: WorkspaceAddons,
     save_layout_state: SaveLayoutState,
     last_build_outcome: Option<BuildOutcome>,
     playtest_state: PlaytestState,
     outliner_filter: String,
     asset_browser_filter: String,
+    asset_browser_sprite_previews: BTreeMap<String, TextureHandle>,
     locked_layers: BTreeSet<(usize, usize)>,
+    solo_layer: Option<(usize, usize)>,
+    solo_group: Option<SceneObjectGroup>,
+    pending_focus_rect: Option<RectI16>,
+    diagnostics_view: DiagnosticsViewState,
 }
 
 impl EditorApp {
@@ -449,12 +564,18 @@ impl EditorApp {
             },
             workspace_preset: WorkspacePreset::LevelDesign,
             workspace: WorkspaceState::for_preset(WorkspacePreset::LevelDesign),
+            workspace_addons: WorkspaceAddons::default(),
             save_layout_state: SaveLayoutState::default(),
             last_build_outcome: None,
             playtest_state: PlaytestState::default(),
             outliner_filter: String::new(),
             asset_browser_filter: String::new(),
+            asset_browser_sprite_previews: BTreeMap::new(),
             locked_layers: BTreeSet::new(),
+            solo_layer: None,
+            solo_group: None,
+            pending_focus_rect: None,
+            diagnostics_view: DiagnosticsViewState::new(),
         };
         app.reload();
         app
@@ -477,6 +598,10 @@ impl EditorApp {
                 self.preview_focus = PreviewFocus::None;
                 self.scene_scroll_offset = Vec2::ZERO;
                 self.locked_layers.clear();
+                self.solo_layer = None;
+                self.solo_group = None;
+                self.pending_focus_rect = None;
+                self.asset_browser_sprite_previews.clear();
                 self.sync_selection();
             }
             Err(error) => {
@@ -484,6 +609,7 @@ impl EditorApp {
                 self.report = ValidationReport::default();
                 self.workspace_preset = WorkspacePreset::LevelDesign;
                 self.workspace = WorkspaceState::for_preset(WorkspacePreset::LevelDesign);
+                self.workspace_addons = WorkspaceAddons::default();
                 self.last_build_outcome = None;
                 self.status = error.to_string();
                 self.dirty = false;
@@ -495,6 +621,10 @@ impl EditorApp {
                 self.preview_focus = PreviewFocus::None;
                 self.scene_scroll_offset = Vec2::ZERO;
                 self.locked_layers.clear();
+                self.solo_layer = None;
+                self.solo_group = None;
+                self.pending_focus_rect = None;
+                self.asset_browser_sprite_previews.clear();
             }
         }
     }
@@ -571,6 +701,270 @@ impl EditorApp {
         }
     }
 
+    fn sprite_source_preview_texture(
+        &mut self,
+        ctx: &egui::Context,
+        path: &Utf8Path,
+    ) -> Option<TextureHandle> {
+        let key = path.as_str().to_string();
+        if let Some(texture) = self.asset_browser_sprite_previews.get(&key) {
+            return Some(texture.clone());
+        }
+
+        let preview = load_sheet_preview(ctx, path.as_std_path()).ok()?;
+        let texture = preview.texture;
+        self.asset_browser_sprite_previews
+            .insert(key, texture.clone());
+        Some(texture)
+    }
+
+    fn diagnostic_matches_filters(&self, diagnostic: &Diagnostic) -> bool {
+        let severity_matches = match diagnostic.severity {
+            Severity::Error => self.diagnostics_view.show_errors,
+            Severity::Warning => self.diagnostics_view.show_warnings,
+        };
+        if !severity_matches {
+            return false;
+        }
+
+        let search = self.diagnostics_view.search.trim().to_ascii_lowercase();
+        if search.is_empty() {
+            return true;
+        }
+
+        diagnostic.code.to_ascii_lowercase().contains(&search)
+            || diagnostic.message.to_ascii_lowercase().contains(&search)
+            || diagnostic
+                .path
+                .as_deref()
+                .unwrap_or_default()
+                .to_ascii_lowercase()
+                .contains(&search)
+    }
+
+    fn filtered_diagnostics(&self) -> Vec<Diagnostic> {
+        self.report
+            .errors
+            .iter()
+            .chain(self.report.warnings.iter())
+            .filter(|diagnostic| self.diagnostic_matches_filters(diagnostic))
+            .cloned()
+            .collect()
+    }
+
+    fn navigate_to_diagnostic_path(&mut self, path: &str) {
+        if path == "project.toml" {
+            self.workspace.layout.show_tab(DockTab::Inspector);
+            self.status = "Opened project settings in the inspector.".to_string();
+            return;
+        }
+
+        if let Some(scene_id) = path.strip_prefix("scene:") {
+            if let Some(scene_index) = self
+                .bundle
+                .as_ref()
+                .and_then(|bundle| bundle.scenes.iter().position(|scene| scene.id == scene_id))
+            {
+                self.selected_scene = scene_index;
+                self.sync_selection();
+                self.focus_scene(scene_index);
+            }
+            return;
+        }
+
+        if let Some(dialogue_id) = path.strip_prefix("dialogue:") {
+            self.asset_browser_filter = dialogue_id.to_string();
+            self.workspace.layout.show_tab(DockTab::Assets);
+            self.status = format!("Filtered asset browser to dialogue '{}'", dialogue_id);
+            return;
+        }
+
+        for prefix in ["palette:", "tileset:", "metasprite:", "animation:"] {
+            if let Some(asset_id) = path.strip_prefix(prefix) {
+                self.asset_browser_filter = asset_id.to_string();
+                self.workspace.layout.show_tab(DockTab::Assets);
+                self.status = format!("Filtered asset browser to '{}'", asset_id);
+                return;
+            }
+        }
+    }
+
+    fn diagnostic_has_quick_fix(&self, diagnostic: &Diagnostic) -> bool {
+        matches!(
+            diagnostic.code.as_str(),
+            "manifest.missing_entry_scene"
+                | "asset.palette_too_large"
+                | "asset.missing_palette"
+                | "scene.trigger_missing_script"
+                | "script.dialogue_missing"
+                | "script.target_scene_missing"
+                | "scene.duplicate_id"
+                | "dialogue.duplicate_id"
+                | "manifest.duplicate_physics"
+        )
+    }
+
+    fn apply_diagnostic_quick_fix(&mut self, diagnostic: &Diagnostic) {
+        let Some(bundle) = &self.bundle else {
+            return;
+        };
+        let mut edited_bundle = bundle.clone();
+        let mut status = None;
+
+        match diagnostic.code.as_str() {
+            "manifest.missing_entry_scene" => {
+                if let Some(scene) = edited_bundle.scenes.first() {
+                    edited_bundle.manifest.gameplay.entry_scene = scene.id.clone();
+                    status = Some(format!("Set entry scene to '{}'", scene.id));
+                }
+            }
+            "asset.palette_too_large" => {
+                if let Some(palette_id) = diagnostic.path.as_deref().and_then(|path| path.strip_prefix("palette:")) {
+                    if let Some(palette) = edited_bundle
+                        .palettes
+                        .iter_mut()
+                        .find(|palette| palette.id == palette_id)
+                    {
+                        palette.colors.truncate(MAX_COLORS_PER_PALETTE);
+                        status = Some(format!("Trimmed palette '{}' to {} colors", palette.id, MAX_COLORS_PER_PALETTE));
+                    }
+                }
+            }
+            "asset.missing_palette" => {
+                let first_palette = edited_bundle.palettes.first().map(|palette| palette.id.clone());
+                if let (Some(tileset_id), Some(palette_id)) = (
+                    diagnostic.path.as_deref().and_then(|path| path.strip_prefix("tileset:")),
+                    first_palette,
+                ) {
+                    if let Some(tileset) = edited_bundle
+                        .tilesets
+                        .iter_mut()
+                        .find(|tileset| tileset.id == tileset_id)
+                    {
+                        tileset.palette_id = palette_id.clone();
+                        status = Some(format!("Reassigned '{}' to palette '{}'", tileset.id, palette_id));
+                    }
+                }
+            }
+            "scene.trigger_missing_script" => {
+                if let Some(scene_id) = diagnostic.path.as_deref().and_then(|path| path.strip_prefix("scene:")) {
+                    if let Some(scene) = edited_bundle.scenes.iter_mut().find(|scene| scene.id == scene_id) {
+                        let missing_script_ids = scene
+                            .triggers
+                            .iter()
+                            .filter(|trigger| scene.scripts.iter().all(|script| script.id != trigger.script_id))
+                            .map(|trigger| trigger.script_id.clone())
+                            .collect::<Vec<_>>();
+                        for script_id in &missing_script_ids {
+                            scene.scripts.push(snesmaker_events::EventScript {
+                                id: script_id.clone(),
+                                commands: Vec::new(),
+                            });
+                        }
+                        if !missing_script_ids.is_empty() {
+                            status = Some(format!("Added {} missing script stub(s) to '{}'", missing_script_ids.len(), scene.id));
+                        }
+                    }
+                }
+            }
+            "script.dialogue_missing" => {
+                let placeholder_id = "auto_dialogue".to_string();
+                if edited_bundle.dialogues.iter().all(|dialogue| dialogue.id != placeholder_id) {
+                    edited_bundle.dialogues.push(snesmaker_events::DialogueGraph {
+                        id: placeholder_id.clone(),
+                        opening_node: "start".to_string(),
+                        nodes: vec![snesmaker_events::DialogueNode {
+                            id: "start".to_string(),
+                            speaker: "System".to_string(),
+                            text: "Placeholder dialogue".to_string(),
+                            commands: Vec::new(),
+                            choices: Vec::new(),
+                            next: None,
+                        }],
+                    });
+                }
+
+                let valid_dialogues = edited_bundle
+                    .dialogues
+                    .iter()
+                    .map(|dialogue| dialogue.id.clone())
+                    .collect::<BTreeSet<_>>();
+
+                for scene in &mut edited_bundle.scenes {
+                    for script in &mut scene.scripts {
+                        for command in &mut script.commands {
+                            if let snesmaker_events::EventCommand::ShowDialogue { dialogue_id, .. } = command {
+                                if !valid_dialogues.contains(dialogue_id) {
+                                    *dialogue_id = placeholder_id.clone();
+                                }
+                            }
+                        }
+                    }
+                }
+                status = Some("Redirected missing dialogue references to a placeholder dialogue".to_string());
+            }
+            "script.target_scene_missing" => {
+                let fallback_scene = edited_bundle.scenes.first().map(|scene| scene.id.clone());
+                if let Some(fallback_scene) = fallback_scene {
+                    let valid_scenes = edited_bundle
+                        .scenes
+                        .iter()
+                        .map(|scene| scene.id.clone())
+                        .collect::<BTreeSet<_>>();
+                    for scene in &mut edited_bundle.scenes {
+                        for script in &mut scene.scripts {
+                            for command in &mut script.commands {
+                                if let snesmaker_events::EventCommand::LoadScene { scene_id, .. } = command {
+                                    if !valid_scenes.contains(scene_id) {
+                                        *scene_id = fallback_scene.clone();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    status = Some(format!("Redirected missing scene loads to '{}'", fallback_scene));
+                }
+            }
+            "scene.duplicate_id" => {
+                let mut seen = BTreeSet::new();
+                for scene in &mut edited_bundle.scenes {
+                    if !seen.insert(scene.id.clone()) {
+                        scene.id = next_unique_layer_id(&seen, &scene.id);
+                        seen.insert(scene.id.clone());
+                    }
+                }
+                status = Some("Renamed duplicate scene ids".to_string());
+            }
+            "dialogue.duplicate_id" => {
+                let mut seen = BTreeSet::new();
+                for dialogue in &mut edited_bundle.dialogues {
+                    if !seen.insert(dialogue.id.clone()) {
+                        dialogue.id = next_unique_layer_id(&seen, &dialogue.id);
+                        seen.insert(dialogue.id.clone());
+                    }
+                }
+                status = Some("Renamed duplicate dialogue ids".to_string());
+            }
+            "manifest.duplicate_physics" => {
+                let mut seen = BTreeSet::new();
+                for preset in &mut edited_bundle.manifest.gameplay.physics_presets {
+                    if !seen.insert(preset.id.clone()) {
+                        preset.id = next_unique_layer_id(&seen, &preset.id);
+                        seen.insert(preset.id.clone());
+                    }
+                }
+                status = Some("Renamed duplicate physics preset ids".to_string());
+            }
+            _ => {}
+        }
+
+        if let Some(status) = status {
+            self.capture_history();
+            self.bundle = Some(edited_bundle);
+            self.mark_edited(status);
+        }
+    }
+
     fn detect_workspace_preset(layout: &DockLayout) -> WorkspacePreset {
         for preset in [
             WorkspacePreset::LevelDesign,
@@ -600,15 +994,24 @@ impl EditorApp {
                     .clone()
                     .unwrap_or_else(|| self.workspace_preset.label().to_string());
                 self.save_layout_state.name = active_saved_layout;
+                self.workspace_addons = load_workspace_addons(&self.project_root)
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default();
             }
             Ok(None) => {
                 self.workspace_preset = WorkspacePreset::LevelDesign;
                 self.workspace = WorkspaceState::for_preset(WorkspacePreset::LevelDesign);
+                self.workspace_addons = load_workspace_addons(&self.project_root)
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default();
                 self.save_layout_state.name = WorkspacePreset::LevelDesign.label().to_string();
             }
             Err(error) => {
                 self.workspace_preset = WorkspacePreset::LevelDesign;
                 self.workspace = WorkspaceState::for_preset(WorkspacePreset::LevelDesign);
+                self.workspace_addons = WorkspaceAddons::default();
                 self.save_layout_state.name = WorkspacePreset::LevelDesign.label().to_string();
                 self.status = format!(
                     "Loaded {} with default workspace ({}).",
@@ -627,6 +1030,12 @@ impl EditorApp {
 
         if let Err(error) = save_workspace_file(&self.project_root, &workspace_file) {
             self.status = format!("Failed to save workspace layout: {}", error);
+        }
+    }
+
+    fn persist_workspace_addons(&mut self) {
+        if let Err(error) = save_workspace_addons(&self.project_root, &self.workspace_addons) {
+            self.status = format!("Failed to save editor addons: {}", error);
         }
     }
 
@@ -851,6 +1260,135 @@ impl EditorApp {
 
         if let Some(status) = status {
             self.mark_edited(status);
+        }
+    }
+
+    fn is_layer_soloed(&self, scene_index: usize, layer_index: usize) -> bool {
+        self.solo_layer == Some((scene_index, layer_index))
+    }
+
+    fn toggle_layer_solo(&mut self, scene_index: usize, layer_index: usize) {
+        if self.is_layer_soloed(scene_index, layer_index) {
+            self.solo_layer = None;
+            self.status = "Cleared layer solo".to_string();
+        } else {
+            self.solo_layer = Some((scene_index, layer_index));
+            self.status = self
+                .layer(scene_index, layer_index)
+                .map(|layer| format!("Solo layer '{}'", layer.id))
+                .unwrap_or_else(|| "Soloed layer".to_string());
+        }
+    }
+
+    fn is_group_soloed(&self, group: SceneObjectGroup) -> bool {
+        self.solo_group == Some(group)
+    }
+
+    fn toggle_group_solo(&mut self, group: SceneObjectGroup) {
+        if self.is_group_soloed(group) {
+            self.solo_group = None;
+            self.status = "Cleared object-group solo".to_string();
+        } else {
+            self.solo_group = Some(group);
+            self.status = format!("Solo {}", group.label());
+        }
+    }
+
+    fn request_focus_rect(&mut self, rect: RectI16, status: impl Into<String>) {
+        self.pending_focus_rect = Some(rect);
+        self.status = status.into();
+    }
+
+    fn focus_scene(&mut self, scene_index: usize) {
+        let Some(scene) = self
+            .bundle
+            .as_ref()
+            .and_then(|bundle| bundle.scenes.get(scene_index))
+        else {
+            return;
+        };
+
+        self.request_focus_rect(
+            RectI16 {
+                x: 0,
+                y: 0,
+                width: scene.size_tiles.width.saturating_mul(8),
+                height: scene.size_tiles.height.saturating_mul(8),
+            },
+            format!("Focused scene '{}'", scene.id),
+        );
+    }
+
+    fn focus_layer(&mut self, scene_index: usize, layer_index: usize) {
+        let Some(scene) = self
+            .bundle
+            .as_ref()
+            .and_then(|bundle| bundle.scenes.get(scene_index))
+        else {
+            return;
+        };
+        let Some(layer) = scene.layers.get(layer_index) else {
+            return;
+        };
+
+        let rect = layer_bounds_pixels(scene, layer).unwrap_or(RectI16 {
+            x: 0,
+            y: 0,
+            width: scene.size_tiles.width.saturating_mul(8),
+            height: scene.size_tiles.height.saturating_mul(8),
+        });
+        self.request_focus_rect(rect, format!("Focused layer '{}'", layer.id));
+    }
+
+    fn focus_point(&mut self, label: &str, point: PointI16) {
+        self.request_focus_rect(
+            RectI16 {
+                x: point.x,
+                y: point.y,
+                width: 16,
+                height: 16,
+            },
+            format!("Focused {}", label),
+        );
+    }
+
+    fn focus_trigger_rect(&mut self, label: &str, rect: RectI16) {
+        self.request_focus_rect(rect, format!("Focused {}", label));
+    }
+
+    fn duplicate_layer(&mut self, scene_index: usize, layer_index: usize) {
+        let Some(scene) = self
+            .bundle
+            .as_ref()
+            .and_then(|bundle| bundle.scenes.get(scene_index))
+        else {
+            return;
+        };
+        let Some(layer) = scene.layers.get(layer_index).cloned() else {
+            return;
+        };
+
+        let existing_ids = scene
+            .layers
+            .iter()
+            .map(|entry| entry.id.clone())
+            .collect::<BTreeSet<_>>();
+        let new_id = next_unique_layer_id(&existing_ids, &layer.id);
+
+        self.capture_history();
+        if let Some(scene) = self
+            .bundle
+            .as_mut()
+            .and_then(|bundle| bundle.scenes.get_mut(scene_index))
+        {
+            let insert_at = (layer_index + 1).min(scene.layers.len());
+            let mut duplicate = layer;
+            duplicate.id = new_id.clone();
+            scene.layers.insert(insert_at, duplicate);
+            self.selected_scene = scene_index;
+            self.selected_layer = insert_at;
+            self.sync_selection();
+            self.mark_edited(format!("Duplicated layer '{}'", new_id));
         }
     }
 
@@ -1241,6 +1779,281 @@ impl EditorApp {
         ));
     }
 
+    fn is_asset_favorite(&self, kind: &str, id: &str) -> bool {
+        let favorites = &self.workspace_addons.editor_favorites;
+        match kind {
+            "scene" => favorites.scenes.iter().any(|value| value == id),
+            "palette" => favorites.palettes.iter().any(|value| value == id),
+            "tileset" => favorites.tilesets.iter().any(|value| value == id),
+            "metasprite" => favorites.metasprites.iter().any(|value| value == id),
+            "animation" => favorites.animations.iter().any(|value| value == id),
+            "dialogue" => favorites.dialogues.iter().any(|value| value == id),
+            "sprite_source" => favorites.sprite_sources.iter().any(|value| value == id),
+            _ => false,
+        }
+    }
+
+    fn toggle_asset_favorite(&mut self, kind: &str, id: &str) {
+        let values = match kind {
+            "scene" => &mut self.workspace_addons.editor_favorites.scenes,
+            "palette" => &mut self.workspace_addons.editor_favorites.palettes,
+            "tileset" => &mut self.workspace_addons.editor_favorites.tilesets,
+            "metasprite" => &mut self.workspace_addons.editor_favorites.metasprites,
+            "animation" => &mut self.workspace_addons.editor_favorites.animations,
+            "dialogue" => &mut self.workspace_addons.editor_favorites.dialogues,
+            "sprite_source" => &mut self.workspace_addons.editor_favorites.sprite_sources,
+            _ => return,
+        };
+
+        if let Some(index) = values.iter().position(|value| value == id) {
+            values.remove(index);
+        } else {
+            values.push(id.to_string());
+        }
+        self.persist_workspace_addons();
+    }
+
+    fn next_snippet_name(&self, prefix: &str) -> String {
+        let used = self
+            .workspace_addons
+            .scene_library
+            .snippets
+            .iter()
+            .map(|snippet| snippet.name.clone())
+            .chain(
+                self.workspace_addons
+                    .scene_library
+                    .brushes
+                    .iter()
+                    .map(|brush| brush.name.clone()),
+            )
+            .collect::<BTreeSet<_>>();
+        next_unique_layer_id(&used, prefix)
+    }
+
+    fn save_selection_as_brush(&mut self) {
+        let Some(selection) = &self.selection else {
+            self.status = "Select a region before saving a brush.".to_string();
+            return;
+        };
+        let Some(scene) = self.current_scene() else {
+            return;
+        };
+        let Some(layer) = self.current_layer() else {
+            return;
+        };
+
+        let width = selection.rect.width_tiles();
+        let height = selection.rect.height_tiles();
+        let scene_width = scene.size_tiles.width as usize;
+        let mut brush = SavedTileBrush {
+            name: self.next_snippet_name("terrain_brush"),
+            size_tiles: snesmaker_project::GridSize {
+                width: width as u16,
+                height: height as u16,
+            },
+            ..SavedTileBrush::default()
+        };
+
+        for tile_y in selection.rect.min_y..=selection.rect.max_y {
+            for tile_x in selection.rect.min_x..=selection.rect.max_x {
+                let cell_index = tile_y * scene_width + tile_x;
+                brush
+                    .tiles
+                    .push(layer.tiles.get(cell_index).copied().unwrap_or_default());
+                brush
+                    .solids
+                    .push(scene.collision.solids.get(cell_index).copied().unwrap_or(false));
+                brush
+                    .ladders
+                    .push(scene.collision.ladders.get(cell_index).copied().unwrap_or(false));
+                brush
+                    .hazards
+                    .push(scene.collision.hazards.get(cell_index).copied().unwrap_or(false));
+            }
+        }
+
+        let label = brush.name.clone();
+        self.workspace_addons.scene_library.brushes.push(brush);
+        self.workspace_addons.scene_library.normalize();
+        self.persist_workspace_addons();
+        self.status = format!("Saved brush '{}'", label);
+    }
+
+    fn save_selection_as_snippet(&mut self) {
+        let Some(selection) = &self.selection else {
+            self.status = "Select a region before saving a snippet.".to_string();
+            return;
+        };
+        let Some(scene) = self.current_scene() else {
+            return;
+        };
+
+        let width = selection.rect.width_tiles();
+        let height = selection.rect.height_tiles();
+        let scene_width = scene.size_tiles.width as usize;
+        let origin = selection.rect.origin_pixels();
+        let mut snippet = SavedSceneSnippet {
+            name: self.next_snippet_name("scene_snippet"),
+            source_scene_id: Some(scene.id.clone()),
+            scene_kind: scene.kind,
+            size_tiles: snesmaker_project::GridSize {
+                width: width as u16,
+                height: height as u16,
+            },
+            ..SavedSceneSnippet::default()
+        };
+
+        for tile_y in selection.rect.min_y..=selection.rect.max_y {
+            for tile_x in selection.rect.min_x..=selection.rect.max_x {
+                let cell_index = tile_y * scene_width + tile_x;
+                snippet
+                    .collision
+                    .solids
+                    .push(scene.collision.solids.get(cell_index).copied().unwrap_or(false));
+                snippet
+                    .collision
+                    .ladders
+                    .push(scene.collision.ladders.get(cell_index).copied().unwrap_or(false));
+                snippet
+                    .collision
+                    .hazards
+                    .push(scene.collision.hazards.get(cell_index).copied().unwrap_or(false));
+            }
+        }
+
+        for layer in &scene.layers {
+            let mut snippet_layer = TileLayer {
+                id: layer.id.clone(),
+                tileset_id: layer.tileset_id.clone(),
+                visible: layer.visible,
+                parallax_x: layer.parallax_x,
+                parallax_y: layer.parallax_y,
+                tiles: Vec::with_capacity(width * height),
+            };
+            for tile_y in selection.rect.min_y..=selection.rect.max_y {
+                for tile_x in selection.rect.min_x..=selection.rect.max_x {
+                    let cell_index = tile_y * scene_width + tile_x;
+                    snippet_layer
+                        .tiles
+                        .push(layer.tiles.get(cell_index).copied().unwrap_or_default());
+                }
+            }
+            snippet.layers.push(snippet_layer);
+        }
+
+        snippet.spawns = selection
+            .spawns
+            .iter()
+            .filter_map(|index| scene.spawns.get(*index))
+            .cloned()
+            .map(|mut spawn| {
+                spawn.position.x -= origin.x;
+                spawn.position.y -= origin.y;
+                spawn
+            })
+            .collect();
+        snippet.checkpoints = selection
+            .checkpoints
+            .iter()
+            .filter_map(|index| scene.checkpoints.get(*index))
+            .cloned()
+            .map(|mut checkpoint| {
+                checkpoint.position.x -= origin.x;
+                checkpoint.position.y -= origin.y;
+                checkpoint
+            })
+            .collect();
+        snippet.entities = selection
+            .entities
+            .iter()
+            .filter_map(|index| scene.entities.get(*index))
+            .cloned()
+            .map(|mut entity| {
+                entity.position.x -= origin.x;
+                entity.position.y -= origin.y;
+                entity
+            })
+            .collect();
+        snippet.triggers = selection
+            .triggers
+            .iter()
+            .filter_map(|index| scene.triggers.get(*index))
+            .cloned()
+            .map(|mut trigger| {
+                trigger.rect.x -= origin.x;
+                trigger.rect.y -= origin.y;
+                trigger
+            })
+            .collect();
+
+        let label = snippet.name.clone();
+        self.workspace_addons.scene_library.snippets.push(snippet);
+        self.workspace_addons.scene_library.normalize();
+        self.persist_workspace_addons();
+        self.status = format!("Saved scene snippet '{}'", label);
+    }
+
+    fn load_brush_into_clipboard(&mut self, name: &str) {
+        let Some(brush) = self
+            .workspace_addons
+            .scene_library
+            .brushes
+            .iter()
+            .find(|brush| brush.name.eq_ignore_ascii_case(name))
+            .cloned()
+        else {
+            return;
+        };
+        self.clipboard = Some(SceneClipboard {
+            width_tiles: brush.size_tiles.width as usize,
+            height_tiles: brush.size_tiles.height as usize,
+            tiles: brush.tiles,
+            solids: brush.solids,
+            ladders: brush.ladders,
+            hazards: brush.hazards,
+            spawns: Vec::new(),
+            checkpoints: Vec::new(),
+            entities: Vec::new(),
+            triggers: Vec::new(),
+        });
+        self.status = format!("Loaded brush '{}' into the clipboard", brush.name);
+    }
+
+    fn load_snippet_into_clipboard(&mut self, name: &str) {
+        let Some(snippet) = self
+            .workspace_addons
+            .scene_library
+            .snippets
+            .iter()
+            .find(|snippet| snippet.name.eq_ignore_ascii_case(name))
+            .cloned()
+        else {
+            return;
+        };
+        let tiles = snippet
+            .layers
+            .first()
+            .map(|layer| layer.tiles.clone())
+            .unwrap_or_default();
+        self.clipboard = Some(SceneClipboard {
+            width_tiles: snippet.size_tiles.width as usize,
+            height_tiles: snippet.size_tiles.height as usize,
+            tiles,
+            solids: snippet.collision.solids,
+            ladders: snippet.collision.ladders,
+            hazards: snippet.collision.hazards,
+            spawns: snippet.spawns,
+            checkpoints: snippet.checkpoints,
+            entities: snippet.entities,
+            triggers: snippet.triggers,
+        });
+        self.status = format!(
+            "Loaded scene snippet '{}' into the clipboard",
+            snippet.name
+        );
+    }
+
     fn sample_tile_from_cell(&mut self, cell_index: usize) {
         let Some(layer) = self.current_layer() else {
             self.status = "No active layer loaded.".to_string();
@@ -1358,6 +2171,143 @@ impl EditorApp {
         }
     }
 
+    fn draw_line_in_selection(&mut self) {
+        let Some(selection_rect) = self.selection.as_ref().map(|selection| selection.rect) else {
+            self.status = "Select a region first.".to_string();
+            return;
+        };
+        if self.active_layer_locked() {
+            self.status = "Active layer is locked.".to_string();
+            return;
+        }
+
+        let start = (selection_rect.min_x as i32, selection_rect.min_y as i32);
+        let end = (selection_rect.max_x as i32, selection_rect.max_y as i32);
+        let points = bresenham_line(start, end);
+        let selected_layer = self.selected_layer;
+        let selected_tile = self.selected_tile as u16;
+        self.capture_history();
+        if let Some(scene) = self.current_scene_mut() {
+            let width = scene.size_tiles.width as usize;
+            if let Some(layer) = scene.layers.get_mut(selected_layer) {
+                for (tile_x, tile_y) in points {
+                    let index = tile_y as usize * width + tile_x as usize;
+                    if let Some(tile) = layer.tiles.get_mut(index) {
+                        *tile = selected_tile;
+                    }
+                }
+            }
+        }
+        self.mark_edited("Drew a line across the current selection");
+    }
+
+    fn mirror_selection(&mut self, horizontal: bool) {
+        let Some(selection_rect) = self.selection.as_ref().map(|selection| selection.rect) else {
+            self.status = "Select a region first.".to_string();
+            return;
+        };
+        if self.active_layer_locked() {
+            self.status = "Active layer is locked.".to_string();
+            return;
+        }
+
+        let selected_layer = self.selected_layer;
+        self.capture_history();
+        if let Some(scene) = self.current_scene_mut() {
+            let width = scene.size_tiles.width as usize;
+            let layer_index = selected_layer.min(scene.layers.len().saturating_sub(1));
+            if let Some(layer) = scene.layers.get_mut(layer_index) {
+                let original_tiles = layer.tiles.clone();
+                let original_solids = scene.collision.solids.clone();
+                let original_ladders = scene.collision.ladders.clone();
+                let original_hazards = scene.collision.hazards.clone();
+
+                for tile_y in selection_rect.min_y..=selection_rect.max_y {
+                    for tile_x in selection_rect.min_x..=selection_rect.max_x {
+                        let mirror_x = if horizontal {
+                            selection_rect.max_x - (tile_x - selection_rect.min_x)
+                        } else {
+                            tile_x
+                        };
+                        let mirror_y = if horizontal {
+                            tile_y
+                        } else {
+                            selection_rect.max_y - (tile_y - selection_rect.min_y)
+                        };
+                        let source_index = mirror_y * width + mirror_x;
+                        let target_index = tile_y * width + tile_x;
+                        layer.tiles[target_index] = original_tiles[source_index];
+                        scene.collision.solids[target_index] = original_solids[source_index];
+                        scene.collision.ladders[target_index] = original_ladders[source_index];
+                        scene.collision.hazards[target_index] = original_hazards[source_index];
+                    }
+                }
+            }
+        }
+        self.mark_edited(if horizontal {
+            "Mirrored the current selection horizontally"
+        } else {
+            "Mirrored the current selection vertically"
+        });
+    }
+
+    fn flood_fill_from_hovered_tile(&mut self) {
+        let Some((start_x, start_y)) = self.last_canvas_tile else {
+            self.status = "Hover or click a tile before using flood fill.".to_string();
+            return;
+        };
+        if self.active_layer_locked() {
+            self.status = "Active layer is locked.".to_string();
+            return;
+        }
+
+        let selected_layer = self.selected_layer;
+        let replacement = self.selected_tile as u16;
+        self.capture_history();
+        if let Some(scene) = self.current_scene_mut() {
+            let width = scene.size_tiles.width as usize;
+            let height = scene.size_tiles.height as usize;
+            let layer_index = selected_layer.min(scene.layers.len().saturating_sub(1));
+            if let Some(layer) = scene.layers.get_mut(layer_index) {
+                let target_index = start_y * width + start_x;
+                let Some(source_tile) = layer.tiles.get(target_index).copied() else {
+                    return;
+                };
+                if source_tile == replacement {
+                    self.status = "Flood fill skipped because the target tile already matches."
+                        .to_string();
+                    return;
+                }
+
+                let mut queue = vec![(start_x, start_y)];
+                let mut visited = BTreeSet::new();
+                while let Some((tile_x, tile_y)) = queue.pop() {
+                    if tile_x >= width || tile_y >= height || !visited.insert((tile_x, tile_y)) {
+                        continue;
+                    }
+                    let index = tile_y * width + tile_x;
+                    if layer.tiles.get(index).copied().unwrap_or_default() != source_tile {
+                        continue;
+                    }
+                    layer.tiles[index] = replacement;
+                    if tile_x > 0 {
+                        queue.push((tile_x - 1, tile_y));
+                    }
+                    if tile_x + 1 < width {
+                        queue.push((tile_x + 1, tile_y));
+                    }
+                    if tile_y > 0 {
+                        queue.push((tile_x, tile_y - 1));
+                    }
+                    if tile_y + 1 < height {
+                        queue.push((tile_x, tile_y + 1));
+                    }
+                }
+            }
+        }
+        self.mark_edited("Flood-filled the current layer");
+    }
+
     fn project_sprite_source_dir(&self) -> Utf8PathBuf {
         self.project_root.join(PROJECT_SPRITE_SOURCE_DIR)
     }
@@ -1408,6 +2358,105 @@ impl EditorApp {
         ids.sort();
         ids.dedup();
         ids
+    }
+
+    fn asset_usage_summary(&self, kind: &str, id: &str) -> String {
+        let Some(bundle) = &self.bundle else {
+            return "No project loaded.".to_string();
+        };
+
+        match kind {
+            "scene" => {
+                let entry = (bundle.manifest.gameplay.entry_scene == id)
+                    .then_some("entry scene")
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                let load_refs = bundle
+                    .scenes
+                    .iter()
+                    .flat_map(|scene| scene.scripts.iter())
+                    .flat_map(|script| script.commands.iter())
+                    .filter(|command| {
+                        matches!(
+                            command,
+                            snesmaker_events::EventCommand::LoadScene { scene_id, .. } if scene_id == id
+                        )
+                    })
+                    .count();
+                let mut parts = entry.into_iter().map(str::to_string).collect::<Vec<_>>();
+                if load_refs > 0 {
+                    parts.push(format!("loaded by {} script command(s)", load_refs));
+                }
+                if parts.is_empty() {
+                    "No inbound references".to_string()
+                } else {
+                    parts.join(" | ")
+                }
+            }
+            "palette" => {
+                let tilesets = bundle
+                    .tilesets
+                    .iter()
+                    .filter(|tileset| tileset.palette_id == id)
+                    .count();
+                let metasprites = bundle
+                    .metasprites
+                    .iter()
+                    .filter(|metasprite| metasprite.palette_id == id)
+                    .count();
+                format!("{} tileset(s) | {} metasprite(s)", tilesets, metasprites)
+            }
+            "tileset" => {
+                let layers = bundle
+                    .scenes
+                    .iter()
+                    .flat_map(|scene| scene.layers.iter())
+                    .filter(|layer| layer.tileset_id == id)
+                    .count();
+                format!("Used by {} layer(s)", layers)
+            }
+            "metasprite" => {
+                let animations = bundle
+                    .animations
+                    .iter()
+                    .filter(|animation| animation.frames.iter().any(|frame| frame.metasprite_id == id))
+                    .count();
+                let entities = bundle
+                    .scenes
+                    .iter()
+                    .flat_map(|scene| scene.entities.iter())
+                    .filter(|entity| entity.archetype == id)
+                    .count();
+                format!("{} animation(s) | {} entity placement(s)", animations, entities)
+            }
+            "animation" => {
+                let entities = bundle
+                    .scenes
+                    .iter()
+                    .flat_map(|scene| scene.entities.iter())
+                    .filter(|entity| entity.archetype == id)
+                    .count();
+                format!("Used by {} entity placement(s)", entities)
+            }
+            "dialogue" => {
+                let scripts = bundle
+                    .scenes
+                    .iter()
+                    .flat_map(|scene| scene.scripts.iter())
+                    .filter(|script| {
+                        script.commands.iter().any(|command| {
+                            matches!(
+                                command,
+                                snesmaker_events::EventCommand::ShowDialogue { dialogue_id, .. }
+                                    if dialogue_id == id
+                            )
+                        })
+                    })
+                    .count();
+                format!("Referenced by {} script(s)", scripts)
+            }
+            _ => "No usage metadata".to_string(),
+        }
     }
 
     fn copy_project_sprite_sources_to(&self, export_root: &Utf8Path) -> Result<()> {
@@ -1639,6 +2688,92 @@ impl EditorApp {
                 self.playtest_state.last_status = message.clone();
                 self.status = message;
             }
+        }
+    }
+
+    fn selected_physics_profile(&self) -> Option<PhysicsProfile> {
+        let bundle = self.bundle.as_ref()?;
+        if self.playtest_state.selected_physics_id.is_empty() {
+            return bundle.manifest.gameplay.physics_presets.first().cloned();
+        }
+        bundle
+            .manifest
+            .gameplay
+            .physics_presets
+            .iter()
+            .find(|preset| preset.id == self.playtest_state.selected_physics_id)
+            .cloned()
+            .or_else(|| bundle.manifest.gameplay.physics_presets.first().cloned())
+    }
+
+    fn reset_playtest_session(&mut self) {
+        let Some(scene) = self.current_scene().cloned() else {
+            self.playtest_state.session = None;
+            return;
+        };
+        let Some(profile) = self.selected_physics_profile() else {
+            self.playtest_state.session = None;
+            return;
+        };
+
+        let profile_id = profile.id.clone();
+        let mut session = PlaytestSession::new(&scene, profile);
+        match self.playtest_state.start_mode {
+            PlaytestStartMode::SceneStart => {
+                session.reset_to_default_start();
+                self.playtest_state.last_status =
+                    format!("Started '{}' from its default start", scene.id);
+            }
+            PlaytestStartMode::SelectedSpawn => {
+                if let Some(index) = self.selected_spawn.and_then(|index| scene.spawns.get(index)) {
+                    let _ = session.reset_to_spawn_id(&index.id);
+                    self.playtest_state.last_status =
+                        format!("Started '{}' from spawn '{}'", scene.id, index.id);
+                } else {
+                    session.reset_to_default_start();
+                    self.playtest_state.last_status =
+                        format!("Started '{}' from its default start", scene.id);
+                }
+            }
+            PlaytestStartMode::SelectedCheckpoint => {
+                if let Some(index) = self
+                    .selected_checkpoint
+                    .and_then(|index| scene.checkpoints.get(index))
+                {
+                    let _ = session.reset_to_checkpoint_id(&index.id);
+                    self.playtest_state.last_status = format!(
+                        "Started '{}' from checkpoint '{}'",
+                        scene.id, index.id
+                    );
+                } else {
+                    session.reset_to_default_start();
+                    self.playtest_state.last_status =
+                        format!("Started '{}' from its default start", scene.id);
+                }
+            }
+        }
+
+        self.playtest_state.session = Some(session);
+        self.playtest_state.playing = false;
+        self.playtest_state.accumulated_seconds = 0.0;
+        self.playtest_state.selected_physics_id = profile_id;
+    }
+
+    fn step_playtest_session(&mut self, input: InputFrame) {
+        if self.playtest_state.session.is_none() {
+            self.reset_playtest_session();
+        }
+        if let Some(session) = &mut self.playtest_state.session {
+            let state = session.step(input);
+            self.playtest_state.last_status = format!(
+                "Frame {}  x={} y={}  grounded={} ladder={} hazard={}",
+                state.frame,
+                state.x_fp >> snesmaker_project::FIXED_POINT_SHIFT,
+                state.y_fp >> snesmaker_project::FIXED_POINT_SHIFT,
+                state.grounded,
+                state.on_ladder,
+                state.touching_hazard
+            );
         }
     }
 
@@ -3336,21 +4471,201 @@ impl EditorApp {
     }
 
     fn draw_diagnostics(&mut self, ui: &mut egui::Ui) {
-        ui.collapsing("Diagnostics", |ui| {
-            if self.report.errors.is_empty() && self.report.warnings.is_empty() {
-                ui.label("No diagnostics.");
-            }
-            for diagnostic in self.report.errors.iter().chain(self.report.warnings.iter()) {
-                let color = match diagnostic.severity {
-                    Severity::Error => Color32::from_rgb(180, 48, 48),
-                    Severity::Warning => Color32::from_rgb(196, 136, 24),
-                };
-                ui.colored_label(
-                    color,
-                    format!("[{}] {}", diagnostic.code, diagnostic.message),
-                );
-            }
+        let mut navigate_to = None;
+        let mut quick_fix = None;
+
+        ui.heading("Diagnostics");
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.diagnostics_view.search)
+                    .hint_text("Search message, code, or asset path"),
+            );
+            ui.checkbox(&mut self.diagnostics_view.show_errors, "Errors");
+            ui.checkbox(&mut self.diagnostics_view.show_warnings, "Warnings");
+            egui::ComboBox::from_label("Group")
+                .selected_text(self.diagnostics_view.grouping.label())
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut self.diagnostics_view.grouping,
+                        DiagnosticGrouping::Severity,
+                        DiagnosticGrouping::Severity.label(),
+                    );
+                    ui.selectable_value(
+                        &mut self.diagnostics_view.grouping,
+                        DiagnosticGrouping::Code,
+                        DiagnosticGrouping::Code.label(),
+                    );
+                    ui.selectable_value(
+                        &mut self.diagnostics_view.grouping,
+                        DiagnosticGrouping::Path,
+                        DiagnosticGrouping::Path.label(),
+                    );
+                });
         });
+
+        ui.separator();
+        ui.collapsing("Budgets", |ui| {
+            let tile_peak = self
+                .bundle
+                .as_ref()
+                .map(|bundle| {
+                    bundle
+                        .tilesets
+                        .iter()
+                        .map(|tileset| tileset.tiles.len())
+                        .max()
+                        .unwrap_or(0)
+                })
+                .unwrap_or(0);
+            let max_rom_banks = self
+                .bundle
+                .as_ref()
+                .map(|bundle| bundle.manifest.build.rom_bank_count.max(1) as usize)
+                .unwrap_or(1);
+            let tile_fraction = (tile_peak as f32 / MAX_TILESET_TILES as f32).clamp(0.0, 1.0);
+            let total_palette_capacity = MAX_PALETTES * MAX_COLORS_PER_PALETTE;
+            let palette_fraction =
+                (self.report.budgets.palette_colors as f32 / total_palette_capacity as f32)
+                    .clamp(0.0, 1.0);
+            let rom_fraction = (self.report.budgets.estimated_rom_banks as f32
+                / max_rom_banks as f32)
+                .clamp(0.0, 1.0);
+            let metasprite_fraction = (self.report.budgets.metasprite_piece_peak as f32
+                / MAX_METASPRITE_TILES_HARD as f32)
+                .clamp(0.0, 1.0);
+            let rom_bytes_capacity = max_rom_banks * ROM_BANK_SIZE;
+            let rom_bytes_fraction =
+                (self.report.budgets.estimated_rom_bytes as f32 / rom_bytes_capacity as f32)
+                    .clamp(0.0, 1.0);
+            let metasprite_warning = self.report.budgets.metasprite_piece_peak
+                >= MAX_METASPRITE_TILES_WARN;
+
+            ui.label("Tileset peak");
+            ui.add(
+                egui::ProgressBar::new(tile_fraction).text(format!(
+                    "{} / {} tiles",
+                    tile_peak, MAX_TILESET_TILES
+                )),
+            );
+            ui.label("Palette colors");
+            ui.add(
+                egui::ProgressBar::new(palette_fraction).text(format!(
+                    "{} / {} colors",
+                    self.report.budgets.palette_colors, total_palette_capacity
+                )),
+            );
+            ui.label("Metasprite peak");
+            ui.add(
+                egui::ProgressBar::new(metasprite_fraction).text(format!(
+                    "{} / {} pieces{}",
+                    self.report.budgets.metasprite_piece_peak,
+                    MAX_METASPRITE_TILES_HARD,
+                    if metasprite_warning { " (warning zone)" } else { "" }
+                )),
+            );
+            ui.label("ROM banks");
+            ui.add(
+                egui::ProgressBar::new(rom_fraction).text(format!(
+                    "{} / {} bank(s)",
+                    self.report.budgets.estimated_rom_banks, max_rom_banks
+                )),
+            );
+            ui.label("ROM bytes");
+            ui.add(
+                egui::ProgressBar::new(rom_bytes_fraction).text(format!(
+                    "{} / {} bytes",
+                    self.report.budgets.estimated_rom_bytes, rom_bytes_capacity
+                )),
+            );
+        });
+
+        let diagnostics = self.filtered_diagnostics();
+        if diagnostics.is_empty() {
+            ui.separator();
+            ui.label("No diagnostics match the current filters.");
+        } else {
+            ui.separator();
+            match self.diagnostics_view.grouping {
+                DiagnosticGrouping::Severity => {
+                    for (heading, severity) in [
+                        ("Errors", Severity::Error),
+                        ("Warnings", Severity::Warning),
+                    ] {
+                        let group = diagnostics
+                            .iter()
+                            .filter(|diagnostic| diagnostic.severity == severity)
+                            .cloned()
+                            .collect::<Vec<_>>();
+                        if group.is_empty() {
+                            continue;
+                        }
+                        ui.collapsing(format!("{} ({})", heading, group.len()), |ui| {
+                            for diagnostic in &group {
+                                draw_diagnostic_row(
+                                    ui,
+                                    diagnostic,
+                                    self.diagnostic_has_quick_fix(diagnostic),
+                                    &mut navigate_to,
+                                    &mut quick_fix,
+                                );
+                            }
+                        });
+                    }
+                }
+                DiagnosticGrouping::Code => {
+                    let mut groups = BTreeMap::<String, Vec<Diagnostic>>::new();
+                    for diagnostic in diagnostics {
+                        groups
+                            .entry(diagnostic.code.clone())
+                            .or_default()
+                            .push(diagnostic);
+                    }
+                    for (code, group) in groups {
+                        ui.collapsing(format!("{} ({})", code, group.len()), |ui| {
+                            for diagnostic in &group {
+                                draw_diagnostic_row(
+                                    ui,
+                                    diagnostic,
+                                    self.diagnostic_has_quick_fix(diagnostic),
+                                    &mut navigate_to,
+                                    &mut quick_fix,
+                                );
+                            }
+                        });
+                    }
+                }
+                DiagnosticGrouping::Path => {
+                    let mut groups = BTreeMap::<String, Vec<Diagnostic>>::new();
+                    for diagnostic in diagnostics {
+                        let key = diagnostic
+                            .path
+                            .clone()
+                            .unwrap_or_else(|| "unscoped".to_string());
+                        groups.entry(key).or_default().push(diagnostic);
+                    }
+                    for (path, group) in groups {
+                        ui.collapsing(format!("{} ({})", path, group.len()), |ui| {
+                            for diagnostic in &group {
+                                draw_diagnostic_row(
+                                    ui,
+                                    diagnostic,
+                                    self.diagnostic_has_quick_fix(diagnostic),
+                                    &mut navigate_to,
+                                    &mut quick_fix,
+                                );
+                            }
+                        });
+                    }
+                }
+            }
+        }
+
+        if let Some(path) = navigate_to {
+            self.navigate_to_diagnostic_path(&path);
+        }
+        if let Some(diagnostic) = quick_fix {
+            self.apply_diagnostic_quick_fix(&diagnostic);
+        }
     }
 
     fn draw_scene_outliner(&mut self, ui: &mut egui::Ui) {
@@ -3360,15 +4675,40 @@ impl EditorApp {
         );
         ui.add_space(6.0);
 
-        let Some(bundle) = &self.bundle else {
+        ui.horizontal_wrapped(|ui| {
+            if let Some((scene_index, layer_index)) = self.solo_layer {
+                let label = self
+                    .layer(scene_index, layer_index)
+                    .map(|layer| format!("Solo layer: {}", layer.id))
+                    .unwrap_or_else(|| "Solo layer".to_string());
+                ui.label(label);
+                if ui.small_button("Clear").clicked() {
+                    self.solo_layer = None;
+                    self.status = "Cleared layer solo".to_string();
+                }
+            }
+            if let Some(group) = self.solo_group {
+                ui.label(format!("Solo group: {}", group.label()));
+                if ui.small_button("Clear").clicked() {
+                    self.solo_group = None;
+                    self.status = "Cleared object-group solo".to_string();
+                }
+            }
+        });
+        ui.add_space(4.0);
+
+        let Some(bundle) = self.bundle.clone() else {
             ui.label("No project loaded.");
             return;
         };
 
-        enum PendingSelection {
+        enum PendingOutlinerAction {
             Scene {
                 scene_index: usize,
                 label: String,
+            },
+            SceneFocus {
+                scene_index: usize,
             },
             Layer {
                 scene_index: usize,
@@ -3383,34 +4723,99 @@ impl EditorApp {
                 scene_index: usize,
                 layer_index: usize,
             },
+            LayerSolo {
+                scene_index: usize,
+                layer_index: usize,
+            },
+            LayerFocus {
+                scene_index: usize,
+                layer_index: usize,
+            },
+            LayerDuplicate {
+                scene_index: usize,
+                layer_index: usize,
+            },
+            GroupSolo(SceneObjectGroup),
             Spawn {
                 scene_index: usize,
                 index: usize,
                 label: String,
+            },
+            SpawnFocus {
+                scene_index: usize,
+                index: usize,
+            },
+            SpawnDuplicate {
+                scene_index: usize,
+                index: usize,
+            },
+            SpawnIsolate {
+                scene_index: usize,
+                index: usize,
             },
             Checkpoint {
                 scene_index: usize,
                 index: usize,
                 label: String,
             },
+            CheckpointFocus {
+                scene_index: usize,
+                index: usize,
+            },
+            CheckpointDuplicate {
+                scene_index: usize,
+                index: usize,
+            },
+            CheckpointIsolate {
+                scene_index: usize,
+                index: usize,
+            },
             Entity {
                 scene_index: usize,
                 index: usize,
                 label: String,
+            },
+            EntityFocus {
+                scene_index: usize,
+                index: usize,
+            },
+            EntityDuplicate {
+                scene_index: usize,
+                index: usize,
+            },
+            EntityIsolate {
+                scene_index: usize,
+                index: usize,
             },
             Trigger {
                 scene_index: usize,
                 index: usize,
                 label: String,
             },
+            TriggerFocus {
+                scene_index: usize,
+                index: usize,
+            },
+            TriggerDuplicate {
+                scene_index: usize,
+                index: usize,
+            },
+            TriggerIsolate {
+                scene_index: usize,
+                index: usize,
+            },
             Script {
+                scene_index: usize,
+                label: String,
+            },
+            ScriptIsolate {
                 scene_index: usize,
                 label: String,
             },
         }
 
         let filter = self.outliner_filter.trim().to_ascii_lowercase();
-        let mut pending_selection = None;
+        let mut pending_action = None;
 
         egui::ScrollArea::vertical().show(ui, |ui| {
             for (scene_index, scene) in bundle.scenes.iter().enumerate() {
@@ -3447,26 +4852,50 @@ impl EditorApp {
                 egui::CollapsingHeader::new(format!("{} ({:?})", scene.id, scene.kind))
                     .default_open(self.selected_scene == scene_index)
                     .show(ui, |ui| {
-                        if ui
-                            .selectable_label(
-                                self.selected_scene == scene_index,
-                                format!(
-                                    "Open scene ({}, {} entities, {} triggers)",
-                                    scene.layers.len(),
-                                    scene.entities.len(),
-                                    scene.triggers.len()
-                                ),
-                            )
-                            .clicked()
-                        {
-                            pending_selection = Some(PendingSelection::Scene {
-                                scene_index,
-                                label: scene.id.clone(),
-                            });
-                        }
+                        ui.horizontal(|ui| {
+                            if ui
+                                .selectable_label(
+                                    self.selected_scene == scene_index,
+                                    format!(
+                                        "Open scene ({}, {} entities, {} triggers)",
+                                        scene.layers.len(),
+                                        scene.entities.len(),
+                                        scene.triggers.len()
+                                    ),
+                                )
+                                .clicked()
+                            {
+                                pending_action = Some(PendingOutlinerAction::Scene {
+                                    scene_index,
+                                    label: scene.id.clone(),
+                                });
+                            }
+                            if ui.small_button("Focus").clicked() {
+                                pending_action =
+                                    Some(PendingOutlinerAction::SceneFocus { scene_index });
+                            }
+                        });
 
                         ui.separator();
-                        ui.label("Layers");
+                        ui.horizontal(|ui| {
+                            ui.label("Layers");
+                            if ui
+                                .small_button(if self.is_layer_soloed(scene_index, self.selected_layer)
+                                {
+                                    "Clear Solo"
+                                } else {
+                                    "Solo Active"
+                                })
+                                .clicked()
+                            {
+                                pending_action = Some(PendingOutlinerAction::LayerSolo {
+                                    scene_index,
+                                    layer_index: self
+                                        .selected_layer
+                                        .min(scene.layers.len().saturating_sub(1)),
+                                });
+                            }
+                        });
                         for (layer_index, layer) in scene.layers.iter().enumerate() {
                             if !filter_matches(&filter, &layer.id) && !filter.is_empty() {
                                 continue;
@@ -3486,7 +4915,7 @@ impl EditorApp {
                                     )
                                     .clicked()
                                 {
-                                    pending_selection = Some(PendingSelection::Layer {
+                                    pending_action = Some(PendingOutlinerAction::Layer {
                                         scene_index,
                                         layer_index,
                                         label: layer.id.clone(),
@@ -3496,7 +4925,8 @@ impl EditorApp {
                                     .small_button(if layer.visible { "Hide" } else { "Show" })
                                     .clicked()
                                 {
-                                    pending_selection = Some(PendingSelection::LayerVisibility {
+                                    pending_action =
+                                        Some(PendingOutlinerAction::LayerVisibility {
                                         scene_index,
                                         layer_index,
                                     });
@@ -3511,7 +4941,32 @@ impl EditorApp {
                                     )
                                     .clicked()
                                 {
-                                    pending_selection = Some(PendingSelection::LayerLock {
+                                    pending_action = Some(PendingOutlinerAction::LayerLock {
+                                        scene_index,
+                                        layer_index,
+                                    });
+                                }
+                                if ui
+                                    .small_button(if self.is_layer_soloed(scene_index, layer_index) {
+                                        "Unsolo"
+                                    } else {
+                                        "Solo"
+                                    })
+                                    .clicked()
+                                {
+                                    pending_action = Some(PendingOutlinerAction::LayerSolo {
+                                        scene_index,
+                                        layer_index,
+                                    });
+                                }
+                                if ui.small_button("Focus").clicked() {
+                                    pending_action = Some(PendingOutlinerAction::LayerFocus {
+                                        scene_index,
+                                        layer_index,
+                                    });
+                                }
+                                if ui.small_button("Dup").clicked() {
+                                    pending_action = Some(PendingOutlinerAction::LayerDuplicate {
                                         scene_index,
                                         layer_index,
                                     });
@@ -3520,109 +4975,299 @@ impl EditorApp {
                         }
 
                         ui.separator();
-                        ui.label("Scene Objects");
+                        ui.horizontal(|ui| {
+                            ui.label(format!("{} ({})", SceneObjectGroup::Spawns.label(), scene.spawns.len()));
+                            if ui
+                                .small_button(if self.is_group_soloed(SceneObjectGroup::Spawns) {
+                                    "Unsolo"
+                                } else {
+                                    "Solo"
+                                })
+                                .clicked()
+                            {
+                                pending_action =
+                                    Some(PendingOutlinerAction::GroupSolo(SceneObjectGroup::Spawns));
+                            }
+                        });
                         for (index, spawn) in scene.spawns.iter().enumerate() {
                             if !filter_matches(&filter, &spawn.id) && !filter.is_empty() {
                                 continue;
                             }
+                            ui.horizontal(|ui| {
+                                if ui
+                                    .selectable_label(
+                                        self.selected_scene == scene_index
+                                            && self.selected_spawn == Some(index),
+                                        format!("Spawn: {}", spawn.id),
+                                    )
+                                    .clicked()
+                                {
+                                    pending_action = Some(PendingOutlinerAction::Spawn {
+                                        scene_index,
+                                        index,
+                                        label: spawn.id.clone(),
+                                    });
+                                }
+                                if ui.small_button("Focus").clicked() {
+                                    pending_action = Some(PendingOutlinerAction::SpawnFocus {
+                                        scene_index,
+                                        index,
+                                    });
+                                }
+                                if ui.small_button("Dup").clicked() {
+                                    pending_action =
+                                        Some(PendingOutlinerAction::SpawnDuplicate {
+                                            scene_index,
+                                            index,
+                                        });
+                                }
+                                if ui.small_button("Isolate").clicked() {
+                                    pending_action = Some(PendingOutlinerAction::SpawnIsolate {
+                                        scene_index,
+                                        index,
+                                    });
+                                }
+                            });
+                        }
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            ui.label(format!(
+                                "{} ({})",
+                                SceneObjectGroup::Checkpoints.label(),
+                                scene.checkpoints.len()
+                            ));
                             if ui
-                                .selectable_label(
-                                    self.selected_scene == scene_index
-                                        && self.selected_spawn == Some(index),
-                                    format!("Spawn: {}", spawn.id),
-                                )
+                                .small_button(if self.is_group_soloed(SceneObjectGroup::Checkpoints)
+                                {
+                                    "Unsolo"
+                                } else {
+                                    "Solo"
+                                })
                                 .clicked()
                             {
-                                pending_selection = Some(PendingSelection::Spawn {
-                                    scene_index,
-                                    index,
-                                    label: spawn.id.clone(),
-                                });
+                                pending_action = Some(PendingOutlinerAction::GroupSolo(
+                                    SceneObjectGroup::Checkpoints,
+                                ));
                             }
-                        }
+                        });
                         for (index, checkpoint) in scene.checkpoints.iter().enumerate() {
                             if !filter_matches(&filter, &checkpoint.id) && !filter.is_empty() {
                                 continue;
                             }
+                            ui.horizontal(|ui| {
+                                if ui
+                                    .selectable_label(
+                                        self.selected_scene == scene_index
+                                            && self.selected_checkpoint == Some(index),
+                                        format!("Checkpoint: {}", checkpoint.id),
+                                    )
+                                    .clicked()
+                                {
+                                    pending_action = Some(PendingOutlinerAction::Checkpoint {
+                                        scene_index,
+                                        index,
+                                        label: checkpoint.id.clone(),
+                                    });
+                                }
+                                if ui.small_button("Focus").clicked() {
+                                    pending_action = Some(PendingOutlinerAction::CheckpointFocus {
+                                        scene_index,
+                                        index,
+                                    });
+                                }
+                                if ui.small_button("Dup").clicked() {
+                                    pending_action = Some(
+                                        PendingOutlinerAction::CheckpointDuplicate {
+                                            scene_index,
+                                            index,
+                                        },
+                                    );
+                                }
+                                if ui.small_button("Isolate").clicked() {
+                                    pending_action = Some(
+                                        PendingOutlinerAction::CheckpointIsolate {
+                                            scene_index,
+                                            index,
+                                        },
+                                    );
+                                }
+                            });
+                        }
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            ui.label(format!(
+                                "{} ({})",
+                                SceneObjectGroup::Entities.label(),
+                                scene.entities.len()
+                            ));
                             if ui
-                                .selectable_label(
-                                    self.selected_scene == scene_index
-                                        && self.selected_checkpoint == Some(index),
-                                    format!("Checkpoint: {}", checkpoint.id),
-                                )
+                                .small_button(if self.is_group_soloed(SceneObjectGroup::Entities) {
+                                    "Unsolo"
+                                } else {
+                                    "Solo"
+                                })
                                 .clicked()
                             {
-                                pending_selection = Some(PendingSelection::Checkpoint {
-                                    scene_index,
-                                    index,
-                                    label: checkpoint.id.clone(),
-                                });
+                                pending_action = Some(PendingOutlinerAction::GroupSolo(
+                                    SceneObjectGroup::Entities,
+                                ));
                             }
-                        }
+                        });
                         for (index, entity) in scene.entities.iter().enumerate() {
                             if !filter_matches(&filter, &entity.id) && !filter.is_empty() {
                                 continue;
                             }
+                            ui.horizontal(|ui| {
+                                if ui
+                                    .selectable_label(
+                                        self.selected_scene == scene_index
+                                            && self.selected_entity == Some(index),
+                                        format!("Entity: {} ({})", entity.id, entity.archetype),
+                                    )
+                                    .clicked()
+                                {
+                                    pending_action = Some(PendingOutlinerAction::Entity {
+                                        scene_index,
+                                        index,
+                                        label: entity.id.clone(),
+                                    });
+                                }
+                                if ui.small_button("Focus").clicked() {
+                                    pending_action = Some(PendingOutlinerAction::EntityFocus {
+                                        scene_index,
+                                        index,
+                                    });
+                                }
+                                if ui.small_button("Dup").clicked() {
+                                    pending_action =
+                                        Some(PendingOutlinerAction::EntityDuplicate {
+                                            scene_index,
+                                            index,
+                                        });
+                                }
+                                if ui.small_button("Isolate").clicked() {
+                                    pending_action = Some(PendingOutlinerAction::EntityIsolate {
+                                        scene_index,
+                                        index,
+                                    });
+                                }
+                            });
+                        }
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            ui.label(format!(
+                                "{} ({})",
+                                SceneObjectGroup::Triggers.label(),
+                                scene.triggers.len()
+                            ));
                             if ui
-                                .selectable_label(
-                                    self.selected_scene == scene_index
-                                        && self.selected_entity == Some(index),
-                                    format!("Entity: {} ({})", entity.id, entity.archetype),
-                                )
+                                .small_button(if self.is_group_soloed(SceneObjectGroup::Triggers) {
+                                    "Unsolo"
+                                } else {
+                                    "Solo"
+                                })
                                 .clicked()
                             {
-                                pending_selection = Some(PendingSelection::Entity {
-                                    scene_index,
-                                    index,
-                                    label: entity.id.clone(),
-                                });
+                                pending_action = Some(PendingOutlinerAction::GroupSolo(
+                                    SceneObjectGroup::Triggers,
+                                ));
                             }
-                        }
+                        });
                         for (index, trigger) in scene.triggers.iter().enumerate() {
                             if !filter_matches(&filter, &trigger.id) && !filter.is_empty() {
                                 continue;
                             }
-                            if ui
-                                .selectable_label(
-                                    self.selected_scene == scene_index
-                                        && self.selected_trigger == Some(index),
-                                    format!("Trigger: {} ({:?})", trigger.id, trigger.kind),
-                                )
-                                .clicked()
-                            {
-                                pending_selection = Some(PendingSelection::Trigger {
-                                    scene_index,
-                                    index,
-                                    label: trigger.id.clone(),
-                                });
-                            }
+                            ui.horizontal(|ui| {
+                                if ui
+                                    .selectable_label(
+                                        self.selected_scene == scene_index
+                                            && self.selected_trigger == Some(index),
+                                        format!("Trigger: {} ({:?})", trigger.id, trigger.kind),
+                                    )
+                                    .clicked()
+                                {
+                                    pending_action = Some(PendingOutlinerAction::Trigger {
+                                        scene_index,
+                                        index,
+                                        label: trigger.id.clone(),
+                                    });
+                                }
+                                if ui.small_button("Focus").clicked() {
+                                    pending_action = Some(PendingOutlinerAction::TriggerFocus {
+                                        scene_index,
+                                        index,
+                                    });
+                                }
+                                if ui.small_button("Dup").clicked() {
+                                    pending_action =
+                                        Some(PendingOutlinerAction::TriggerDuplicate {
+                                            scene_index,
+                                            index,
+                                        });
+                                }
+                                if ui.small_button("Isolate").clicked() {
+                                    pending_action = Some(PendingOutlinerAction::TriggerIsolate {
+                                        scene_index,
+                                        index,
+                                    });
+                                }
+                            });
                         }
 
                         if !scene.scripts.is_empty() {
                             ui.separator();
-                            ui.label("Scripts");
+                            ui.horizontal(|ui| {
+                                ui.label(format!(
+                                    "{} ({})",
+                                    SceneObjectGroup::Scripts.label(),
+                                    scene.scripts.len()
+                                ));
+                                if ui
+                                    .small_button(if self.is_group_soloed(SceneObjectGroup::Scripts)
+                                    {
+                                        "Unsolo"
+                                    } else {
+                                        "Solo"
+                                    })
+                                    .clicked()
+                                {
+                                    pending_action = Some(PendingOutlinerAction::GroupSolo(
+                                        SceneObjectGroup::Scripts,
+                                    ));
+                                }
+                            });
                             for script in &scene.scripts {
                                 if !filter_matches(&filter, &script.id) && !filter.is_empty() {
                                     continue;
                                 }
-                                if ui
-                                    .selectable_label(false, format!("Script: {}", script.id))
-                                    .clicked()
-                                {
-                                    pending_selection = Some(PendingSelection::Script {
-                                        scene_index,
-                                        label: script.id.clone(),
-                                    });
-                                }
+                                ui.horizontal(|ui| {
+                                    if ui
+                                        .selectable_label(false, format!("Script: {}", script.id))
+                                        .clicked()
+                                    {
+                                        pending_action = Some(PendingOutlinerAction::Script {
+                                            scene_index,
+                                            label: script.id.clone(),
+                                        });
+                                    }
+                                    if ui.small_button("Isolate").clicked() {
+                                        pending_action = Some(
+                                            PendingOutlinerAction::ScriptIsolate {
+                                                scene_index,
+                                                label: script.id.clone(),
+                                            },
+                                        );
+                                    }
+                                });
                             }
                         }
                     });
             }
         });
 
-        if let Some(selection) = pending_selection {
-            match selection {
-                PendingSelection::Scene { scene_index, label } => {
+        if let Some(action) = pending_action {
+            match action {
+                PendingOutlinerAction::Scene { scene_index, label } => {
                     self.selected_scene = scene_index;
                     self.scene_scroll_offset = Vec2::ZERO;
                     self.clear_selection();
@@ -3630,7 +5275,12 @@ impl EditorApp {
                     self.sync_selection();
                     self.status = format!("Selected scene '{}'", label);
                 }
-                PendingSelection::Layer {
+                PendingOutlinerAction::SceneFocus { scene_index } => {
+                    self.selected_scene = scene_index;
+                    self.sync_selection();
+                    self.focus_scene(scene_index);
+                }
+                PendingOutlinerAction::Layer {
                     scene_index,
                     layer_index,
                     label,
@@ -3638,19 +5288,41 @@ impl EditorApp {
                     self.select_layer(scene_index, layer_index);
                     self.status = format!("Active layer: '{}'", label);
                 }
-                PendingSelection::LayerVisibility {
+                PendingOutlinerAction::LayerVisibility {
                     scene_index,
                     layer_index,
                 } => {
                     self.toggle_layer_visibility(scene_index, layer_index);
                 }
-                PendingSelection::LayerLock {
+                PendingOutlinerAction::LayerLock {
                     scene_index,
                     layer_index,
                 } => {
                     self.toggle_layer_lock(scene_index, layer_index);
                 }
-                PendingSelection::Spawn {
+                PendingOutlinerAction::LayerSolo {
+                    scene_index,
+                    layer_index,
+                } => {
+                    self.toggle_layer_solo(scene_index, layer_index);
+                }
+                PendingOutlinerAction::LayerFocus {
+                    scene_index,
+                    layer_index,
+                } => {
+                    self.select_layer(scene_index, layer_index);
+                    self.focus_layer(scene_index, layer_index);
+                }
+                PendingOutlinerAction::LayerDuplicate {
+                    scene_index,
+                    layer_index,
+                } => {
+                    self.duplicate_layer(scene_index, layer_index);
+                }
+                PendingOutlinerAction::GroupSolo(group) => {
+                    self.toggle_group_solo(group);
+                }
+                PendingOutlinerAction::Spawn {
                     scene_index,
                     index,
                     label,
@@ -3666,7 +5338,73 @@ impl EditorApp {
                     self.preview_focus = PreviewFocus::None;
                     self.status = format!("Selected spawn '{}'", label);
                 }
-                PendingSelection::Checkpoint {
+                PendingOutlinerAction::SpawnFocus { scene_index, index } => {
+                    let spawn = self
+                        .bundle
+                        .as_ref()
+                        .and_then(|bundle| bundle.scenes.get(scene_index))
+                        .and_then(|scene| scene.spawns.get(index))
+                        .map(|spawn| (spawn.id.clone(), spawn.position));
+                    if let Some((label, position)) = spawn {
+                        self.selected_scene = scene_index;
+                        self.sync_selection();
+                        self.selected_spawn = Some(index);
+                        self.tool = EditorTool::Spawn;
+                        self.focus_point(&format!("spawn '{}'", label), position);
+                    }
+                }
+                PendingOutlinerAction::SpawnDuplicate { scene_index, index } => {
+                    let duplicate = self
+                        .bundle
+                        .as_ref()
+                        .and_then(|bundle| bundle.scenes.get(scene_index))
+                        .and_then(|scene| scene.spawns.get(index).cloned())
+                        .map(|mut spawn| {
+                            let existing = self
+                                .bundle
+                                .as_ref()
+                                .and_then(|bundle| bundle.scenes.get(scene_index))
+                                .map(|scene| {
+                                    scene.spawns.iter().map(|entry| entry.id.clone()).collect::<BTreeSet<_>>()
+                                })
+                                .unwrap_or_default();
+                            spawn.id = next_unique_layer_id(&existing, &spawn.id);
+                            spawn.position.x += 16;
+                            spawn
+                        });
+                    if let Some(duplicate) = duplicate {
+                        self.capture_history();
+                        if let Some(scene) = self
+                            .bundle
+                            .as_mut()
+                            .and_then(|bundle| bundle.scenes.get_mut(scene_index))
+                        {
+                            let insert_at = (index + 1).min(scene.spawns.len());
+                            let label = duplicate.id.clone();
+                            scene.spawns.insert(insert_at, duplicate);
+                            self.selected_scene = scene_index;
+                            self.selected_spawn = Some(insert_at);
+                            self.tool = EditorTool::Spawn;
+                            self.mark_edited(format!("Duplicated spawn '{}'", label));
+                        }
+                    }
+                }
+                PendingOutlinerAction::SpawnIsolate { scene_index, index } => {
+                    self.solo_group = Some(SceneObjectGroup::Spawns);
+                    let spawn = self
+                        .bundle
+                        .as_ref()
+                        .and_then(|bundle| bundle.scenes.get(scene_index))
+                        .and_then(|scene| scene.spawns.get(index))
+                        .map(|spawn| (spawn.id.clone(), spawn.position));
+                    if let Some((label, position)) = spawn {
+                        self.selected_scene = scene_index;
+                        self.selected_spawn = Some(index);
+                        self.tool = EditorTool::Spawn;
+                        self.focus_point(&format!("spawn '{}'", label), position);
+                    }
+                }
+                PendingOutlinerAction::Checkpoint {
                     scene_index,
                     index,
                     label,
@@ -3682,7 +5420,76 @@ impl EditorApp {
                     self.preview_focus = PreviewFocus::None;
                     self.status = format!("Selected checkpoint '{}'", label);
                 }
-                PendingSelection::Entity {
+                PendingOutlinerAction::CheckpointFocus { scene_index, index } => {
+                    let checkpoint = self
+                        .bundle
+                        .as_ref()
+                        .and_then(|bundle| bundle.scenes.get(scene_index))
+                        .and_then(|scene| scene.checkpoints.get(index))
+                        .map(|checkpoint| (checkpoint.id.clone(), checkpoint.position));
+                    if let Some((label, position)) = checkpoint {
+                        self.selected_scene = scene_index;
+                        self.sync_selection();
+                        self.selected_checkpoint = Some(index);
+                        self.tool = EditorTool::Checkpoint;
+                        self.focus_point(&format!("checkpoint '{}'", label), position);
+                    }
+                }
+                PendingOutlinerAction::CheckpointDuplicate { scene_index, index } => {
+                    let duplicate = self
+                        .bundle
+                        .as_ref()
+                        .and_then(|bundle| bundle.scenes.get(scene_index))
+                        .and_then(|scene| scene.checkpoints.get(index).cloned())
+                        .map(|mut checkpoint| {
+                            let existing = self
+                                .bundle
+                                .as_ref()
+                                .and_then(|bundle| bundle.scenes.get(scene_index))
+                                .map(|scene| {
+                                    scene.checkpoints
+                                        .iter()
+                                        .map(|entry| entry.id.clone())
+                                        .collect::<BTreeSet<_>>()
+                                })
+                                .unwrap_or_default();
+                            checkpoint.id = next_unique_layer_id(&existing, &checkpoint.id);
+                            checkpoint.position.x += 16;
+                            checkpoint
+                        });
+                    if let Some(duplicate) = duplicate {
+                        self.capture_history();
+                        if let Some(scene) = self
+                            .bundle
+                            .as_mut()
+                            .and_then(|bundle| bundle.scenes.get_mut(scene_index))
+                        {
+                            let insert_at = (index + 1).min(scene.checkpoints.len());
+                            let label = duplicate.id.clone();
+                            scene.checkpoints.insert(insert_at, duplicate);
+                            self.selected_scene = scene_index;
+                            self.selected_checkpoint = Some(insert_at);
+                            self.tool = EditorTool::Checkpoint;
+                            self.mark_edited(format!("Duplicated checkpoint '{}'", label));
+                        }
+                    }
+                }
+                PendingOutlinerAction::CheckpointIsolate { scene_index, index } => {
+                    self.solo_group = Some(SceneObjectGroup::Checkpoints);
+                    let checkpoint = self
+                        .bundle
+                        .as_ref()
+                        .and_then(|bundle| bundle.scenes.get(scene_index))
+                        .and_then(|scene| scene.checkpoints.get(index))
+                        .map(|checkpoint| (checkpoint.id.clone(), checkpoint.position));
+                    if let Some((label, position)) = checkpoint {
+                        self.selected_scene = scene_index;
+                        self.selected_checkpoint = Some(index);
+                        self.tool = EditorTool::Checkpoint;
+                        self.focus_point(&format!("checkpoint '{}'", label), position);
+                    }
+                }
+                PendingOutlinerAction::Entity {
                     scene_index,
                     index,
                     label,
@@ -3698,7 +5505,76 @@ impl EditorApp {
                     self.preview_focus = PreviewFocus::Entity;
                     self.status = format!("Selected entity '{}'", label);
                 }
-                PendingSelection::Trigger {
+                PendingOutlinerAction::EntityFocus { scene_index, index } => {
+                    let entity = self
+                        .bundle
+                        .as_ref()
+                        .and_then(|bundle| bundle.scenes.get(scene_index))
+                        .and_then(|scene| scene.entities.get(index))
+                        .map(|entity| (entity.id.clone(), entity.position));
+                    if let Some((label, position)) = entity {
+                        self.selected_scene = scene_index;
+                        self.sync_selection();
+                        self.selected_entity = Some(index);
+                        self.tool = EditorTool::Entity;
+                        self.preview_focus = PreviewFocus::Entity;
+                        self.focus_point(&format!("entity '{}'", label), position);
+                    }
+                }
+                PendingOutlinerAction::EntityDuplicate { scene_index, index } => {
+                    let duplicate = self
+                        .bundle
+                        .as_ref()
+                        .and_then(|bundle| bundle.scenes.get(scene_index))
+                        .and_then(|scene| scene.entities.get(index).cloned())
+                        .map(|mut entity| {
+                            let existing = self
+                                .bundle
+                                .as_ref()
+                                .and_then(|bundle| bundle.scenes.get(scene_index))
+                                .map(|scene| {
+                                    scene.entities.iter().map(|entry| entry.id.clone()).collect::<BTreeSet<_>>()
+                                })
+                                .unwrap_or_default();
+                            entity.id = next_unique_layer_id(&existing, &entity.id);
+                            entity.position.x += 16;
+                            entity
+                        });
+                    if let Some(duplicate) = duplicate {
+                        self.capture_history();
+                        if let Some(scene) = self
+                            .bundle
+                            .as_mut()
+                            .and_then(|bundle| bundle.scenes.get_mut(scene_index))
+                        {
+                            let insert_at = (index + 1).min(scene.entities.len());
+                            let label = duplicate.id.clone();
+                            scene.entities.insert(insert_at, duplicate);
+                            self.selected_scene = scene_index;
+                            self.selected_entity = Some(insert_at);
+                            self.tool = EditorTool::Entity;
+                            self.preview_focus = PreviewFocus::Entity;
+                            self.mark_edited(format!("Duplicated entity '{}'", label));
+                        }
+                    }
+                }
+                PendingOutlinerAction::EntityIsolate { scene_index, index } => {
+                    self.solo_group = Some(SceneObjectGroup::Entities);
+                    let entity = self
+                        .bundle
+                        .as_ref()
+                        .and_then(|bundle| bundle.scenes.get(scene_index))
+                        .and_then(|scene| scene.entities.get(index))
+                        .map(|entity| (entity.id.clone(), entity.position));
+                    if let Some((label, position)) = entity {
+                        self.selected_scene = scene_index;
+                        self.selected_entity = Some(index);
+                        self.tool = EditorTool::Entity;
+                        self.preview_focus = PreviewFocus::Entity;
+                        self.focus_point(&format!("entity '{}'", label), position);
+                    }
+                }
+                PendingOutlinerAction::Trigger {
                     scene_index,
                     index,
                     label,
@@ -3714,7 +5590,73 @@ impl EditorApp {
                     self.preview_focus = PreviewFocus::None;
                     self.status = format!("Selected trigger '{}'", label);
                 }
-                PendingSelection::Script { scene_index, label } => {
+                PendingOutlinerAction::TriggerFocus { scene_index, index } => {
+                    let trigger = self
+                        .bundle
+                        .as_ref()
+                        .and_then(|bundle| bundle.scenes.get(scene_index))
+                        .and_then(|scene| scene.triggers.get(index))
+                        .map(|trigger| (trigger.id.clone(), trigger.rect));
+                    if let Some((label, rect)) = trigger {
+                        self.selected_scene = scene_index;
+                        self.sync_selection();
+                        self.selected_trigger = Some(index);
+                        self.tool = EditorTool::Trigger;
+                        self.focus_trigger_rect(&format!("trigger '{}'", label), rect);
+                    }
+                }
+                PendingOutlinerAction::TriggerDuplicate { scene_index, index } => {
+                    let duplicate = self
+                        .bundle
+                        .as_ref()
+                        .and_then(|bundle| bundle.scenes.get(scene_index))
+                        .and_then(|scene| scene.triggers.get(index).cloned())
+                        .map(|mut trigger| {
+                            let existing = self
+                                .bundle
+                                .as_ref()
+                                .and_then(|bundle| bundle.scenes.get(scene_index))
+                                .map(|scene| {
+                                    scene.triggers.iter().map(|entry| entry.id.clone()).collect::<BTreeSet<_>>()
+                                })
+                                .unwrap_or_default();
+                            trigger.id = next_unique_layer_id(&existing, &trigger.id);
+                            trigger.rect.x += 16;
+                            trigger
+                        });
+                    if let Some(duplicate) = duplicate {
+                        self.capture_history();
+                        if let Some(scene) = self
+                            .bundle
+                            .as_mut()
+                            .and_then(|bundle| bundle.scenes.get_mut(scene_index))
+                        {
+                            let insert_at = (index + 1).min(scene.triggers.len());
+                            let label = duplicate.id.clone();
+                            scene.triggers.insert(insert_at, duplicate);
+                            self.selected_scene = scene_index;
+                            self.selected_trigger = Some(insert_at);
+                            self.tool = EditorTool::Trigger;
+                            self.mark_edited(format!("Duplicated trigger '{}'", label));
+                        }
+                    }
+                }
+                PendingOutlinerAction::TriggerIsolate { scene_index, index } => {
+                    self.solo_group = Some(SceneObjectGroup::Triggers);
+                    let trigger = self
+                        .bundle
+                        .as_ref()
+                        .and_then(|bundle| bundle.scenes.get(scene_index))
+                        .and_then(|scene| scene.triggers.get(index))
+                        .map(|trigger| (trigger.id.clone(), trigger.rect));
+                    if let Some((label, rect)) = trigger {
+                        self.selected_scene = scene_index;
+                        self.selected_trigger = Some(index);
+                        self.tool = EditorTool::Trigger;
+                        self.focus_trigger_rect(&format!("trigger '{}'", label), rect);
+                    }
+                }
+                PendingOutlinerAction::Script { scene_index, label } => {
                     self.selected_scene = scene_index;
                     self.scene_scroll_offset = Vec2::ZERO;
                     self.sync_selection();
@@ -3723,6 +5665,13 @@ impl EditorApp {
                         "Selected script '{}'. A visual event editor can plug in here.",
                         label
                     );
+                }
+                PendingOutlinerAction::ScriptIsolate { scene_index, label } => {
+                    self.selected_scene = scene_index;
+                    self.solo_group = Some(SceneObjectGroup::Scripts);
+                    self.sync_selection();
+                    self.preview_focus = PreviewFocus::None;
+                    self.status = format!("Isolated script group around '{}'", label);
                 }
             }
         }
@@ -3735,7 +5684,7 @@ impl EditorApp {
         );
         ui.add_space(6.0);
 
-        let Some(bundle) = &self.bundle else {
+        let Some(bundle) = self.bundle.clone() else {
             ui.label("No project loaded.");
             return;
         };
@@ -3754,10 +5703,17 @@ impl EditorApp {
                 path: Utf8PathBuf,
                 label: String,
             },
+            ToggleFavorite {
+                kind: &'static str,
+                id: String,
+            },
+            LoadBrush(String),
+            LoadSnippet(String),
         }
 
         let filter = self.asset_browser_filter.trim().to_ascii_lowercase();
         let sprite_sources = self.list_project_sprite_sources().unwrap_or_default();
+        let time_seconds = ctx.input(|input| input.time) as f32;
         let mut pending_action = None;
 
         ui.label(format!(
@@ -3769,6 +5725,18 @@ impl EditorApp {
             bundle.animations.len(),
             bundle.dialogues.len()
         ));
+        ui.label(format!(
+            "{} favorite(s) | {} snippet(s) | {} brush(es)",
+            self.workspace_addons.editor_favorites.scenes.len()
+                + self.workspace_addons.editor_favorites.palettes.len()
+                + self.workspace_addons.editor_favorites.tilesets.len()
+                + self.workspace_addons.editor_favorites.metasprites.len()
+                + self.workspace_addons.editor_favorites.animations.len()
+                + self.workspace_addons.editor_favorites.dialogues.len()
+                + self.workspace_addons.editor_favorites.sprite_sources.len(),
+            self.workspace_addons.scene_library.snippets.len(),
+            self.workspace_addons.scene_library.brushes.len(),
+        ));
         ui.add_space(4.0);
 
         egui::ScrollArea::vertical().show(ui, |ui| {
@@ -3777,15 +5745,39 @@ impl EditorApp {
                     if !filter_matches(&filter, &scene.id) && !filter.is_empty() {
                         continue;
                     }
-                    if ui
-                        .selectable_label(self.selected_scene == scene_index, &scene.id)
-                        .clicked()
-                    {
-                        pending_action = Some(PendingAssetAction::Scene {
-                            scene_index,
-                            label: scene.id.clone(),
+                    ui.horizontal(|ui| {
+                        draw_scene_thumbnail(ui, &bundle, scene);
+                        ui.vertical(|ui| {
+                            if ui
+                                .selectable_label(self.selected_scene == scene_index, &scene.id)
+                                .clicked()
+                            {
+                                pending_action = Some(PendingAssetAction::Scene {
+                                    scene_index,
+                                    label: scene.id.clone(),
+                                });
+                            }
+                            ui.small(format!(
+                                "{}",
+                                self.asset_usage_summary("scene", &scene.id)
+                            ));
+                            ui.horizontal(|ui| {
+                                if ui
+                                    .small_button(if self.is_asset_favorite("scene", &scene.id) {
+                                        "Unstar"
+                                    } else {
+                                        "Star"
+                                    })
+                                    .clicked()
+                                {
+                                    pending_action = Some(PendingAssetAction::ToggleFavorite {
+                                        kind: "scene",
+                                        id: scene.id.clone(),
+                                    });
+                                }
+                            });
                         });
-                    }
+                    });
                 }
             });
 
@@ -3794,18 +5786,37 @@ impl EditorApp {
                     if !filter_matches(&filter, &animation.id) && !filter.is_empty() {
                         continue;
                     }
-                    if ui
-                        .selectable_label(
-                            self.selected_animation == animation_index,
-                            format!("{} ({} frame(s))", animation.id, animation.frames.len()),
-                        )
-                        .clicked()
-                    {
-                        pending_action = Some(PendingAssetAction::Animation {
-                            animation_index,
-                            label: animation.id.clone(),
+                    ui.horizontal(|ui| {
+                        draw_animation_thumbnail(ui, &bundle, animation_index, time_seconds);
+                        ui.vertical(|ui| {
+                            if ui
+                                .selectable_label(
+                                    self.selected_animation == animation_index,
+                                    format!("{} ({} frame(s))", animation.id, animation.frames.len()),
+                                )
+                                .clicked()
+                            {
+                                pending_action = Some(PendingAssetAction::Animation {
+                                    animation_index,
+                                    label: animation.id.clone(),
+                                });
+                            }
+                            ui.small(self.asset_usage_summary("animation", &animation.id));
+                            if ui
+                                .small_button(if self.is_asset_favorite("animation", &animation.id) {
+                                    "Unstar"
+                                } else {
+                                    "Star"
+                                })
+                                .clicked()
+                            {
+                                pending_action = Some(PendingAssetAction::ToggleFavorite {
+                                    kind: "animation",
+                                    id: animation.id.clone(),
+                                });
+                            }
                         });
-                    }
+                    });
                 }
             });
 
@@ -3814,18 +5825,37 @@ impl EditorApp {
                     if !filter_matches(&filter, &metasprite.id) && !filter.is_empty() {
                         continue;
                     }
-                    if ui
-                        .selectable_label(
-                            false,
-                            format!("{} ({} piece(s))", metasprite.id, metasprite.pieces.len()),
-                        )
-                        .clicked()
-                    {
-                        pending_action = Some(PendingAssetAction::Status(format!(
-                            "Metasprite '{}' selected. A visual metasprite editor is the next natural step.",
-                            metasprite.id
-                        )));
-                    }
+                    ui.horizontal(|ui| {
+                        draw_metasprite_thumbnail(ui, &bundle, metasprite);
+                        ui.vertical(|ui| {
+                            if ui
+                                .selectable_label(
+                                    false,
+                                    format!("{} ({} piece(s))", metasprite.id, metasprite.pieces.len()),
+                                )
+                                .clicked()
+                            {
+                                pending_action = Some(PendingAssetAction::Status(format!(
+                                    "Metasprite '{}' selected. Use the Animation tab for visual editing.",
+                                    metasprite.id
+                                )));
+                            }
+                            ui.small(self.asset_usage_summary("metasprite", &metasprite.id));
+                            if ui
+                                .small_button(if self.is_asset_favorite("metasprite", &metasprite.id) {
+                                    "Unstar"
+                                } else {
+                                    "Star"
+                                })
+                                .clicked()
+                            {
+                                pending_action = Some(PendingAssetAction::ToggleFavorite {
+                                    kind: "metasprite",
+                                    id: metasprite.id.clone(),
+                                });
+                            }
+                        });
+                    });
                 }
             });
 
@@ -3834,19 +5864,50 @@ impl EditorApp {
                     if !filter_matches(&filter, &tileset.id) && !filter.is_empty() {
                         continue;
                     }
-                    if ui
-                        .selectable_label(
-                            false,
-                            format!("{} ({} tile(s))", tileset.id, tileset.tiles.len()),
-                        )
-                        .clicked()
-                    {
-                        pending_action = Some(PendingAssetAction::Status(format!(
-                            "Tileset '{}' selected with {} tile(s).",
-                            tileset.id,
-                            tileset.tiles.len()
-                        )));
-                    }
+                    ui.horizontal(|ui| {
+                        if let Some(palette) = bundle.palette(&tileset.palette_id) {
+                            draw_tileset_thumbnail(ui, tileset, palette);
+                        } else {
+                            let (response, painter) =
+                                draw_asset_thumbnail_frame(ui, Vec2::new(92.0, 54.0));
+                            painter.text(
+                                response.rect.center(),
+                                Align2::CENTER_CENTER,
+                                "No palette",
+                                FontId::proportional(12.0),
+                                Color32::from_rgb(180, 160, 160),
+                            );
+                        }
+                        ui.vertical(|ui| {
+                            if ui
+                                .selectable_label(
+                                    false,
+                                    format!("{} ({} tile(s))", tileset.id, tileset.tiles.len()),
+                                )
+                                .clicked()
+                            {
+                                pending_action = Some(PendingAssetAction::Status(format!(
+                                    "Tileset '{}' selected with {} tile(s).",
+                                    tileset.id,
+                                    tileset.tiles.len()
+                                )));
+                            }
+                            ui.small(self.asset_usage_summary("tileset", &tileset.id));
+                            if ui
+                                .small_button(if self.is_asset_favorite("tileset", &tileset.id) {
+                                    "Unstar"
+                                } else {
+                                    "Star"
+                                })
+                                .clicked()
+                            {
+                                pending_action = Some(PendingAssetAction::ToggleFavorite {
+                                    kind: "tileset",
+                                    id: tileset.id.clone(),
+                                });
+                            }
+                        });
+                    });
                 }
             });
 
@@ -3855,19 +5916,38 @@ impl EditorApp {
                     if !filter_matches(&filter, &palette.id) && !filter.is_empty() {
                         continue;
                     }
-                    if ui
-                        .selectable_label(
-                            false,
-                            format!("{} ({} color(s))", palette.id, palette.colors.len()),
-                        )
-                        .clicked()
-                    {
-                        pending_action = Some(PendingAssetAction::Status(format!(
-                            "Palette '{}' selected with {} color(s).",
-                            palette.id,
-                            palette.colors.len()
-                        )));
-                    }
+                    ui.horizontal(|ui| {
+                        draw_palette_thumbnail(ui, palette);
+                        ui.vertical(|ui| {
+                            if ui
+                                .selectable_label(
+                                    false,
+                                    format!("{} ({} color(s))", palette.id, palette.colors.len()),
+                                )
+                                .clicked()
+                            {
+                                pending_action = Some(PendingAssetAction::Status(format!(
+                                    "Palette '{}' selected with {} color(s).",
+                                    palette.id,
+                                    palette.colors.len()
+                                )));
+                            }
+                            ui.small(self.asset_usage_summary("palette", &palette.id));
+                            if ui
+                                .small_button(if self.is_asset_favorite("palette", &palette.id) {
+                                    "Unstar"
+                                } else {
+                                    "Star"
+                                })
+                                .clicked()
+                            {
+                                pending_action = Some(PendingAssetAction::ToggleFavorite {
+                                    kind: "palette",
+                                    id: palette.id.clone(),
+                                });
+                            }
+                        });
+                    });
                 }
             });
 
@@ -3876,18 +5956,42 @@ impl EditorApp {
                     if !filter_matches(&filter, &dialogue.id) && !filter.is_empty() {
                         continue;
                     }
-                    if ui
-                        .selectable_label(
-                            false,
-                            format!("{} ({} node(s))", dialogue.id, dialogue.nodes.len()),
-                        )
-                        .clicked()
-                    {
-                        pending_action = Some(PendingAssetAction::Status(format!(
-                            "Dialogue '{}' selected. A graph editor would fit naturally here.",
-                            dialogue.id
-                        )));
-                    }
+                    ui.horizontal(|ui| {
+                        draw_text_thumbnail(
+                            ui,
+                            "Dialogue",
+                            &dialogue_preview_text(dialogue),
+                            Color32::from_rgb(214, 132, 84),
+                        );
+                        ui.vertical(|ui| {
+                        if ui
+                            .selectable_label(
+                                false,
+                                format!("{} ({} node(s))", dialogue.id, dialogue.nodes.len()),
+                            )
+                            .clicked()
+                        {
+                            pending_action = Some(PendingAssetAction::Status(format!(
+                                "Dialogue '{}' selected. A graph editor would fit naturally here.",
+                                dialogue.id
+                            )));
+                        }
+                        ui.small(self.asset_usage_summary("dialogue", &dialogue.id));
+                        if ui
+                            .small_button(if self.is_asset_favorite("dialogue", &dialogue.id) {
+                                "Unstar"
+                            } else {
+                                "Star"
+                            })
+                            .clicked()
+                            {
+                                pending_action = Some(PendingAssetAction::ToggleFavorite {
+                                    kind: "dialogue",
+                                    id: dialogue.id.clone(),
+                                });
+                            }
+                        });
+                    });
                 }
             });
 
@@ -3897,18 +6001,29 @@ impl EditorApp {
                         if !filter_matches(&filter, &script.id) && !filter.is_empty() {
                             continue;
                         }
-                        if ui
-                            .selectable_label(
-                                false,
-                                format!("{} ({} command(s))", script.id, script.commands.len()),
-                            )
-                            .clicked()
-                        {
-                            pending_action = Some(PendingAssetAction::Status(format!(
-                                "Script '{}' selected. A visual event editor would make this much faster to author.",
-                                script.id
-                            )));
-                        }
+                        ui.horizontal(|ui| {
+                            draw_text_thumbnail(
+                                ui,
+                                "Script",
+                                &script_preview_text(script),
+                                Color32::from_rgb(96, 208, 255),
+                            );
+                            ui.vertical(|ui| {
+                                if ui
+                                    .selectable_label(
+                                        false,
+                                        format!("{} ({} command(s))", script.id, script.commands.len()),
+                                    )
+                                    .clicked()
+                                {
+                                    pending_action = Some(PendingAssetAction::Status(format!(
+                                        "Script '{}' selected. A visual event editor would make this much faster to author.",
+                                        script.id
+                                    )));
+                                }
+                                ui.small(format!("Scene: {}", scene.id));
+                            });
+                        });
                     }
                 });
             }
@@ -3925,12 +6040,132 @@ impl EditorApp {
                             if !filter_matches(&filter, &label) && !filter.is_empty() {
                                 continue;
                             }
-                            if ui.selectable_label(false, &label).clicked() {
-                                pending_action = Some(PendingAssetAction::SpriteSource {
-                                    path: path.clone(),
-                                    label,
+                            ui.horizontal(|ui| {
+                                if let Some(texture) = self.sprite_source_preview_texture(ctx, path) {
+                                    draw_sprite_source_thumbnail(ui, &texture, &label);
+                                } else {
+                                    let (response, painter) =
+                                        draw_asset_thumbnail_frame(ui, Vec2::new(92.0, 54.0));
+                                    painter.text(
+                                        response.rect.center(),
+                                        Align2::CENTER_CENTER,
+                                        "Sheet",
+                                        FontId::proportional(12.0),
+                                        Color32::from_rgb(180, 180, 190),
+                                    );
+                                }
+                                ui.vertical(|ui| {
+                                    if ui.selectable_label(false, &label).clicked() {
+                                        pending_action = Some(PendingAssetAction::SpriteSource {
+                                            path: path.clone(),
+                                            label: label.clone(),
+                                        });
+                                    }
                                 });
+                                if ui
+                                    .small_button(if self.is_asset_favorite("sprite_source", &label)
+                                    {
+                                        "Unstar"
+                                    } else {
+                                        "Star"
+                                    })
+                                    .clicked()
+                                {
+                                    pending_action = Some(PendingAssetAction::ToggleFavorite {
+                                        kind: "sprite_source",
+                                        id: label.clone(),
+                                    });
+                                }
+                            });
+                        }
+                    }
+                },
+            );
+
+            ui.collapsing(
+                format!(
+                    "Scene Snippets ({})",
+                    self.workspace_addons.scene_library.snippets.len()
+                ),
+                |ui| {
+                    if self.workspace_addons.scene_library.snippets.is_empty() {
+                        ui.label("Save a selection as a snippet from the Scene tab.");
+                    } else {
+                        for snippet in &self.workspace_addons.scene_library.snippets {
+                            if !filter_matches(&filter, &snippet.name) && !filter.is_empty() {
+                                continue;
                             }
+                            ui.horizontal(|ui| {
+                                draw_scene_snippet_thumbnail(ui, &bundle, snippet);
+                                ui.vertical(|ui| {
+                                    if ui
+                                        .selectable_label(
+                                            false,
+                                            format!(
+                                                "{} ({}x{} tiles, {} object(s))",
+                                                snippet.name,
+                                                snippet.size_tiles.width,
+                                                snippet.size_tiles.height,
+                                                snippet.spawns.len()
+                                                    + snippet.checkpoints.len()
+                                                    + snippet.entities.len()
+                                                    + snippet.triggers.len()
+                                            ),
+                                        )
+                                        .clicked()
+                                    {
+                                        pending_action = Some(PendingAssetAction::LoadSnippet(
+                                            snippet.name.clone(),
+                                        ));
+                                    }
+                                    if ui.small_button("Load").clicked() {
+                                        pending_action = Some(PendingAssetAction::LoadSnippet(
+                                            snippet.name.clone(),
+                                        ));
+                                    }
+                                });
+                            });
+                        }
+                    }
+                },
+            );
+
+            ui.collapsing(
+                format!("Tile Brushes ({})", self.workspace_addons.scene_library.brushes.len()),
+                |ui| {
+                    if self.workspace_addons.scene_library.brushes.is_empty() {
+                        ui.label("Save a selection as a brush from the Scene tab.");
+                    } else {
+                        for brush in &self.workspace_addons.scene_library.brushes {
+                            if !filter_matches(&filter, &brush.name) && !filter.is_empty() {
+                                continue;
+                            }
+                            ui.horizontal(|ui| {
+                                draw_tile_brush_thumbnail(ui, brush);
+                                ui.vertical(|ui| {
+                                    if ui
+                                        .selectable_label(
+                                            false,
+                                            format!(
+                                                "{} ({}x{} tiles)",
+                                                brush.name,
+                                                brush.size_tiles.width,
+                                                brush.size_tiles.height
+                                            ),
+                                        )
+                                        .clicked()
+                                    {
+                                        pending_action = Some(PendingAssetAction::LoadBrush(
+                                            brush.name.clone(),
+                                        ));
+                                    }
+                                    if ui.small_button("Load").clicked() {
+                                        pending_action = Some(PendingAssetAction::LoadBrush(
+                                            brush.name.clone(),
+                                        ));
+                                    }
+                                });
+                            });
                         }
                     }
                 },
@@ -3961,6 +6196,15 @@ impl EditorApp {
                 PendingAssetAction::SpriteSource { path, label } => {
                     self.import_state.open = true;
                     self.load_import_preview_from_path(ctx, path.as_std_path(), label);
+                }
+                PendingAssetAction::ToggleFavorite { kind, id } => {
+                    self.toggle_asset_favorite(kind, &id);
+                }
+                PendingAssetAction::LoadBrush(name) => {
+                    self.load_brush_into_clipboard(&name);
+                }
+                PendingAssetAction::LoadSnippet(name) => {
+                    self.load_snippet_into_clipboard(&name);
                 }
             }
         }
@@ -4089,15 +6333,26 @@ impl EditorApp {
         });
     }
 
-    fn draw_playtest_tab(&mut self, ui: &mut egui::Ui) {
-        let emulator = self
-            .bundle
-            .as_ref()
-            .and_then(|bundle| bundle.manifest.editor.preferred_emulator.clone())
+    fn draw_playtest_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let Some(bundle_snapshot) = self.bundle.clone() else {
+            ui.heading("Playtest");
+            ui.label("Load a project to use the in-editor playtest sandbox.");
+            return;
+        };
+
+        let emulator = bundle_snapshot
+            .manifest
+            .editor
+            .preferred_emulator
+            .clone()
             .unwrap_or_else(|| "ares".to_string());
         let mut build = false;
         let mut build_and_launch = false;
         let mut refresh_report = false;
+        let mut restart_session = false;
+        let mut step_session = false;
+        let mut duplicate_preset = false;
+        let mut reset_preset = false;
 
         ui.heading("Playtest");
         ui.label(format!("Configured emulator: {}", emulator));
@@ -4123,9 +6378,391 @@ impl EditorApp {
             self.refresh_last_build_report();
         }
 
+        if self.playtest_state.selected_physics_id.is_empty() {
+            if let Some(preset) = bundle_snapshot.manifest.gameplay.physics_presets.first() {
+                self.playtest_state.selected_physics_id = preset.id.clone();
+            }
+        }
+
+        ui.separator();
+        ui.horizontal(|ui| {
+            egui::ComboBox::from_label("Physics Preset")
+                .selected_text(if self.playtest_state.selected_physics_id.is_empty() {
+                    "Choose preset"
+                } else {
+                    self.playtest_state.selected_physics_id.as_str()
+                })
+                .show_ui(ui, |ui| {
+                    for preset in &bundle_snapshot.manifest.gameplay.physics_presets {
+                        if ui
+                            .selectable_value(
+                                &mut self.playtest_state.selected_physics_id,
+                                preset.id.clone(),
+                                &preset.id,
+                            )
+                            .changed()
+                        {
+                            restart_session = true;
+                        }
+                    }
+                });
+            egui::ComboBox::from_label("Start")
+                .selected_text(self.playtest_state.start_mode.label())
+                .show_ui(ui, |ui| {
+                    if ui
+                        .selectable_value(
+                            &mut self.playtest_state.start_mode,
+                            PlaytestStartMode::SceneStart,
+                            PlaytestStartMode::SceneStart.label(),
+                        )
+                        .changed()
+                    {
+                        restart_session = true;
+                    }
+                    if ui
+                        .selectable_value(
+                            &mut self.playtest_state.start_mode,
+                            PlaytestStartMode::SelectedSpawn,
+                            PlaytestStartMode::SelectedSpawn.label(),
+                        )
+                        .changed()
+                    {
+                        restart_session = true;
+                    }
+                    if ui
+                        .selectable_value(
+                            &mut self.playtest_state.start_mode,
+                            PlaytestStartMode::SelectedCheckpoint,
+                            PlaytestStartMode::SelectedCheckpoint.label(),
+                        )
+                        .changed()
+                    {
+                        restart_session = true;
+                    }
+                });
+            if ui
+                .button(if self.playtest_state.playing {
+                    "Pause"
+                } else {
+                    "Play"
+                })
+                .clicked()
+            {
+                self.playtest_state.playing = !self.playtest_state.playing;
+            }
+            if ui.button("Step").clicked() {
+                step_session = true;
+            }
+            if ui.button("Restart").clicked() {
+                restart_session = true;
+            }
+        });
+
+        ui.horizontal_wrapped(|ui| {
+            ui.add(
+                egui::Slider::new(&mut self.playtest_state.speed_multiplier, 0.1..=2.0)
+                    .text("Slow Motion"),
+            );
+            ui.checkbox(&mut self.show_collision, "Collision");
+            ui.checkbox(&mut self.playtest_state.show_spawns, "Spawns");
+            ui.checkbox(&mut self.playtest_state.show_checkpoints, "Checkpoints");
+            ui.checkbox(&mut self.playtest_state.show_triggers, "Triggers");
+            ui.checkbox(&mut self.playtest_state.show_entities, "Entities");
+            ui.checkbox(&mut self.playtest_state.show_camera_bounds, "Camera Bounds");
+        });
+
+        let selected_profile_index = bundle_snapshot
+            .manifest
+            .gameplay
+            .physics_presets
+            .iter()
+            .position(|preset| preset.id == self.playtest_state.selected_physics_id);
+        if let Some(index) = selected_profile_index {
+            let preset_snapshot = bundle_snapshot.manifest.gameplay.physics_presets[index].clone();
+            let mut edited = preset_snapshot.clone();
+            let mut changed = false;
+
+            ui.separator();
+            ui.collapsing("Physics Sandbox", |ui| {
+                ui.horizontal(|ui| {
+                    if ui.button("Duplicate Preset").clicked() {
+                        duplicate_preset = true;
+                    }
+                    if ui.button("Reset To Template").clicked() {
+                        reset_preset = true;
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Family");
+                    egui::ComboBox::from_id_salt("physics_family")
+                        .selected_text(format!("{:?}", edited.family))
+                        .show_ui(ui, |ui| {
+                            changed |= ui
+                                .selectable_value(
+                                    &mut edited.family,
+                                    snesmaker_project::PhysicsFamily::MegaManLike,
+                                    "Mega Man-like",
+                                )
+                                .changed();
+                            changed |= ui
+                                .selectable_value(
+                                    &mut edited.family,
+                                    snesmaker_project::PhysicsFamily::MarioLike,
+                                    "Mario-like",
+                                )
+                                .changed();
+                            changed |= ui
+                                .selectable_value(
+                                    &mut edited.family,
+                                    snesmaker_project::PhysicsFamily::Custom,
+                                    "Custom",
+                                )
+                                .changed();
+                        });
+                });
+                for (label, value) in [
+                    ("Gravity", &mut edited.gravity_fp),
+                    ("Max Fall", &mut edited.max_fall_speed_fp),
+                    ("Ground Accel", &mut edited.ground_accel_fp),
+                    ("Air Accel", &mut edited.air_accel_fp),
+                    ("Run Speed", &mut edited.max_run_speed_fp),
+                    ("Jump Velocity", &mut edited.jump_velocity_fp),
+                    ("Ladder Speed", &mut edited.ladder_speed_fp),
+                ] {
+                    ui.horizontal(|ui| {
+                        ui.label(label);
+                        changed |= ui.add(egui::DragValue::new(value).speed(4)).changed();
+                    });
+                }
+                ui.horizontal(|ui| {
+                    ui.label("Coyote Frames");
+                    changed |= ui
+                        .add(egui::DragValue::new(&mut edited.coyote_frames).range(0..=16))
+                        .changed();
+                    ui.label("Jump Buffer");
+                    changed |= ui
+                        .add(
+                            egui::DragValue::new(&mut edited.jump_buffer_frames).range(0..=16),
+                        )
+                        .changed();
+                });
+            });
+
+            if changed {
+                self.capture_history();
+                if let Some(bundle) = &mut self.bundle {
+                    if let Some(target) = bundle
+                        .manifest
+                        .gameplay
+                        .physics_presets
+                        .iter_mut()
+                        .find(|preset| preset.id == preset_snapshot.id)
+                    {
+                        *target = edited.clone();
+                    }
+                }
+                self.playtest_state.selected_physics_id = edited.id.clone();
+                self.mark_edited(format!("Updated physics preset '{}'", edited.id));
+                restart_session = true;
+            }
+
+            if duplicate_preset {
+                self.capture_history();
+                let mut duplicated_label = None;
+                if let Some(bundle) = &mut self.bundle {
+                    let existing = bundle
+                        .manifest
+                        .gameplay
+                        .physics_presets
+                        .iter()
+                        .map(|preset| preset.id.clone())
+                        .collect::<BTreeSet<_>>();
+                    let mut duplicate = preset_snapshot.clone();
+                    duplicate.id = next_unique_layer_id(&existing, &preset_snapshot.id);
+                    self.playtest_state.selected_physics_id = duplicate.id.clone();
+                    bundle.manifest.gameplay.physics_presets.push(duplicate.clone());
+                    duplicated_label = Some(duplicate.id);
+                    restart_session = true;
+                }
+                if let Some(label) = duplicated_label {
+                    self.mark_edited(format!("Duplicated physics preset '{}'", label));
+                }
+            }
+
+            if reset_preset {
+                self.capture_history();
+                let mut reset_label = None;
+                if let Some(bundle) = &mut self.bundle {
+                    if let Some(target) = bundle
+                        .manifest
+                        .gameplay
+                        .physics_presets
+                        .iter_mut()
+                        .find(|preset| preset.id == preset_snapshot.id)
+                    {
+                        *target =
+                            template_physics_profile(target.family, target.id.clone());
+                        reset_label = Some(target.id.clone());
+                        restart_session = true;
+                    }
+                }
+                if let Some(label) = reset_label {
+                    self.mark_edited(format!("Reset physics preset '{}'", label));
+                }
+            }
+        }
+
+        if restart_session {
+            self.reset_playtest_session();
+        }
+
+        let input = input_frame_from_context(ctx);
+        if self.playtest_state.playing {
+            self.playtest_state.accumulated_seconds +=
+                ctx.input(|input| input.stable_dt) * self.playtest_state.speed_multiplier;
+            while self.playtest_state.accumulated_seconds >= (1.0 / 60.0) {
+                self.step_playtest_session(input);
+                self.playtest_state.accumulated_seconds -= 1.0 / 60.0;
+            }
+            ctx.request_repaint();
+        } else if step_session {
+            self.step_playtest_session(input);
+        }
+
         if !self.playtest_state.last_status.is_empty() {
             ui.separator();
             ui.label(&self.playtest_state.last_status);
+        }
+
+        if let Some(profile) = self.selected_physics_profile() {
+            ui.separator();
+            ui.collapsing("Movement Trace", |ui| {
+                let trace = simulate_trace(
+                    &profile,
+                    &sample_platformer_trace_input(),
+                );
+                draw_trace_chart(ui, &trace, "Y Position", |frame| frame.y_fp);
+                draw_trace_chart(ui, &trace, "Horizontal Speed", |frame| frame.vx_fp);
+                ui.label(format!(
+                    "Preset '{}'  |  coyote={}  jump buffer={}  ladder={}",
+                    profile.id,
+                    profile.coyote_frames,
+                    profile.jump_buffer_frames,
+                    profile.ladder_speed_fp
+                ));
+            });
+        }
+
+        ui.separator();
+        ui.heading("In-Editor Sandbox");
+        let playtest_zoom = 6.0;
+        let playtest_viewport = Vec2::new(ui.available_width(), 280.0);
+        let mut camera_offset = Vec2::ZERO;
+        if let (Some(scene), Some(state)) = (
+            bundle_snapshot.scenes.get(self.selected_scene),
+            self.playtest_state.session.as_ref().map(|session| session.state()),
+        ) {
+            let focus_rect = RectI16 {
+                x: (state.x_fp >> snesmaker_project::FIXED_POINT_SHIFT) as i16,
+                y: (state.y_fp >> snesmaker_project::FIXED_POINT_SHIFT) as i16,
+                width: 16,
+                height: 16,
+            };
+            camera_offset = focus_offset_for_rect(
+                focus_rect,
+                playtest_zoom,
+                playtest_viewport,
+                Vec2::new(
+                    scene.size_tiles.width as f32 * 8.0 * playtest_zoom,
+                    scene.size_tiles.height as f32 * 8.0 * playtest_zoom,
+                ),
+            );
+        }
+
+        let outcome = draw_scene_canvas(
+            ui,
+            &bundle_snapshot,
+            self.selected_scene,
+            playtest_zoom,
+            camera_offset,
+            playtest_viewport,
+            self.show_grid,
+            self.show_collision,
+            self.selected_layer,
+            self.selected_tile,
+            self.selected_spawn,
+            self.selected_checkpoint,
+            self.selected_entity,
+            self.selected_trigger,
+            None,
+            None,
+            false,
+            None,
+            None,
+            self.playtest_state.show_spawns,
+            self.playtest_state.show_checkpoints,
+            self.playtest_state.show_entities,
+            self.playtest_state.show_triggers,
+            ctx.input(|input| input.time) as f32,
+        );
+
+        if let Some(session) = &self.playtest_state.session {
+            let state = session.state();
+            let painter = ui.painter_at(outcome.viewport_rect);
+            let origin = outcome.viewport_rect.min - camera_offset;
+            let player_center = origin
+                + Vec2::new(
+                    (state.x_fp >> snesmaker_project::FIXED_POINT_SHIFT) as f32 * playtest_zoom
+                        + 8.0 * playtest_zoom,
+                    (state.y_fp >> snesmaker_project::FIXED_POINT_SHIFT) as f32 * playtest_zoom
+                        + 8.0 * playtest_zoom,
+                );
+            painter.circle_filled(player_center, 8.0, Color32::from_rgb(255, 112, 96));
+            painter.circle_stroke(player_center, 10.0, (2.0, Color32::WHITE));
+
+            if self.playtest_state.show_camera_bounds {
+                painter.rect_stroke(
+                    outcome.viewport_rect,
+                    6.0,
+                    (2.0, Color32::from_rgb(255, 255, 255)),
+                    StrokeKind::Inside,
+                );
+            }
+
+            if let Some(scene) = bundle_snapshot.scenes.get(self.selected_scene) {
+                let player_rect = RectI16 {
+                    x: (state.x_fp >> snesmaker_project::FIXED_POINT_SHIFT) as i16,
+                    y: (state.y_fp >> snesmaker_project::FIXED_POINT_SHIFT) as i16,
+                    width: 16,
+                    height: 16,
+                };
+                let active_triggers = scene
+                    .triggers
+                    .iter()
+                    .filter(|trigger| rects_overlap_pixels(player_rect, trigger.rect))
+                    .map(|trigger| trigger.id.clone())
+                    .collect::<Vec<_>>();
+                ui.label(format!(
+                    "Player: x={} y={} grounded={} ladder={} hazard={}  |  Active triggers: {}",
+                    state.x_fp >> snesmaker_project::FIXED_POINT_SHIFT,
+                    state.y_fp >> snesmaker_project::FIXED_POINT_SHIFT,
+                    state.grounded,
+                    state.on_ladder,
+                    state.touching_hazard,
+                    if active_triggers.is_empty() {
+                        "none".to_string()
+                    } else {
+                        active_triggers.join(", ")
+                    }
+                ));
+                ui.label(format!(
+                    "Entity state: {} active / {} inactive",
+                    scene.entities.iter().filter(|entity| entity.active).count(),
+                    scene.entities.iter().filter(|entity| !entity.active).count()
+                ));
+            }
+        } else {
+            ui.label("Restart the session to begin simulating the current scene.");
         }
 
         if let Some(outcome) = &self.last_build_outcome {
@@ -4217,7 +6854,7 @@ impl EditorApp {
                 Some(DockTab::Animation) => self.draw_animation_tab(ui, ctx),
                 Some(DockTab::Diagnostics) => self.draw_diagnostics(ui),
                 Some(DockTab::BuildReport) => self.draw_build_report_tab(ui),
-                Some(DockTab::Playtest) => self.draw_playtest_tab(ui),
+                Some(DockTab::Playtest) => self.draw_playtest_tab(ui, ctx),
                 None => {
                     ui.with_layout(Layout::top_down_justified(Align::Min), |ui| {
                         ui.add_space(16.0);
@@ -4378,6 +7015,14 @@ impl EditorApp {
         let viewport_size = Vec2::new(ui.available_width(), viewport_height);
         let bundle = self.bundle.as_ref().expect("bundle");
         let content_size = scene_content_size(bundle, self.selected_scene, self.scene_zoom);
+        if let Some(focus_rect) = self.pending_focus_rect.take() {
+            self.scene_scroll_offset = focus_offset_for_rect(
+                focus_rect,
+                self.scene_zoom,
+                viewport_size,
+                content_size,
+            );
+        }
         self.scene_scroll_offset =
             clamp_scene_scroll_offset(self.scene_scroll_offset, content_size, viewport_size);
         let outcome = draw_scene_canvas(
@@ -4398,6 +7043,12 @@ impl EditorApp {
             self.selection.as_ref(),
             self.selection_drag_anchor,
             self.tool == EditorTool::Select,
+            self.solo_layer,
+            self.solo_group,
+            true,
+            true,
+            true,
+            true,
             ctx.input(|input| input.time) as f32,
         );
         self.apply_scene_view_gestures(ctx, outcome.viewport_rect, content_size);
@@ -4447,6 +7098,27 @@ impl EditorApp {
                 }
                 if ui.button("Hazard Off").clicked() {
                     self.apply_selection_action(SelectionAction::SetHazard(false));
+                }
+                if ui.button("Line").clicked() {
+                    self.draw_line_in_selection();
+                }
+                if ui.button("Mirror H").clicked() {
+                    self.mirror_selection(true);
+                }
+                if ui.button("Mirror V").clicked() {
+                    self.mirror_selection(false);
+                }
+                if ui.button("Stamp Clipboard").clicked() {
+                    self.paste_clipboard();
+                }
+                if ui.button("Flood Fill From Hover").clicked() {
+                    self.flood_fill_from_hovered_tile();
+                }
+                if ui.button("Save Brush").clicked() {
+                    self.save_selection_as_brush();
+                }
+                if ui.button("Save Snippet").clicked() {
+                    self.save_selection_as_snippet();
                 }
             });
         }
@@ -5005,6 +7677,12 @@ fn draw_scene_canvas(
     current_selection: Option<&SceneSelection>,
     selection_drag_anchor: Option<(usize, usize)>,
     selection_mode: bool,
+    solo_layer: Option<(usize, usize)>,
+    solo_group: Option<SceneObjectGroup>,
+    show_spawns: bool,
+    show_checkpoints: bool,
+    show_entities: bool,
+    show_triggers: bool,
     time_seconds: f32,
 ) -> SceneCanvasOutcome {
     let Some(scene) = bundle.scenes.get(scene_index) else {
@@ -5019,8 +7697,12 @@ fn draw_scene_canvas(
     let render_layers = scene
         .layers
         .iter()
-        .filter(|layer| layer.visible)
-        .filter_map(|layer| {
+        .enumerate()
+        .filter(|(layer_index, _)| {
+            solo_layer.is_none() || solo_layer == Some((scene_index, *layer_index))
+        })
+        .filter(|(_, layer)| layer.visible)
+        .filter_map(|(_, layer)| {
             let tileset = bundle.tileset(&layer.tileset_id)?;
             let palette = bundle.palette(&tileset.palette_id)?;
             Some((layer, tileset, palette))
@@ -5124,32 +7806,42 @@ fn draw_scene_canvas(
         }
     }
 
-    draw_spawns(
-        &painter,
-        rect,
-        zoom,
-        &scene.spawns,
-        selected_spawn,
-        Color32::from_rgb(64, 212, 255),
-    );
-    draw_checkpoints(
-        &painter,
-        rect,
-        zoom,
-        &scene.checkpoints,
-        selected_checkpoint,
-        Color32::from_rgb(255, 220, 72),
-    );
-    draw_triggers(&painter, rect, zoom, &scene.triggers, selected_trigger);
-    draw_entities(
-        &painter,
-        rect,
-        zoom,
-        bundle,
-        &scene.entities,
-        selected_entity,
-        time_seconds,
-    );
+    if show_spawns && (solo_group.is_none() || solo_group == Some(SceneObjectGroup::Spawns)) {
+        draw_spawns(
+            &painter,
+            rect,
+            zoom,
+            &scene.spawns,
+            selected_spawn,
+            Color32::from_rgb(64, 212, 255),
+        );
+    }
+    if show_checkpoints
+        && (solo_group.is_none() || solo_group == Some(SceneObjectGroup::Checkpoints))
+    {
+        draw_checkpoints(
+            &painter,
+            rect,
+            zoom,
+            &scene.checkpoints,
+            selected_checkpoint,
+            Color32::from_rgb(255, 220, 72),
+        );
+    }
+    if show_triggers && (solo_group.is_none() || solo_group == Some(SceneObjectGroup::Triggers)) {
+        draw_triggers(&painter, rect, zoom, &scene.triggers, selected_trigger);
+    }
+    if show_entities && (solo_group.is_none() || solo_group == Some(SceneObjectGroup::Entities)) {
+        draw_entities(
+            &painter,
+            rect,
+            zoom,
+            bundle,
+            &scene.entities,
+            selected_entity,
+            time_seconds,
+        );
+    }
 
     if let Some(selection) = current_selection {
         draw_scene_selection_overlay(&painter, rect, zoom, scene, selection);
@@ -5327,6 +8019,86 @@ fn draw_metasprite_preview_canvas(
     );
 }
 
+fn draw_text_thumbnail(
+    ui: &mut egui::Ui,
+    title: &str,
+    body: &str,
+    accent: Color32,
+) {
+    let desired = Vec2::new(96.0, 56.0);
+    let (response, painter) = ui.allocate_painter(desired, Sense::hover());
+    painter.rect_filled(response.rect, 6.0, Color32::from_rgb(18, 26, 34));
+    let accent_rect = Rect::from_min_size(response.rect.min, Vec2::new(4.0, response.rect.height()));
+    painter.rect_filled(accent_rect, 4.0, accent);
+    painter.text(
+        response.rect.min + Vec2::new(10.0, 8.0),
+        Align2::LEFT_TOP,
+        title,
+        FontId::proportional(12.0),
+        Color32::WHITE,
+    );
+    painter.text(
+        response.rect.min + Vec2::new(10.0, 26.0),
+        Align2::LEFT_TOP,
+        truncate_preview_text(body, 40),
+        FontId::proportional(11.0),
+        Color32::from_gray(190),
+    );
+}
+
+fn dialogue_preview_text(dialogue: &DialogueGraph) -> String {
+    dialogue
+        .nodes
+        .iter()
+        .find(|node| node.id == dialogue.opening_node)
+        .or_else(|| dialogue.nodes.first())
+        .map(|node| {
+            if node.speaker.trim().is_empty() {
+                node.text.clone()
+            } else {
+                format!("{}: {}", node.speaker, node.text)
+            }
+        })
+        .unwrap_or_else(|| "Empty dialogue".to_string())
+}
+
+fn event_command_label(command: &EventCommand) -> &'static str {
+    match command {
+        EventCommand::ShowDialogue { .. } => "ShowDialogue",
+        EventCommand::SetFlag { .. } => "SetFlag",
+        EventCommand::Wait { .. } => "Wait",
+        EventCommand::MoveCamera { .. } => "MoveCamera",
+        EventCommand::FreezePlayer { .. } => "FreezePlayer",
+        EventCommand::SpawnEntity { .. } => "SpawnEntity",
+        EventCommand::LoadScene { .. } => "LoadScene",
+        EventCommand::StartBattleScene { .. } => "StartBattleScene",
+        EventCommand::PlayCutscene { .. } => "PlayCutscene",
+        EventCommand::EmitCheckpoint { .. } => "EmitCheckpoint",
+    }
+}
+
+fn script_preview_text(script: &EventScript) -> String {
+    script
+        .commands
+        .first()
+        .map(event_command_label)
+        .map(|label| format!("{} command(s), starts with {}", script.commands.len(), label))
+        .unwrap_or_else(|| "No commands".to_string())
+}
+
+fn truncate_preview_text(value: &str, max_chars: usize) -> String {
+    let value = value.trim().replace('\n', " ");
+    let mut chars = value.chars();
+    let preview = chars.by_ref().take(max_chars).collect::<String>();
+    if chars.next().is_some() {
+        format!("{}...", preview)
+    } else if preview.is_empty() {
+        "Empty".to_string()
+    } else {
+        preview
+    }
+}
+
 fn draw_tile_button(
     ui: &mut egui::Ui,
     tile: &Tile8,
@@ -5361,6 +8133,424 @@ fn draw_tile_button(
         StrokeKind::Inside,
     );
     response
+}
+
+fn draw_asset_thumbnail_frame(ui: &mut egui::Ui, size: Vec2) -> (egui::Response, egui::Painter) {
+    let (response, painter) = ui.allocate_painter(size, Sense::hover());
+    painter.rect_filled(response.rect, 6.0, Color32::from_rgb(20, 28, 38));
+    painter.rect_stroke(
+        response.rect,
+        6.0,
+        (1.0, Color32::from_rgb(60, 74, 92)),
+        StrokeKind::Inside,
+    );
+    (response, painter)
+}
+
+fn draw_palette_thumbnail(ui: &mut egui::Ui, palette: &PaletteResource) {
+    let (response, painter) = draw_asset_thumbnail_frame(ui, Vec2::new(92.0, 32.0));
+    let rect = response.rect.shrink2(Vec2::splat(4.0));
+    let swatch_count = palette.colors.len().clamp(1, 8);
+    let swatch_width = rect.width() / swatch_count as f32;
+
+    for (index, color) in palette.colors.iter().take(swatch_count).enumerate() {
+        let swatch = Rect::from_min_size(
+            Pos2::new(rect.left() + swatch_width * index as f32, rect.top()),
+            Vec2::new(swatch_width + 1.0, rect.height()),
+        );
+        painter.rect_filled(swatch, 2.0, to_color32(color));
+    }
+
+    if palette.colors.is_empty() {
+        painter.text(
+            rect.center(),
+            Align2::CENTER_CENTER,
+            "Empty",
+            FontId::proportional(12.0),
+            Color32::from_rgb(160, 170, 180),
+        );
+    }
+}
+
+fn draw_tileset_thumbnail(ui: &mut egui::Ui, tileset: &TilesetResource, palette: &PaletteResource) {
+    let (response, painter) = draw_asset_thumbnail_frame(ui, Vec2::new(92.0, 54.0));
+    let rect = response.rect.shrink2(Vec2::splat(4.0));
+    let columns = 2;
+    let rows = 2;
+    let cell_size = Vec2::new(rect.width() / columns as f32, rect.height() / rows as f32);
+
+    for index in 0..columns * rows {
+        let x = index % columns;
+        let y = index / columns;
+        let cell = Rect::from_min_size(
+            Pos2::new(
+                rect.left() + cell_size.x * x as f32,
+                rect.top() + cell_size.y * y as f32,
+            ),
+            cell_size - Vec2::splat(2.0),
+        );
+        if let Some(tile) = tileset.tiles.get(index) {
+            draw_tile_pixels(&painter, cell, tile, palette);
+            painter.rect_stroke(
+                cell,
+                2.0,
+                (1.0, Color32::from_rgb(64, 78, 96)),
+                StrokeKind::Inside,
+            );
+        } else {
+            painter.rect_filled(cell, 2.0, Color32::from_rgb(30, 38, 50));
+        }
+    }
+}
+
+fn draw_metasprite_thumbnail(
+    ui: &mut egui::Ui,
+    bundle: &ProjectBundle,
+    metasprite: &MetaspriteResource,
+) {
+    let (response, painter) = draw_asset_thumbnail_frame(ui, Vec2::new(92.0, 54.0));
+    let rect = response.rect.shrink(6.0);
+
+    let Some(tileset) = find_tileset_for_metasprite(bundle, metasprite) else {
+        painter.text(
+            rect.center(),
+            Align2::CENTER_CENTER,
+            "No tileset",
+            FontId::proportional(12.0),
+            Color32::from_rgb(180, 160, 160),
+        );
+        return;
+    };
+    let Some(palette) = bundle.palette(&metasprite.palette_id) else {
+        painter.text(
+            rect.center(),
+            Align2::CENTER_CENTER,
+            "No palette",
+            FontId::proportional(12.0),
+            Color32::from_rgb(180, 160, 160),
+        );
+        return;
+    };
+
+    let width_pixels = metasprite
+        .pieces
+        .iter()
+        .map(|piece| piece.x + 8)
+        .max()
+        .unwrap_or(8) as f32;
+    let height_pixels = metasprite
+        .pieces
+        .iter()
+        .map(|piece| piece.y + 8)
+        .max()
+        .unwrap_or(8) as f32;
+    let zoom = (rect.width() / width_pixels.max(1.0)).min(rect.height() / height_pixels.max(1.0));
+    let zoom = zoom.clamp(2.0, 4.0);
+    let origin = rect.center() - Vec2::new(width_pixels * zoom * 0.5, height_pixels * zoom * 0.5);
+    draw_metasprite(
+        &painter,
+        origin,
+        metasprite,
+        tileset,
+        palette,
+        zoom,
+        Facing::Right,
+        false,
+    );
+}
+
+fn draw_animation_thumbnail(
+    ui: &mut egui::Ui,
+    bundle: &ProjectBundle,
+    animation_index: usize,
+    time_seconds: f32,
+) {
+    let (response, painter) = draw_asset_thumbnail_frame(ui, Vec2::new(92.0, 54.0));
+    let rect = response.rect.shrink(6.0);
+    let Some(animation) = bundle.animations.get(animation_index) else {
+        painter.text(
+            rect.center(),
+            Align2::CENTER_CENTER,
+            "No animation",
+            FontId::proportional(12.0),
+            Color32::from_rgb(180, 160, 160),
+        );
+        return;
+    };
+
+    let Some(metasprite) = metasprite_for_animation_frame(bundle, animation, time_seconds) else {
+        painter.text(
+            rect.center(),
+            Align2::CENTER_CENTER,
+            "No frames",
+            FontId::proportional(12.0),
+            Color32::from_rgb(180, 160, 160),
+        );
+        return;
+    };
+    let Some(tileset) = find_tileset_for_metasprite(bundle, metasprite) else {
+        painter.text(
+            rect.center(),
+            Align2::CENTER_CENTER,
+            "No tileset",
+            FontId::proportional(12.0),
+            Color32::from_rgb(180, 160, 160),
+        );
+        return;
+    };
+    let Some(palette) = bundle.palette(&metasprite.palette_id) else {
+        painter.text(
+            rect.center(),
+            Align2::CENTER_CENTER,
+            "No palette",
+            FontId::proportional(12.0),
+            Color32::from_rgb(180, 160, 160),
+        );
+        return;
+    };
+
+    let width_pixels = metasprite
+        .pieces
+        .iter()
+        .map(|piece| piece.x + 8)
+        .max()
+        .unwrap_or(8) as f32;
+    let height_pixels = metasprite
+        .pieces
+        .iter()
+        .map(|piece| piece.y + 8)
+        .max()
+        .unwrap_or(8) as f32;
+    let zoom = (rect.width() / width_pixels.max(1.0)).min(rect.height() / height_pixels.max(1.0));
+    let zoom = zoom.clamp(2.0, 4.0);
+    let origin = rect.center() - Vec2::new(width_pixels * zoom * 0.5, height_pixels * zoom * 0.5);
+    draw_metasprite(
+        &painter,
+        origin,
+        metasprite,
+        tileset,
+        palette,
+        zoom,
+        Facing::Right,
+        false,
+    );
+}
+
+fn draw_scene_snippet_thumbnail(
+    ui: &mut egui::Ui,
+    bundle: &ProjectBundle,
+    snippet: &SavedSceneSnippet,
+) {
+    let (response, painter) = draw_asset_thumbnail_frame(ui, Vec2::new(92.0, 54.0));
+    let rect = response.rect.shrink(4.0);
+    let Some(layer) = snippet.layers.first() else {
+        painter.text(
+            rect.center(),
+            Align2::CENTER_CENTER,
+            "Empty",
+            FontId::proportional(12.0),
+            Color32::from_rgb(170, 180, 190),
+        );
+        return;
+    };
+    let Some(tileset) = bundle.tileset(&layer.tileset_id) else {
+        painter.text(
+            rect.center(),
+            Align2::CENTER_CENTER,
+            "No tileset",
+            FontId::proportional(12.0),
+            Color32::from_rgb(180, 160, 160),
+        );
+        return;
+    };
+    let Some(palette) = bundle.palette(&tileset.palette_id) else {
+        painter.text(
+            rect.center(),
+            Align2::CENTER_CENTER,
+            "No palette",
+            FontId::proportional(12.0),
+            Color32::from_rgb(180, 160, 160),
+        );
+        return;
+    };
+
+    let grid_width = snippet.size_tiles.width.max(1) as usize;
+    let grid_height = snippet.size_tiles.height.max(1) as usize;
+    let tile_scale = Vec2::new(
+        rect.width() / grid_width as f32 / 8.0,
+        rect.height() / grid_height as f32 / 8.0,
+    );
+    let scale = tile_scale.x.min(tile_scale.y).clamp(1.0, 4.0);
+    let tile_size = Vec2::splat(8.0 * scale);
+
+    for y in 0..grid_height.min(4) {
+        for x in 0..grid_width.min(4) {
+            let index = y * grid_width + x;
+            let Some(tile) = layer.tiles.get(index).and_then(|tile_index| {
+                tileset.tiles.get(*tile_index as usize)
+            }) else {
+                continue;
+            };
+            let cell = Rect::from_min_size(
+                Pos2::new(rect.left() + x as f32 * tile_size.x, rect.top() + y as f32 * tile_size.y),
+                tile_size,
+            );
+            draw_tile_pixels(&painter, cell, tile, palette);
+        }
+    }
+}
+
+fn draw_tile_brush_thumbnail(ui: &mut egui::Ui, brush: &SavedTileBrush) {
+    let (response, painter) = draw_asset_thumbnail_frame(ui, Vec2::new(92.0, 54.0));
+    let rect = response.rect.shrink(4.0);
+    if brush.tiles.is_empty() {
+        painter.text(
+            rect.center(),
+            Align2::CENTER_CENTER,
+            "Empty",
+            FontId::proportional(12.0),
+            Color32::from_rgb(170, 180, 190),
+        );
+        return;
+    }
+
+    let cols = brush.size_tiles.width.max(1) as usize;
+    let rows = brush.size_tiles.height.max(1) as usize;
+    let cell_w = rect.width() / cols as f32;
+    let cell_h = rect.height() / rows as f32;
+    for y in 0..rows.min(4) {
+        for x in 0..cols.min(4) {
+            let index = y * cols + x;
+            let value = brush.tiles.get(index).copied().unwrap_or_default();
+            let hue = ((value as u32 * 37) % 255) as u8;
+            let cell = Rect::from_min_size(
+                Pos2::new(rect.left() + x as f32 * cell_w, rect.top() + y as f32 * cell_h),
+                Vec2::new(cell_w - 2.0, cell_h - 2.0),
+            );
+            painter.rect_filled(cell, 2.0, Color32::from_rgb(60 + hue / 3, 70 + hue / 4, 100 + hue / 5));
+            painter.rect_stroke(
+                cell,
+                2.0,
+                (1.0, Color32::from_rgb(36, 48, 62)),
+                StrokeKind::Inside,
+            );
+        }
+    }
+}
+
+fn draw_sprite_source_thumbnail(
+    ui: &mut egui::Ui,
+    texture: &TextureHandle,
+    label: &str,
+) {
+    let (response, painter) = draw_asset_thumbnail_frame(ui, Vec2::new(92.0, 54.0));
+    let rect = response.rect.shrink(4.0);
+    let image_rect = Rect::from_center_size(rect.center(), Vec2::new(rect.width(), rect.height()));
+    painter.image(
+        texture.id(),
+        image_rect,
+        Rect::from_min_size(Pos2::ZERO, texture.size_vec2()),
+        Color32::WHITE,
+    );
+    painter.rect_stroke(
+        rect,
+        4.0,
+        (1.0, Color32::from_rgb(74, 88, 108)),
+        StrokeKind::Inside,
+    );
+    painter.text(
+        rect.left_bottom() + Vec2::new(4.0, -4.0),
+        Align2::LEFT_BOTTOM,
+        label,
+        FontId::proportional(10.0),
+        Color32::from_white_alpha(220),
+    );
+}
+
+fn draw_scene_thumbnail(ui: &mut egui::Ui, bundle: &ProjectBundle, scene: &SceneResource) {
+    let (response, painter) = draw_asset_thumbnail_frame(ui, Vec2::new(92.0, 54.0));
+    let rect = response.rect.shrink(4.0);
+    let Some(layer) = scene.layers.first() else {
+        painter.text(
+            rect.center(),
+            Align2::CENTER_CENTER,
+            "Empty",
+            FontId::proportional(12.0),
+            Color32::from_rgb(170, 180, 190),
+        );
+        return;
+    };
+    let Some(tileset) = bundle.tileset(&layer.tileset_id) else {
+        painter.text(
+            rect.center(),
+            Align2::CENTER_CENTER,
+            "No tileset",
+            FontId::proportional(12.0),
+            Color32::from_rgb(180, 160, 160),
+        );
+        return;
+    };
+    let Some(palette) = bundle.palette(&tileset.palette_id) else {
+        painter.text(
+            rect.center(),
+            Align2::CENTER_CENTER,
+            "No palette",
+            FontId::proportional(12.0),
+            Color32::from_rgb(180, 160, 160),
+        );
+        return;
+    };
+
+    let grid_width = scene.size_tiles.width.max(1) as usize;
+    let grid_height = scene.size_tiles.height.max(1) as usize;
+    let scale = (rect.width() / grid_width as f32 / 8.0)
+        .min(rect.height() / grid_height as f32 / 8.0)
+        .clamp(1.0, 3.0);
+    let tile_size = Vec2::splat(8.0 * scale);
+    for y in 0..grid_height.min(4) {
+        for x in 0..grid_width.min(4) {
+            let index = y * grid_width + x;
+            let Some(tile) = layer.tiles.get(index).and_then(|tile_index| {
+                tileset.tiles.get(*tile_index as usize)
+            }) else {
+                continue;
+            };
+            let cell = Rect::from_min_size(
+                Pos2::new(rect.left() + x as f32 * tile_size.x, rect.top() + y as f32 * tile_size.y),
+                tile_size,
+            );
+            draw_tile_pixels(&painter, cell, tile, palette);
+        }
+    }
+}
+
+fn draw_diagnostic_row(
+    ui: &mut egui::Ui,
+    diagnostic: &Diagnostic,
+    has_quick_fix: bool,
+    navigate_to: &mut Option<String>,
+    quick_fix: &mut Option<Diagnostic>,
+) {
+    let color = match diagnostic.severity {
+        Severity::Error => Color32::from_rgb(196, 72, 72),
+        Severity::Warning => Color32::from_rgb(208, 160, 40),
+    };
+
+    ui.group(|ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.colored_label(color, format!("[{}]", diagnostic.code));
+            if let Some(path) = &diagnostic.path {
+                ui.monospace(path);
+                if ui.small_button("Go").clicked() {
+                    *navigate_to = Some(path.clone());
+                }
+            }
+            if has_quick_fix && ui.small_button("Quick Fix").clicked() {
+                *quick_fix = Some(diagnostic.clone());
+            }
+        });
+        ui.label(&diagnostic.message);
+    });
 }
 
 fn draw_tile_editor_grid(ui: &mut egui::Ui, tile: &mut Tile8, palette: &PaletteResource) -> bool {
@@ -5715,6 +8905,109 @@ fn draw_metasprite(
     }
 }
 
+fn template_physics_profile(
+    family: snesmaker_project::PhysicsFamily,
+    id: String,
+) -> PhysicsProfile {
+    match family {
+        snesmaker_project::PhysicsFamily::MegaManLike
+        | snesmaker_project::PhysicsFamily::Custom => PhysicsProfile {
+            id,
+            family,
+            gravity_fp: snesmaker_project::fp(0.28),
+            max_fall_speed_fp: snesmaker_project::fp(4.0),
+            ground_accel_fp: snesmaker_project::fp(0.35),
+            air_accel_fp: snesmaker_project::fp(0.22),
+            max_run_speed_fp: snesmaker_project::fp(1.75),
+            jump_velocity_fp: snesmaker_project::fp(-4.1),
+            coyote_frames: 4,
+            jump_buffer_frames: 4,
+            ladder_speed_fp: snesmaker_project::fp(1.0),
+        },
+        snesmaker_project::PhysicsFamily::MarioLike => PhysicsProfile {
+            id,
+            family,
+            gravity_fp: snesmaker_project::fp(0.22),
+            max_fall_speed_fp: snesmaker_project::fp(4.8),
+            ground_accel_fp: snesmaker_project::fp(0.45),
+            air_accel_fp: snesmaker_project::fp(0.28),
+            max_run_speed_fp: snesmaker_project::fp(2.2),
+            jump_velocity_fp: snesmaker_project::fp(-4.8),
+            coyote_frames: 6,
+            jump_buffer_frames: 5,
+            ladder_speed_fp: snesmaker_project::fp(1.2),
+        },
+    }
+}
+
+fn input_frame_from_context(ctx: &egui::Context) -> InputFrame {
+    ctx.input(|input| InputFrame {
+        left: input.key_down(Key::ArrowLeft) || input.key_down(Key::A),
+        right: input.key_down(Key::ArrowRight) || input.key_down(Key::D),
+        jump_pressed: input.key_pressed(Key::Space),
+        jump_held: input.key_down(Key::Space),
+        climb_up: input.key_down(Key::ArrowUp) || input.key_down(Key::W),
+        climb_down: input.key_down(Key::ArrowDown) || input.key_down(Key::S),
+    })
+}
+
+fn sample_platformer_trace_input() -> Vec<InputFrame> {
+    let mut frames = Vec::new();
+    for index in 0..48 {
+        frames.push(InputFrame {
+            right: index < 36,
+            jump_pressed: index == 8,
+            jump_held: (8..18).contains(&index),
+            ..InputFrame::default()
+        });
+    }
+    frames
+}
+
+fn draw_trace_chart(
+    ui: &mut egui::Ui,
+    trace: &[snesmaker_platformer::TraceFrame],
+    label: &str,
+    sample: impl Fn(&snesmaker_platformer::TraceFrame) -> i32,
+) {
+    ui.label(label);
+    let desired = Vec2::new(ui.available_width(), 120.0);
+    let (response, painter) = ui.allocate_painter(desired, Sense::hover());
+    painter.rect_filled(response.rect, 6.0, Color32::from_rgb(18, 26, 34));
+    if trace.len() < 2 {
+        return;
+    }
+
+    let values = trace.iter().map(sample).collect::<Vec<_>>();
+    let min = *values.iter().min().unwrap_or(&0) as f32;
+    let max = *values.iter().max().unwrap_or(&0) as f32;
+    let range = (max - min).max(1.0);
+
+    for index in 1..values.len() {
+        let prev_t = (index - 1) as f32 / (values.len().saturating_sub(1)) as f32;
+        let next_t = index as f32 / (values.len().saturating_sub(1)) as f32;
+        let prev_y = (values[index - 1] as f32 - min) / range;
+        let next_y = (values[index] as f32 - min) / range;
+        let prev = Pos2::new(
+            egui::lerp(response.rect.x_range(), prev_t),
+            egui::lerp(response.rect.y_range(), 1.0 - prev_y),
+        );
+        let next = Pos2::new(
+            egui::lerp(response.rect.x_range(), next_t),
+            egui::lerp(response.rect.y_range(), 1.0 - next_y),
+        );
+        painter.line_segment([prev, next], (2.0, Color32::from_rgb(96, 208, 255)));
+    }
+}
+
+fn rects_overlap_pixels(a: RectI16, b: RectI16) -> bool {
+    let a_right = a.x.saturating_add(a.width as i16);
+    let a_bottom = a.y.saturating_add(a.height as i16);
+    let b_right = b.x.saturating_add(b.width as i16);
+    let b_bottom = b.y.saturating_add(b.height as i16);
+    a.x < b_right && a_right > b.x && a.y < b_bottom && a_bottom > b.y
+}
+
 fn draw_sprite_tile_pixels(
     painter: &egui::Painter,
     rect: Rect,
@@ -5786,6 +9079,84 @@ fn build_scene_selection(scene: &SceneResource, rect: TileSelectionRect) -> Scen
     }
 }
 
+fn layer_bounds_pixels(scene: &SceneResource, layer: &TileLayer) -> Option<RectI16> {
+    let width = scene.size_tiles.width as usize;
+    if width == 0 {
+        return None;
+    }
+
+    let mut min_x = usize::MAX;
+    let mut min_y = usize::MAX;
+    let mut max_x = 0_usize;
+    let mut max_y = 0_usize;
+    let mut found = false;
+
+    for (index, tile) in layer.tiles.iter().enumerate() {
+        if *tile == 0 {
+            continue;
+        }
+        let tile_x = index % width;
+        let tile_y = index / width;
+        min_x = min_x.min(tile_x);
+        min_y = min_y.min(tile_y);
+        max_x = max_x.max(tile_x);
+        max_y = max_y.max(tile_y);
+        found = true;
+    }
+
+    found.then_some(RectI16 {
+        x: (min_x * 8) as i16,
+        y: (min_y * 8) as i16,
+        width: ((max_x - min_x + 1) * 8) as u16,
+        height: ((max_y - min_y + 1) * 8) as u16,
+    })
+}
+
+fn bresenham_line(start: (i32, i32), end: (i32, i32)) -> Vec<(i32, i32)> {
+    let mut points = Vec::new();
+    let (mut x0, mut y0) = start;
+    let (x1, y1) = end;
+    let dx = (x1 - x0).abs();
+    let sx = if x0 < x1 { 1 } else { -1 };
+    let dy = -(y1 - y0).abs();
+    let sy = if y0 < y1 { 1 } else { -1 };
+    let mut error = dx + dy;
+
+    loop {
+        points.push((x0, y0));
+        if x0 == x1 && y0 == y1 {
+            break;
+        }
+        let doubled = 2 * error;
+        if doubled >= dy {
+            error += dy;
+            x0 += sx;
+        }
+        if doubled <= dx {
+            error += dx;
+            y0 += sy;
+        }
+    }
+
+    points
+}
+
+fn next_unique_layer_id(existing: &BTreeSet<String>, base: &str) -> String {
+    let stem = format!("{}_copy", slugify(base));
+    if !existing.contains(&stem) {
+        return stem;
+    }
+
+    let mut suffix = 2;
+    loop {
+        let candidate = format!("{}_{}", stem, suffix);
+        if !existing.contains(&candidate) {
+            return candidate;
+        }
+        suffix += 1;
+    }
+}
+
 fn next_unique_copy_id(existing: &mut BTreeSet<String>, base: &str) -> String {
     let stem = format!("{}_copy", slugify(base));
     if existing.insert(stem.clone()) {
@@ -5806,6 +9177,19 @@ fn clamp_scene_scroll_offset(offset: Vec2, content_size: Vec2, viewport_size: Ve
     let max_x = (content_size.x - viewport_size.x).max(0.0);
     let max_y = (content_size.y - viewport_size.y).max(0.0);
     Vec2::new(offset.x.clamp(0.0, max_x), offset.y.clamp(0.0, max_y))
+}
+
+fn focus_offset_for_rect(
+    rect: RectI16,
+    zoom: f32,
+    viewport_size: Vec2,
+    content_size: Vec2,
+) -> Vec2 {
+    let center = Vec2::new(
+        rect.x as f32 * zoom + rect.width as f32 * zoom * 0.5,
+        rect.y as f32 * zoom + rect.height as f32 * zoom * 0.5,
+    );
+    clamp_scene_scroll_offset(center - viewport_size * 0.5, content_size, viewport_size)
 }
 
 fn scene_content_size(bundle: &ProjectBundle, scene_index: usize, zoom: f32) -> Vec2 {

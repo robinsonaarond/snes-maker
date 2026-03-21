@@ -1,0 +1,39 @@
+(
+    current_layout: (
+        show_status_bar: true,
+        left: (
+            size: 320.0,
+            tabs: [
+                Toolbox,
+                Outliner,
+            ],
+            active: 0,
+        ),
+        center: (
+            size: 180.0,
+            tabs: [
+                Scene,
+            ],
+            active: 0,
+        ),
+        right: (
+            size: 492.59375,
+            tabs: [
+                Inspector,
+                Animation,
+            ],
+            active: 0,
+        ),
+        bottom: (
+            size: 886.0,
+            tabs: [
+                Diagnostics,
+                BuildReport,
+                Playtest,
+            ],
+            active: 2,
+        ),
+    ),
+    saved_layouts: [],
+    active_saved_layout: None,
+)

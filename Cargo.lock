@@ -3136,6 +3136,7 @@ dependencies = [
  "serde_json",
  "snesmaker-events",
  "snesmaker-export",
+ "snesmaker-platformer",
  "snesmaker-project",
  "snesmaker-validator",
 ]
