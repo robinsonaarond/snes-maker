@@ -6846,15 +6846,29 @@ impl EditorApp {
             ui.separator();
 
             match slot.active_tab() {
-                Some(DockTab::Toolbox) => self.draw_toolbox_tab(ui),
-                Some(DockTab::Scene) => self.draw_scene_tab(ui, ctx),
-                Some(DockTab::Inspector) => self.draw_inspector_tab(ui, ctx),
-                Some(DockTab::Outliner) => self.draw_scene_outliner(ui),
-                Some(DockTab::Assets) => self.draw_asset_browser(ui, ctx),
-                Some(DockTab::Animation) => self.draw_animation_tab(ui, ctx),
-                Some(DockTab::Diagnostics) => self.draw_diagnostics(ui),
-                Some(DockTab::BuildReport) => self.draw_build_report_tab(ui),
-                Some(DockTab::Playtest) => self.draw_playtest_tab(ui, ctx),
+                Some(DockTab::Scene) => {
+                    let clip_rect = ui.clip_rect().intersect(ui.available_rect_before_wrap());
+                    ui.scope(|ui| {
+                        ui.set_clip_rect(clip_rect);
+                        self.draw_scene_tab(ui, ctx);
+                    });
+                }
+                Some(active_tab) => {
+                    egui::ScrollArea::both()
+                        .id_salt(format!("dock_scroll_{area:?}_{active_tab:?}"))
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| match active_tab {
+                            DockTab::Toolbox => self.draw_toolbox_tab(ui),
+                            DockTab::Inspector => self.draw_inspector_tab(ui, ctx),
+                            DockTab::Outliner => self.draw_scene_outliner(ui),
+                            DockTab::Assets => self.draw_asset_browser(ui, ctx),
+                            DockTab::Animation => self.draw_animation_tab(ui, ctx),
+                            DockTab::Diagnostics => self.draw_diagnostics(ui),
+                            DockTab::BuildReport => self.draw_build_report_tab(ui),
+                            DockTab::Playtest => self.draw_playtest_tab(ui, ctx),
+                            DockTab::Scene => unreachable!("scene tab handled above"),
+                        });
+                }
                 None => {
                     ui.with_layout(Layout::top_down_justified(Align::Min), |ui| {
                         ui.add_space(16.0);
@@ -6990,7 +7004,7 @@ impl EditorApp {
                 )
             };
 
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.heading("Scene Preview");
             ui.label(format!("{}  |  entry scene: {}", scene_label, entry_scene));
             ui.separator();
@@ -7716,7 +7730,7 @@ fn draw_scene_canvas(
     );
     let viewport_size = Vec2::new(viewport_size.x.max(64.0), viewport_size.y.max(64.0));
     let (viewport_rect, response) = ui.allocate_exact_size(viewport_size, Sense::click_and_drag());
-    let painter = ui.painter_at(viewport_rect);
+    let painter = ui.painter().with_clip_rect(viewport_rect);
     painter.rect_filled(viewport_rect, 6.0, Color32::from_rgb(18, 26, 34));
     let rect = Rect::from_min_size(viewport_rect.min - camera_offset, desired_size);
 

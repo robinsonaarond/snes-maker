@@ -17,7 +17,7 @@
             active: 0,
         ),
         right: (
-            size: 492.59375,
+            size: 260.0,
             tabs: [
                 Inspector,
                 Animation,
@@ -25,13 +25,14 @@
             active: 0,
         ),
         bottom: (
-            size: 886.0,
+            size: 309.0,
             tabs: [
                 Diagnostics,
                 BuildReport,
                 Playtest,
+                Assets,
             ],
-            active: 2,
+            active: 3,
         ),
     ),
     saved_layouts: [],
