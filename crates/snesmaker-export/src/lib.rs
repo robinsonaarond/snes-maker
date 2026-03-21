@@ -717,7 +717,7 @@ fn build_bg_assets(bundle: &ProjectBundle) -> Result<BgAssets> {
         .flat_map(|entry| entry.to_le_bytes())
         .collect::<Vec<_>>();
     let max_scroll_x_pixels =
-        (DISPLAY_MAP_WIDTH_TILES.saturating_sub(VISIBLE_SCREEN_WIDTH_TILES) * 8) as usize;
+        DISPLAY_MAP_WIDTH_TILES.saturating_sub(VISIBLE_SCREEN_WIDTH_TILES) * 8;
 
     Ok(BgAssets {
         palette_bytes,

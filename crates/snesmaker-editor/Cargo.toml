@@ -12,6 +12,9 @@ eframe.workspace = true
 egui.workspace = true
 image.workspace = true
 rfd.workspace = true
+ron.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 
 snesmaker-export = { path = "../snesmaker-export" }
 snesmaker-events = { path = "../snesmaker-events" }

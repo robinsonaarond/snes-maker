@@ -1,26 +1,34 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{anyhow, bail, Context, Result};
 use camino::{Utf8Path, Utf8PathBuf};
 use eframe::egui::{
-    self, Align2, Color32, ColorImage, FontId, Key, KeyboardShortcut, Modifiers, Pos2, Rect, Sense,
-    StrokeKind, TextureHandle, TextureOptions, Vec2, ViewportCommand,
+    self, Align, Align2, Color32, ColorImage, FontId, Key, KeyboardShortcut, Layout, Modifiers,
+    Pos2, Rect, Sense, StrokeKind, TextureHandle, TextureOptions, Vec2, ViewportCommand,
 };
 use image::RgbaImage;
 use rfd::FileDialog;
 use snesmaker_events::TriggerKind;
-use snesmaker_export::build_rom;
+use snesmaker_export::{BuildOutcome, build_rom};
 use snesmaker_project::{
-    AnimationFrame, AnimationResource, Checkpoint, CombatProfile, EntityAction, EntityKind,
-    EntityPlacement, Facing, HealthHudStyle, MetaspriteResource, MovementPattern,
-    PROJECT_SPRITE_SOURCE_DIR, PaletteResource, PointI16, ProjectBundle, RectI16, RgbaColor,
-    SceneResource, SpawnPoint, SpriteTileRef, Tile8, TilesetResource, TriggerVolume,
-    default_entity_hitbox, slugify,
+    default_entity_hitbox, slugify, AnimationFrame, AnimationResource, Checkpoint, CombatProfile,
+    EntityAction, EntityKind, EntityPlacement, Facing, HealthHudStyle, MetaspriteResource,
+    MovementPattern, PaletteResource, PointI16, ProjectBundle, RectI16, RgbaColor, SceneResource,
+    SpawnPoint, SpriteTileRef, Tile8, TileLayer, TilesetResource, TriggerVolume,
+    PROJECT_SPRITE_SOURCE_DIR,
 };
-use snesmaker_validator::{Severity, ValidationReport, validate_project};
+use snesmaker_validator::{validate_project, Severity, ValidationReport};
+
+mod workspace;
+
+use workspace::{
+    DockArea, DockLayout, DockSlot, DockTab, SavedDockLayout, WorkspaceFile, copy_workspace_file,
+    load_workspace_file, save_workspace_file,
+};
 
 const HISTORY_LIMIT: usize = 64;
 const SCENE_MIN_ZOOM: f32 = 2.0;
@@ -62,6 +70,14 @@ enum EditorTool {
     Checkpoint,
     Entity,
     Trigger,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelectionAction {
+    PaintTile(u16),
+    SetSolid(bool),
+    SetLadder(bool),
+    SetHazard(bool),
 }
 
 impl EditorTool {
@@ -160,6 +176,97 @@ enum PreviewFocus {
     None,
     Animation,
     Entity,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkspacePreset {
+    LevelDesign,
+    Animation,
+    Eventing,
+    Debug,
+    Custom,
+}
+
+impl WorkspacePreset {
+    fn label(self) -> &'static str {
+        match self {
+            Self::LevelDesign => "Level Design",
+            Self::Animation => "Animation",
+            Self::Eventing => "Eventing",
+            Self::Debug => "Debug",
+            Self::Custom => "Custom",
+        }
+    }
+
+    fn layout(self) -> DockLayout {
+        match self {
+            Self::LevelDesign => DockLayout {
+                show_status_bar: true,
+                left: DockSlot::new(320.0, vec![DockTab::Toolbox, DockTab::Outliner], 0),
+                center: DockSlot::new(0.0, vec![DockTab::Scene], 0),
+                right: DockSlot::new(380.0, vec![DockTab::Inspector, DockTab::Animation], 0),
+                bottom: DockSlot::new(
+                    280.0,
+                    vec![DockTab::Assets, DockTab::Diagnostics, DockTab::BuildReport, DockTab::Playtest],
+                    0,
+                ),
+            },
+            Self::Animation => DockLayout {
+                show_status_bar: true,
+                left: DockSlot::new(320.0, vec![DockTab::Assets, DockTab::Toolbox], 0),
+                center: DockSlot::new(0.0, vec![DockTab::Scene], 0),
+                right: DockSlot::new(380.0, vec![DockTab::Animation, DockTab::Inspector], 0),
+                bottom: DockSlot::new(260.0, vec![DockTab::Diagnostics, DockTab::BuildReport], 0),
+            },
+            Self::Eventing => DockLayout {
+                show_status_bar: true,
+                left: DockSlot::new(320.0, vec![DockTab::Outliner, DockTab::Assets], 0),
+                center: DockSlot::new(0.0, vec![DockTab::Scene], 0),
+                right: DockSlot::new(380.0, vec![DockTab::Inspector, DockTab::Diagnostics], 0),
+                bottom: DockSlot::new(260.0, vec![DockTab::BuildReport, DockTab::Playtest], 0),
+            },
+            Self::Debug => DockLayout {
+                show_status_bar: true,
+                left: DockSlot::new(320.0, vec![DockTab::Toolbox, DockTab::Outliner], 1),
+                center: DockSlot::new(0.0, vec![DockTab::Scene], 0),
+                right: DockSlot::new(380.0, vec![DockTab::Inspector, DockTab::Animation], 0),
+                bottom: DockSlot::new(
+                    300.0,
+                    vec![DockTab::Diagnostics, DockTab::BuildReport, DockTab::Playtest, DockTab::Assets],
+                    0,
+                ),
+            },
+            Self::Custom => WorkspacePreset::LevelDesign.layout(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct WorkspaceState {
+    layout: DockLayout,
+    saved_layouts: Vec<SavedDockLayout>,
+    active_saved_layout: Option<String>,
+}
+
+impl WorkspaceState {
+    fn for_preset(preset: WorkspacePreset) -> Self {
+        Self {
+            layout: preset.layout(),
+            saved_layouts: Vec::new(),
+            active_saved_layout: None,
+        }
+    }
+}
+
+#[derive(Default)]
+struct SaveLayoutState {
+    open: bool,
+    name: String,
+}
+
+#[derive(Default)]
+struct PlaytestState {
+    last_status: String,
 }
 
 #[derive(Default)]
@@ -271,6 +378,7 @@ struct EditorApp {
     status: String,
     dirty: bool,
     selected_scene: usize,
+    selected_layer: usize,
     selected_tile: usize,
     selected_animation: usize,
     selected_spawn: Option<usize>,
@@ -293,6 +401,14 @@ struct EditorApp {
     confirm_exit: bool,
     import_state: SpriteSheetImportState,
     new_project_state: NewProjectState,
+    workspace_preset: WorkspacePreset,
+    workspace: WorkspaceState,
+    save_layout_state: SaveLayoutState,
+    last_build_outcome: Option<BuildOutcome>,
+    playtest_state: PlaytestState,
+    outliner_filter: String,
+    asset_browser_filter: String,
+    locked_layers: BTreeSet<(usize, usize)>,
 }
 
 impl EditorApp {
@@ -304,6 +420,7 @@ impl EditorApp {
             status: String::new(),
             dirty: false,
             selected_scene: 0,
+            selected_layer: 0,
             selected_tile: 0,
             selected_animation: 0,
             selected_spawn: Some(0),
@@ -330,6 +447,14 @@ impl EditorApp {
                 project_name: "My SNES Game".to_string(),
                 destination: String::new(),
             },
+            workspace_preset: WorkspacePreset::LevelDesign,
+            workspace: WorkspaceState::for_preset(WorkspacePreset::LevelDesign),
+            save_layout_state: SaveLayoutState::default(),
+            last_build_outcome: None,
+            playtest_state: PlaytestState::default(),
+            outliner_filter: String::new(),
+            asset_browser_filter: String::new(),
+            locked_layers: BTreeSet::new(),
         };
         app.reload();
         app
@@ -340,6 +465,8 @@ impl EditorApp {
             Ok(bundle) => {
                 self.bundle = Some(bundle);
                 self.report = validate_project(self.bundle.as_ref().expect("bundle"));
+                self.load_workspace_state();
+                self.refresh_last_build_report();
                 self.status = format!("Loaded {}", self.project_root);
                 self.dirty = false;
                 self.history.clear();
@@ -349,11 +476,15 @@ impl EditorApp {
                 self.last_canvas_tile = None;
                 self.preview_focus = PreviewFocus::None;
                 self.scene_scroll_offset = Vec2::ZERO;
+                self.locked_layers.clear();
                 self.sync_selection();
             }
             Err(error) => {
                 self.bundle = None;
                 self.report = ValidationReport::default();
+                self.workspace_preset = WorkspacePreset::LevelDesign;
+                self.workspace = WorkspaceState::for_preset(WorkspacePreset::LevelDesign);
+                self.last_build_outcome = None;
                 self.status = error.to_string();
                 self.dirty = false;
                 self.history.clear();
@@ -363,6 +494,7 @@ impl EditorApp {
                 self.last_canvas_tile = None;
                 self.preview_focus = PreviewFocus::None;
                 self.scene_scroll_offset = Vec2::ZERO;
+                self.locked_layers.clear();
             }
         }
     }
@@ -375,6 +507,7 @@ impl EditorApp {
     fn sync_selection(&mut self) {
         let Some(bundle) = &self.bundle else {
             self.selected_scene = 0;
+            self.selected_layer = 0;
             self.selected_tile = 0;
             self.selected_animation = 0;
             self.selected_spawn = None;
@@ -387,20 +520,24 @@ impl EditorApp {
         self.selected_scene = self
             .selected_scene
             .min(bundle.scenes.len().saturating_sub(1));
-        self.selected_tile = self.selected_tile.min(
-            bundle
-                .tilesets
-                .first()
-                .map(|tileset| tileset.tiles.len())
-                .unwrap_or(1)
-                .saturating_sub(1),
-        );
         self.selected_animation = self
             .selected_animation
             .min(bundle.animations.len().saturating_sub(1));
         self.import_state.sync_to_bundle(bundle);
 
         if let Some(scene) = bundle.scenes.get(self.selected_scene) {
+            self.selected_layer = self
+                .selected_layer
+                .min(scene.layers.len().saturating_sub(1));
+            self.selected_tile = scene
+                .layers
+                .get(self.selected_layer)
+                .and_then(|layer| bundle.tileset(&layer.tileset_id))
+                .map(|tileset| {
+                    self.selected_tile
+                        .min(tileset.tiles.len().saturating_sub(1))
+                })
+                .unwrap_or(0);
             self.selected_spawn = sanitize_optional_index(self.selected_spawn, scene.spawns.len());
             self.selected_checkpoint =
                 sanitize_optional_index(self.selected_checkpoint, scene.checkpoints.len());
@@ -409,6 +546,8 @@ impl EditorApp {
             self.selected_trigger =
                 sanitize_optional_index(self.selected_trigger, scene.triggers.len());
         } else {
+            self.selected_layer = 0;
+            self.selected_tile = 0;
             self.selected_spawn = None;
             self.selected_checkpoint = None;
             self.selected_entity = None;
@@ -432,6 +571,177 @@ impl EditorApp {
         }
     }
 
+    fn detect_workspace_preset(layout: &DockLayout) -> WorkspacePreset {
+        for preset in [
+            WorkspacePreset::LevelDesign,
+            WorkspacePreset::Animation,
+            WorkspacePreset::Eventing,
+            WorkspacePreset::Debug,
+        ] {
+            if layout == &preset.layout() {
+                return preset;
+            }
+        }
+        WorkspacePreset::Custom
+    }
+
+    fn load_workspace_state(&mut self) {
+        match load_workspace_file(&self.project_root) {
+            Ok(Some(mut workspace_file)) => {
+                workspace_file.normalize();
+                self.workspace.layout = workspace_file.current_layout;
+                self.workspace.saved_layouts = workspace_file.saved_layouts;
+                self.workspace.active_saved_layout = workspace_file.active_saved_layout;
+                self.workspace_preset =
+                    Self::detect_workspace_preset(&self.workspace.layout);
+                let active_saved_layout = self
+                    .workspace
+                    .active_saved_layout
+                    .clone()
+                    .unwrap_or_else(|| self.workspace_preset.label().to_string());
+                self.save_layout_state.name = active_saved_layout;
+            }
+            Ok(None) => {
+                self.workspace_preset = WorkspacePreset::LevelDesign;
+                self.workspace = WorkspaceState::for_preset(WorkspacePreset::LevelDesign);
+                self.save_layout_state.name = WorkspacePreset::LevelDesign.label().to_string();
+            }
+            Err(error) => {
+                self.workspace_preset = WorkspacePreset::LevelDesign;
+                self.workspace = WorkspaceState::for_preset(WorkspacePreset::LevelDesign);
+                self.save_layout_state.name = WorkspacePreset::LevelDesign.label().to_string();
+                self.status = format!(
+                    "Loaded {} with default workspace ({}).",
+                    self.project_root, error
+                );
+            }
+        }
+    }
+
+    fn persist_workspace_state(&mut self) {
+        let workspace_file = WorkspaceFile {
+            current_layout: self.workspace.layout.clone(),
+            saved_layouts: self.workspace.saved_layouts.clone(),
+            active_saved_layout: self.workspace.active_saved_layout.clone(),
+        };
+
+        if let Err(error) = save_workspace_file(&self.project_root, &workspace_file) {
+            self.status = format!("Failed to save workspace layout: {}", error);
+        }
+    }
+
+    fn set_workspace_preset(&mut self, preset: WorkspacePreset) {
+        if preset == WorkspacePreset::Custom {
+            return;
+        }
+
+        self.workspace_preset = preset;
+        self.workspace.layout = preset.layout();
+        self.workspace.active_saved_layout = None;
+        self.save_layout_state.name = preset.label().to_string();
+        self.persist_workspace_state();
+        self.status = format!("Workspace: {}", preset.label());
+    }
+
+    fn mark_workspace_custom(&mut self) {
+        self.workspace_preset = WorkspacePreset::Custom;
+        self.workspace.active_saved_layout = None;
+        self.persist_workspace_state();
+    }
+
+    fn load_saved_workspace(&mut self, name: &str) {
+        let Some(saved) = self
+            .workspace
+            .saved_layouts
+            .iter()
+            .find(|layout| layout.name.eq_ignore_ascii_case(name))
+            .cloned()
+        else {
+            self.status = format!("Workspace layout '{}' no longer exists.", name);
+            return;
+        };
+
+        self.workspace.layout = saved.layout;
+        self.workspace_preset = Self::detect_workspace_preset(&self.workspace.layout);
+        self.workspace.active_saved_layout = Some(saved.name.clone());
+        self.save_layout_state.name = saved.name.clone();
+        self.persist_workspace_state();
+        self.status = format!("Loaded workspace layout '{}'", saved.name);
+    }
+
+    fn save_current_workspace_layout(&mut self) {
+        let name = self.save_layout_state.name.trim().to_string();
+        if name.is_empty() {
+            self.status = "Enter a workspace layout name first.".to_string();
+            return;
+        }
+
+        let saved = SavedDockLayout {
+            name: name.clone(),
+            layout: self.workspace.layout.clone(),
+        };
+        if let Some(existing) = self
+            .workspace
+            .saved_layouts
+            .iter_mut()
+            .find(|layout| layout.name.eq_ignore_ascii_case(&name))
+        {
+            *existing = saved;
+        } else {
+            self.workspace.saved_layouts.push(saved);
+        }
+        self.workspace
+            .saved_layouts
+            .sort_by(|left, right| left.name.cmp(&right.name));
+        self.workspace.active_saved_layout = Some(name.clone());
+        self.workspace_preset = WorkspacePreset::Custom;
+        self.persist_workspace_state();
+        self.save_layout_state.open = false;
+        self.status = format!("Saved workspace layout '{}'", name);
+    }
+
+    fn delete_saved_workspace(&mut self, name: &str) {
+        let before = self.workspace.saved_layouts.len();
+        self.workspace
+            .saved_layouts
+            .retain(|layout| !layout.name.eq_ignore_ascii_case(name));
+
+        if self.workspace.saved_layouts.len() == before {
+            self.status = format!("Workspace layout '{}' was already removed.", name);
+            return;
+        }
+
+        if self
+            .workspace
+            .active_saved_layout
+            .as_deref()
+            .is_some_and(|active| active.eq_ignore_ascii_case(name))
+        {
+            self.workspace.active_saved_layout = None;
+        }
+        self.persist_workspace_state();
+        self.status = format!("Deleted workspace layout '{}'", name);
+    }
+
+    fn set_dock_tab_visibility(&mut self, tab: DockTab, visible: bool) {
+        if visible {
+            self.workspace.layout.show_tab(tab);
+        } else {
+            self.workspace.layout.hide_tab(tab);
+        }
+        self.mark_workspace_custom();
+    }
+
+    fn move_dock_tab(&mut self, tab: DockTab, area: DockArea) {
+        self.workspace.layout.move_tab(tab, area);
+        self.mark_workspace_custom();
+    }
+
+    fn move_active_dock_tab_within_slot(&mut self, area: DockArea, direction: i32) {
+        self.workspace.layout.move_active_within_slot(area, direction);
+        self.mark_workspace_custom();
+    }
+
     fn capture_history(&mut self) {
         if let Some(bundle) = &self.bundle {
             self.history.capture(bundle);
@@ -448,6 +758,214 @@ impl EditorApp {
         self.bundle
             .as_ref()
             .and_then(|bundle| bundle.scenes.get(self.selected_scene))
+    }
+
+    fn layer(
+        &self,
+        scene_index: usize,
+        layer_index: usize,
+    ) -> Option<&snesmaker_project::TileLayer> {
+        let bundle = self.bundle.as_ref()?;
+        let scene = bundle.scenes.get(scene_index)?;
+        let layer_index = layer_index.min(scene.layers.len().saturating_sub(1));
+        scene.layers.get(layer_index)
+    }
+
+    fn layer_mut(
+        &mut self,
+        scene_index: usize,
+        layer_index: usize,
+    ) -> Option<&mut snesmaker_project::TileLayer> {
+        let bundle = self.bundle.as_mut()?;
+        let scene = bundle.scenes.get_mut(scene_index)?;
+        let layer_index = layer_index.min(scene.layers.len().saturating_sub(1));
+        scene.layers.get_mut(layer_index)
+    }
+
+    fn current_layer(&self) -> Option<&snesmaker_project::TileLayer> {
+        self.layer(self.selected_scene, self.selected_layer)
+    }
+
+    fn current_layer_mut(&mut self) -> Option<&mut snesmaker_project::TileLayer> {
+        self.layer_mut(self.selected_scene, self.selected_layer)
+    }
+
+    fn active_tileset_and_palette(&self) -> Option<(&TilesetResource, &PaletteResource)> {
+        let bundle = self.bundle.as_ref()?;
+        let layer = self.current_layer()?;
+        let tileset = bundle.tileset(&layer.tileset_id)?;
+        let palette = bundle.palette(&tileset.palette_id)?;
+        Some((tileset, palette))
+    }
+
+    fn is_layer_locked(&self, scene_index: usize, layer_index: usize) -> bool {
+        self.locked_layers.contains(&(scene_index, layer_index))
+    }
+
+    fn active_layer_locked(&self) -> bool {
+        self.is_layer_locked(self.selected_scene, self.selected_layer)
+    }
+
+    fn select_layer(&mut self, scene_index: usize, layer_index: usize) {
+        self.selected_scene = scene_index;
+        self.selected_layer = layer_index;
+        self.scene_scroll_offset = Vec2::ZERO;
+        self.clear_selection();
+        self.preview_focus = PreviewFocus::None;
+        self.sync_selection();
+        if let Some(layer) = self.current_layer() {
+            self.status = format!("Active layer: '{}'", layer.id);
+        }
+    }
+
+    fn toggle_layer_lock(&mut self, scene_index: usize, layer_index: usize) {
+        let key = (scene_index, layer_index);
+        let locked = if self.locked_layers.contains(&key) {
+            self.locked_layers.remove(&key);
+            false
+        } else {
+            self.locked_layers.insert(key);
+            true
+        };
+
+        if let Some(layer) = self.layer(scene_index, layer_index) {
+            self.status = format!(
+                "{} layer '{}'",
+                if locked { "Locked" } else { "Unlocked" },
+                layer.id
+            );
+        }
+    }
+
+    fn toggle_layer_visibility(&mut self, scene_index: usize, layer_index: usize) {
+        let mut status = None;
+        self.capture_history();
+        if let Some(layer) = self.layer_mut(scene_index, layer_index) {
+            layer.visible = !layer.visible;
+            status = Some(format!(
+                "{} layer '{}'",
+                if layer.visible { "Showed" } else { "Hid" },
+                layer.id
+            ));
+        }
+
+        if let Some(status) = status {
+            self.mark_edited(status);
+        }
+    }
+
+    fn clear_scene_layer_locks(&mut self, scene_index: usize) {
+        self.locked_layers
+            .retain(|(locked_scene_index, _)| *locked_scene_index != scene_index);
+    }
+
+    fn add_layer_to_current_scene(&mut self) {
+        let Some(default_tileset_id) = self
+            .current_layer()
+            .map(|layer| layer.tileset_id.clone())
+            .or_else(|| {
+                self.bundle
+                    .as_ref()
+                    .and_then(|bundle| bundle.tilesets.first().map(|tileset| tileset.id.clone()))
+            })
+        else {
+            self.status = "Add a tileset before creating a new layer.".to_string();
+            return;
+        };
+
+        self.capture_history();
+        let mut added_layer = None;
+        if let Some(scene) = self.current_scene_mut() {
+            let mut next_index = scene.layers.len() + 1;
+            let id = loop {
+                let candidate = format!("layer_{}", next_index);
+                if scene.layers.iter().all(|layer| layer.id != candidate) {
+                    break candidate;
+                }
+                next_index += 1;
+            };
+
+            scene.layers.push(TileLayer {
+                id: id.clone(),
+                tileset_id: default_tileset_id,
+                visible: true,
+                parallax_x: 1,
+                parallax_y: 1,
+                tiles: vec![0; scene.size_tiles.tile_count()],
+            });
+            added_layer = Some((scene.layers.len() - 1, id));
+        }
+
+        if let Some((layer_index, id)) = added_layer {
+            self.selected_layer = layer_index;
+            self.sync_selection();
+            self.mark_edited(format!("Added layer '{}'", id));
+        }
+    }
+
+    fn remove_selected_layer(&mut self) {
+        let scene_index = self.selected_scene;
+        let Some(scene) = self.current_scene() else {
+            self.status = "No scene loaded.".to_string();
+            return;
+        };
+        if scene.layers.len() <= 1 {
+            self.status = "Each scene needs at least one layer.".to_string();
+            return;
+        }
+
+        let selected_layer = self
+            .selected_layer
+            .min(scene.layers.len().saturating_sub(1));
+        self.capture_history();
+        let mut removed_layer_id = None;
+        if let Some(scene) = self.current_scene_mut() {
+            if selected_layer < scene.layers.len() {
+                removed_layer_id = Some(scene.layers.remove(selected_layer).id);
+            }
+        }
+
+        if let Some(layer_id) = removed_layer_id {
+            self.clear_scene_layer_locks(scene_index);
+            self.selected_layer = selected_layer.saturating_sub(1);
+            self.sync_selection();
+            self.mark_edited(format!("Removed layer '{}'", layer_id));
+        }
+    }
+
+    fn move_selected_layer(&mut self, direction: i32) {
+        let scene_index = self.selected_scene;
+        let Some(scene) = self.current_scene() else {
+            self.status = "No scene loaded.".to_string();
+            return;
+        };
+        if scene.layers.is_empty() {
+            self.status = "This scene has no layers.".to_string();
+            return;
+        }
+
+        let selected_layer = self
+            .selected_layer
+            .min(scene.layers.len().saturating_sub(1));
+        let target_layer = match direction {
+            -1 if selected_layer > 0 => selected_layer - 1,
+            1 if selected_layer + 1 < scene.layers.len() => selected_layer + 1,
+            _ => return,
+        };
+
+        self.capture_history();
+        let mut moved_layer_id = None;
+        if let Some(scene) = self.current_scene_mut() {
+            scene.layers.swap(selected_layer, target_layer);
+            moved_layer_id = scene.layers.get(target_layer).map(|layer| layer.id.clone());
+        }
+
+        if let Some(layer_id) = moved_layer_id {
+            self.clear_scene_layer_locks(scene_index);
+            self.selected_layer = target_layer;
+            self.sync_selection();
+            self.mark_edited(format!("Moved layer '{}'", layer_id));
+        }
     }
 
     fn clear_selection(&mut self) {
@@ -480,8 +998,8 @@ impl EditorApp {
             self.status = "No scene loaded.".to_string();
             return;
         };
-        let Some(layer) = scene.layers.first() else {
-            self.status = "Current scene has no tile layer.".to_string();
+        let Some(layer) = self.current_layer() else {
+            self.status = "Current scene has no active layer.".to_string();
             return;
         };
 
@@ -526,6 +1044,7 @@ impl EditorApp {
         }
 
         let origin = rect.origin_pixels();
+        let layer_id = layer.id.clone();
         self.clipboard = Some(SceneClipboard {
             width_tiles,
             height_tiles,
@@ -578,7 +1097,10 @@ impl EditorApp {
                 })
                 .collect(),
         });
-        self.status = format!("Copied {}x{} selection", width_tiles, height_tiles);
+        self.status = format!(
+            "Copied {}x{} selection from '{}'",
+            width_tiles, height_tiles, layer_id
+        );
     }
 
     fn paste_clipboard(&mut self) {
@@ -586,6 +1108,13 @@ impl EditorApp {
             self.status = "Clipboard is empty.".to_string();
             return;
         };
+        if self.active_layer_locked() {
+            self.status = self
+                .current_layer()
+                .map(|layer| format!("Layer '{}' is locked.", layer.id))
+                .unwrap_or_else(|| "Active layer is locked.".to_string());
+            return;
+        }
         let anchor = self
             .last_canvas_tile
             .or_else(|| {
@@ -614,10 +1143,17 @@ impl EditorApp {
             triggers: Vec::new(),
         };
 
+        let layer_index = self
+            .current_scene()
+            .map(|scene| {
+                self.selected_layer
+                    .min(scene.layers.len().saturating_sub(1))
+            })
+            .unwrap_or(0);
         if let Some(scene) = self.current_scene_mut() {
             let scene_width = scene.size_tiles.width as usize;
             let scene_height = scene.size_tiles.height as usize;
-            if let Some(layer) = scene.layers.first_mut() {
+            if let Some(layer) = scene.layers.get_mut(layer_index) {
                 for local_y in 0..clipboard.height_tiles {
                     for local_x in 0..clipboard.width_tiles {
                         let target_x = anchor.0 + local_x;
@@ -695,7 +1231,131 @@ impl EditorApp {
         }
 
         self.selection = Some(new_selection);
-        self.mark_edited(format!("Pasted selection at {}, {}", anchor.0, anchor.1));
+        let layer_name = self
+            .current_layer()
+            .map(|layer| layer.id.as_str())
+            .unwrap_or("layer");
+        self.mark_edited(format!(
+            "Pasted selection into '{}' at {}, {}",
+            layer_name, anchor.0, anchor.1
+        ));
+    }
+
+    fn sample_tile_from_cell(&mut self, cell_index: usize) {
+        let Some(layer) = self.current_layer() else {
+            self.status = "No active layer loaded.".to_string();
+            return;
+        };
+        let layer_id = layer.id.clone();
+        let tile_index = layer.tiles.get(cell_index).copied().unwrap_or_default() as usize;
+        self.selected_tile = tile_index;
+        self.tool = EditorTool::Paint;
+        self.preview_focus = PreviewFocus::None;
+        self.status = format!("Sampled tile {} from '{}'", tile_index, layer_id);
+    }
+
+    fn apply_selection_action(&mut self, action: SelectionAction) {
+        let Some(selection) = self.selection.as_ref() else {
+            self.status = "Select a region first.".to_string();
+            return;
+        };
+        if matches!(action, SelectionAction::PaintTile(_)) && self.active_layer_locked() {
+            self.status = self
+                .current_layer()
+                .map(|layer| format!("Layer '{}' is locked.", layer.id))
+                .unwrap_or_else(|| "Active layer is locked.".to_string());
+            return;
+        }
+
+        let rect = selection.rect;
+        let width_tiles = rect.width_tiles();
+        let height_tiles = rect.height_tiles();
+        let selected_layer = self.selected_layer;
+
+        self.capture_history();
+        let mut edited = false;
+        if let Some(scene) = self.current_scene_mut() {
+            let scene_width = scene.size_tiles.width as usize;
+            let layer_index = selected_layer.min(scene.layers.len().saturating_sub(1));
+            for tile_y in rect.min_y..=rect.max_y {
+                for tile_x in rect.min_x..=rect.max_x {
+                    let cell_index = tile_y * scene_width + tile_x;
+                    match action {
+                        SelectionAction::PaintTile(tile_index) => {
+                            if let Some(layer) = scene.layers.get_mut(layer_index) {
+                                if cell_index < layer.tiles.len() {
+                                    layer.tiles[cell_index] = tile_index;
+                                    edited = true;
+                                }
+                            }
+                        }
+                        SelectionAction::SetSolid(value) => {
+                            if cell_index < scene.collision.solids.len() {
+                                scene.collision.solids[cell_index] = value;
+                                edited = true;
+                            }
+                        }
+                        SelectionAction::SetLadder(value) => {
+                            if cell_index < scene.collision.ladders.len() {
+                                scene.collision.ladders[cell_index] = value;
+                                edited = true;
+                            }
+                        }
+                        SelectionAction::SetHazard(value) => {
+                            if cell_index < scene.collision.hazards.len() {
+                                scene.collision.hazards[cell_index] = value;
+                                edited = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if edited {
+            let status = match action {
+                SelectionAction::PaintTile(0) => {
+                    format!(
+                        "Cleared tiles in {}x{} selection",
+                        width_tiles, height_tiles
+                    )
+                }
+                SelectionAction::PaintTile(tile_index) => format!(
+                    "Filled {}x{} selection with tile {}",
+                    width_tiles, height_tiles, tile_index
+                ),
+                SelectionAction::SetSolid(true) => {
+                    format!("Marked {}x{} selection as solid", width_tiles, height_tiles)
+                }
+                SelectionAction::SetSolid(false) => {
+                    format!(
+                        "Cleared solid collision in {}x{} selection",
+                        width_tiles, height_tiles
+                    )
+                }
+                SelectionAction::SetLadder(true) => {
+                    format!(
+                        "Marked {}x{} selection as ladder",
+                        width_tiles, height_tiles
+                    )
+                }
+                SelectionAction::SetLadder(false) => format!(
+                    "Cleared ladder collision in {}x{} selection",
+                    width_tiles, height_tiles
+                ),
+                SelectionAction::SetHazard(true) => {
+                    format!(
+                        "Marked {}x{} selection as hazard",
+                        width_tiles, height_tiles
+                    )
+                }
+                SelectionAction::SetHazard(false) => format!(
+                    "Cleared hazard collision in {}x{} selection",
+                    width_tiles, height_tiles
+                ),
+            };
+            self.mark_edited(status);
+        }
     }
 
     fn project_sprite_source_dir(&self) -> Utf8PathBuf {
@@ -848,9 +1508,44 @@ impl EditorApp {
         match bundle
             .save(&export_root)
             .and_then(|_| self.copy_project_sprite_sources_to(&export_root))
+            .and_then(|_| copy_workspace_file(&self.project_root, &export_root))
         {
             Ok(()) => self.status = format!("Exported project to {}", export_root),
             Err(error) => self.status = error.to_string(),
+        }
+    }
+
+    fn build_report_path(&self) -> Utf8PathBuf {
+        if let Some(bundle) = &self.bundle {
+            self.project_root
+                .join(&bundle.manifest.build.output_dir)
+                .join("build-report.json")
+        } else {
+            self.project_root.join("build/build-report.json")
+        }
+    }
+
+    fn refresh_last_build_report(&mut self) {
+        let path = self.build_report_path();
+        if !path.exists() {
+            self.last_build_outcome = None;
+            return;
+        }
+
+        match fs::read_to_string(&path)
+            .with_context(|| format!("failed to read {}", path))
+            .and_then(|text| {
+                serde_json::from_str::<BuildOutcome>(&text)
+                    .with_context(|| format!("failed to parse {}", path))
+            })
+        {
+            Ok(outcome) => {
+                self.last_build_outcome = Some(outcome);
+            }
+            Err(error) => {
+                self.last_build_outcome = None;
+                self.status = format!("Failed to load build report: {}", error);
+            }
         }
     }
 
@@ -877,6 +1572,7 @@ impl EditorApp {
 
         match build_rom(&self.project_root, None) {
             Ok(outcome) => {
+                self.last_build_outcome = Some(outcome.clone());
                 self.report = outcome.validation;
                 self.status = if outcome.rom_built {
                     format!("Built ROM at {}", outcome.rom_path)
@@ -884,7 +1580,65 @@ impl EditorApp {
                     format!("Generated build assets at {}", outcome.build_dir)
                 };
             }
-            Err(error) => self.status = error.to_string(),
+            Err(error) => {
+                self.refresh_last_build_report();
+                self.status = error.to_string();
+            }
+        }
+    }
+
+    fn build_and_launch_playtest(&mut self) {
+        if !self.save_before_build() {
+            return;
+        }
+
+        let emulator = self
+            .bundle
+            .as_ref()
+            .and_then(|bundle| bundle.manifest.editor.preferred_emulator.clone())
+            .unwrap_or_else(|| "ares".to_string());
+        if self.bundle.is_none() {
+            self.status = "No project loaded.".to_string();
+            return;
+        }
+
+        match build_rom(&self.project_root, None) {
+            Ok(outcome) => {
+                self.last_build_outcome = Some(outcome.clone());
+                self.report = outcome.validation.clone();
+                if !outcome.rom_built {
+                    let message = format!(
+                        "Generated build assets at {}. Configure ca65/ld65 to enable playtest launches.",
+                        outcome.build_dir
+                    );
+                    self.playtest_state.last_status = message.clone();
+                    self.status = message;
+                    return;
+                }
+
+                match Command::new(&emulator).arg(&outcome.rom_path).spawn() {
+                    Ok(_) => {
+                        let message = format!(
+                            "Launched '{}' with {}",
+                            emulator, outcome.rom_path
+                        );
+                        self.playtest_state.last_status = message.clone();
+                        self.status = message;
+                    }
+                    Err(error) => {
+                        let message =
+                            format!("Failed to launch emulator '{}': {}", emulator, error);
+                        self.playtest_state.last_status = message.clone();
+                        self.status = message;
+                    }
+                }
+            }
+            Err(error) => {
+                self.refresh_last_build_report();
+                let message = error.to_string();
+                self.playtest_state.last_status = message.clone();
+                self.status = message;
+            }
         }
     }
 
@@ -1055,6 +1809,7 @@ impl EditorApp {
         let import = KeyboardShortcut::new(Modifiers::COMMAND, Key::I);
         let copy = KeyboardShortcut::new(Modifiers::COMMAND, Key::C);
         let paste = KeyboardShortcut::new(Modifiers::COMMAND, Key::V);
+        let fill_selection = KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::SHIFT, Key::F);
         let escape = KeyboardShortcut::new(Modifiers::NONE, Key::Escape);
 
         if ctx.input_mut(|input| input.consume_shortcut(&save)) {
@@ -1086,6 +1841,9 @@ impl EditorApp {
         if ctx.input_mut(|input| input.consume_shortcut(&paste)) {
             self.paste_clipboard();
         }
+        if ctx.input_mut(|input| input.consume_shortcut(&fill_selection)) {
+            self.apply_selection_action(SelectionAction::PaintTile(self.selected_tile as u16));
+        }
         if ctx.input_mut(|input| input.consume_shortcut(&escape))
             && (self.selection.is_some() || self.selection_drag_anchor.is_some())
         {
@@ -1102,6 +1860,13 @@ impl EditorApp {
     }
 
     fn draw_menu_bar(&mut self, ctx: &egui::Context) {
+        let mut next_workspace_preset = None;
+        let mut next_saved_layout = None;
+        let mut delete_saved_layout = None;
+        let mut open_save_dialog = false;
+        let mut workspace_changed = false;
+        let mut pending_tab_visibility = Vec::new();
+
         egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
                 ui.menu_button("File", |ui| {
@@ -1148,6 +1913,12 @@ impl EditorApp {
                         self.redo();
                         ui.close();
                     }
+                    if ui.button("Fill Selection With Tile").clicked() {
+                        self.apply_selection_action(SelectionAction::PaintTile(
+                            self.selected_tile as u16,
+                        ));
+                        ui.close();
+                    }
                 });
 
                 ui.menu_button("Build", |ui| {
@@ -1164,6 +1935,54 @@ impl EditorApp {
                         self.build_current_rom();
                         ui.close();
                     }
+                    if ui.button("Build && Launch Playtest").clicked() {
+                        self.build_and_launch_playtest();
+                        ui.close();
+                    }
+                });
+
+                ui.menu_button("Workspace", |ui| {
+                    for preset in [
+                        WorkspacePreset::LevelDesign,
+                        WorkspacePreset::Animation,
+                        WorkspacePreset::Eventing,
+                        WorkspacePreset::Debug,
+                    ] {
+                        if ui
+                            .selectable_label(self.workspace_preset == preset, preset.label())
+                            .clicked()
+                        {
+                            next_workspace_preset = Some(preset);
+                            ui.close();
+                        }
+                    }
+                    ui.separator();
+                    if ui.button("Save Current Layout...").clicked() {
+                        open_save_dialog = true;
+                        ui.close();
+                    }
+                    ui.menu_button("Load Saved Layout", |ui| {
+                        if self.workspace.saved_layouts.is_empty() {
+                            ui.label("No saved layouts yet.");
+                        }
+                        for layout in &self.workspace.saved_layouts {
+                            if ui.button(&layout.name).clicked() {
+                                next_saved_layout = Some(layout.name.clone());
+                                ui.close();
+                            }
+                        }
+                    });
+                    ui.menu_button("Delete Saved Layout", |ui| {
+                        if self.workspace.saved_layouts.is_empty() {
+                            ui.label("No saved layouts yet.");
+                        }
+                        for layout in &self.workspace.saved_layouts {
+                            if ui.button(&layout.name).clicked() {
+                                delete_saved_layout = Some(layout.name.clone());
+                                ui.close();
+                            }
+                        }
+                    });
                 });
 
                 ui.menu_button("View", |ui| {
@@ -1173,6 +1992,19 @@ impl EditorApp {
                         egui::Slider::new(&mut self.scene_zoom, SCENE_MIN_ZOOM..=SCENE_MAX_ZOOM)
                             .text("Scene Zoom"),
                     );
+                    ui.separator();
+                    ui.label("Workspace");
+                    workspace_changed |= ui
+                        .checkbox(&mut self.workspace.layout.show_status_bar, "Show Status Bar")
+                        .changed();
+                    ui.separator();
+                    ui.label("Dock Tabs");
+                    for tab in DockTab::ALL {
+                        let mut visible = self.workspace.layout.contains(tab);
+                        if ui.checkbox(&mut visible, tab.label()).changed() {
+                            pending_tab_visibility.push((tab, visible));
+                        }
+                    }
                 });
 
                 ui.menu_button("Help", |ui| {
@@ -1184,6 +2016,12 @@ impl EditorApp {
 
                 ui.separator();
                 ui.strong("SNES Maker");
+                let active_workspace_label = self
+                    .workspace
+                    .active_saved_layout
+                    .as_deref()
+                    .unwrap_or_else(|| self.workspace_preset.label());
+                ui.label(format!("Workspace: {}", active_workspace_label));
                 ui.label(self.project_root.as_str());
                 if self.dirty {
                     ui.colored_label(Color32::from_rgb(222, 168, 32), "Unsaved changes");
@@ -1191,194 +2029,409 @@ impl EditorApp {
             });
         });
 
-        egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(&self.status);
-                ui.separator();
-                ui.label(format!(
-                    "{} error(s), {} warning(s)",
-                    self.report.errors.len(),
-                    self.report.warnings.len()
-                ));
-                ui.separator();
-                ui.label(format!(
-                    "Budgets: {} scene(s), {} tile(s), {} color(s), ~{} bank(s)",
-                    self.report.budgets.scene_count,
-                    self.report.budgets.unique_tiles,
-                    self.report.budgets.palette_colors,
-                    self.report.budgets.estimated_rom_banks
-                ));
+        if let Some(preset) = next_workspace_preset {
+            self.set_workspace_preset(preset);
+        }
+        if let Some(name) = next_saved_layout {
+            self.load_saved_workspace(&name);
+        }
+        if let Some(name) = delete_saved_layout {
+            self.delete_saved_workspace(&name);
+        }
+        if open_save_dialog {
+            self.save_layout_state.open = true;
+            if self.save_layout_state.name.trim().is_empty() {
+                self.save_layout_state.name = self
+                    .workspace
+                    .active_saved_layout
+                    .clone()
+                    .unwrap_or_else(|| self.workspace_preset.label().to_string());
+            }
+        }
+        for (tab, visible) in pending_tab_visibility {
+            self.set_dock_tab_visibility(tab, visible);
+        }
+        if workspace_changed {
+            self.mark_workspace_custom();
+        }
+
+        if self.workspace.layout.show_status_bar {
+            egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(&self.status);
+                    ui.separator();
+                    ui.label(format!(
+                        "{} error(s), {} warning(s)",
+                        self.report.errors.len(),
+                        self.report.warnings.len()
+                    ));
+                    ui.separator();
+                    ui.label(format!(
+                        "Budgets: {} scene(s), {} tile(s), {} color(s), ~{} bank(s)",
+                        self.report.budgets.scene_count,
+                        self.report.budgets.unique_tiles,
+                        self.report.budgets.palette_colors,
+                        self.report.budgets.estimated_rom_banks
+                    ));
+                });
             });
-        });
+        }
     }
 
-    fn draw_left_panel(&mut self, ctx: &egui::Context) {
+    fn draw_toolbox_tab(&mut self, ui: &mut egui::Ui) {
         let mut pending_scene_selection = None;
-        egui::SidePanel::left("left_panel")
-            .min_width(280.0)
-            .resizable(true)
-            .show(ctx, |ui| {
-                let Some(bundle) = &self.bundle else {
-                    ui.heading("Project");
-                    ui.label("No project loaded.");
-                    if ui.button("Open Project...").clicked() {
-                        self.open_project_dialog();
-                    }
-                    if ui.button("Create Template Project").clicked() {
-                        self.new_project_state.open = true;
-                    }
-                    return;
-                };
+        let mut pending_layer_selection = None;
+        let mut pending_layer_visibility = None;
+        let mut pending_layer_lock = None;
+        let mut pending_tile_selection = None;
+        let Some(bundle) = &self.bundle else {
+            ui.heading("Project");
+            ui.label("No project loaded.");
+            if ui.button("Open Project...").clicked() {
+                self.open_project_dialog();
+            }
+            if ui.button("Create Template Project").clicked() {
+                self.new_project_state.open = true;
+            }
+            return;
+        };
 
-                ui.heading("Scenes");
-                for (index, scene) in bundle.scenes.iter().enumerate() {
-                    if ui
-                        .selectable_label(self.selected_scene == index, &scene.id)
-                        .clicked()
-                    {
-                        pending_scene_selection = Some(index);
-                    }
+        ui.heading("Scenes");
+        for (index, scene) in bundle.scenes.iter().enumerate() {
+            if ui
+                .selectable_label(self.selected_scene == index, &scene.id)
+                .clicked()
+            {
+                pending_scene_selection = Some(index);
+            }
+        }
+
+        ui.separator();
+        ui.heading("Layers");
+        if let Some(scene) = bundle.scenes.get(self.selected_scene) {
+            if scene.layers.is_empty() {
+                ui.label("This scene has no layers.");
+            } else {
+                for (index, layer) in scene.layers.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        if ui
+                            .selectable_label(self.selected_layer == index, &layer.id)
+                            .clicked()
+                        {
+                            pending_layer_selection = Some(index);
+                        }
+                        if ui
+                            .small_button(if layer.visible { "Hide" } else { "Show" })
+                            .clicked()
+                        {
+                            pending_layer_visibility = Some(index);
+                        }
+                        if ui
+                            .small_button(
+                                if self.is_layer_locked(self.selected_scene, index) {
+                                    "Unlock"
+                                } else {
+                                    "Lock"
+                                },
+                            )
+                            .clicked()
+                        {
+                            pending_layer_lock = Some(index);
+                        }
+                    });
                 }
+            }
+        }
 
-                ui.separator();
-                ui.heading("Tools");
-                ui.horizontal_wrapped(|ui| {
-                    for tool in [
-                        EditorTool::Select,
-                        EditorTool::Paint,
-                        EditorTool::Erase,
-                        EditorTool::Solid,
-                        EditorTool::Ladder,
-                        EditorTool::Hazard,
-                        EditorTool::Spawn,
-                        EditorTool::Checkpoint,
-                        EditorTool::Entity,
-                        EditorTool::Trigger,
-                    ] {
-                        ui.selectable_value(&mut self.tool, tool, tool.label());
-                    }
+        ui.separator();
+        ui.heading("Tools");
+        ui.horizontal_wrapped(|ui| {
+            for tool in [
+                EditorTool::Select,
+                EditorTool::Paint,
+                EditorTool::Erase,
+                EditorTool::Solid,
+                EditorTool::Ladder,
+                EditorTool::Hazard,
+                EditorTool::Spawn,
+                EditorTool::Checkpoint,
+                EditorTool::Entity,
+                EditorTool::Trigger,
+            ] {
+                ui.selectable_value(&mut self.tool, tool, tool.label());
+            }
+        });
+
+        ui.separator();
+        ui.heading("Tiles");
+        let active_layer_label = self.current_layer().map(|active_layer| {
+            format!(
+                "Layer: {}{}{}",
+                active_layer.id,
+                if active_layer.visible { "" } else { " [hidden]" },
+                if self.active_layer_locked() {
+                    " [locked]"
+                } else {
+                    ""
+                }
+            )
+        });
+        let active_tileset = self
+            .active_tileset_and_palette()
+            .map(|(tileset, palette)| (tileset.name.clone(), tileset.tiles.clone(), palette.clone()));
+        if let Some(label) = active_layer_label {
+            ui.label(label);
+        }
+        if let Some((tileset_name, tiles, palette)) = active_tileset {
+            ui.label(format!("Tileset: {}", tileset_name));
+            egui::ScrollArea::vertical()
+                .max_height(260.0)
+                .show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        for (index, tile) in tiles.iter().enumerate() {
+                            let response =
+                                draw_tile_button(ui, tile, &palette, 2.0, self.selected_tile == index);
+                            if response.clicked() {
+                                pending_tile_selection = Some(index);
+                            }
+                        }
+                    });
                 });
+        } else {
+            ui.label("Active layer tileset or palette is missing.");
+        }
 
-                ui.separator();
-                ui.heading("Tiles");
-                if let (Some(tileset), Some(palette)) =
-                    (bundle.tilesets.first(), bundle.palettes.first())
-                {
-                    ui.label(format!("Tileset: {}", tileset.name));
-                    egui::ScrollArea::vertical()
-                        .max_height(260.0)
-                        .show(ui, |ui| {
-                            ui.horizontal_wrapped(|ui| {
-                                for (index, tile) in tileset.tiles.iter().enumerate() {
-                                    let response = draw_tile_button(
-                                        ui,
-                                        tile,
-                                        palette,
-                                        2.0,
-                                        self.selected_tile == index,
-                                    );
-                                    if response.clicked() {
-                                        self.selected_tile = index;
-                                        self.tool = EditorTool::Paint;
-                                        self.preview_focus = PreviewFocus::None;
-                                    }
-                                }
-                            });
-                        });
-                }
+        ui.separator();
+        ui.heading("Animations");
+        for (index, animation) in bundle.animations.iter().enumerate() {
+            if ui
+                .selectable_label(self.selected_animation == index, &animation.id)
+                .clicked()
+            {
+                self.selected_animation = index;
+                self.preview_focus = PreviewFocus::Animation;
+            }
+        }
 
-                ui.separator();
-                ui.heading("Animations");
-                for (index, animation) in bundle.animations.iter().enumerate() {
-                    if ui
-                        .selectable_label(self.selected_animation == index, &animation.id)
-                        .clicked()
-                    {
-                        self.selected_animation = index;
-                        self.preview_focus = PreviewFocus::Animation;
-                    }
-                }
-
-                ui.separator();
-                if ui.button("Import Sprite Sheet...").clicked() {
-                    self.import_state.open = true;
-                }
-            });
+        ui.separator();
+        if ui.button("Import Sprite Sheet...").clicked() {
+            self.import_state.open = true;
+        }
         if let Some(index) = pending_scene_selection {
             self.selected_scene = index;
             self.clear_selection();
             self.preview_focus = PreviewFocus::None;
             self.scene_scroll_offset = Vec2::ZERO;
+            self.selected_layer = 0;
             self.sync_selection();
+        }
+        if let Some(index) = pending_layer_selection {
+            self.select_layer(self.selected_scene, index);
+        }
+        if let Some(index) = pending_layer_visibility {
+            self.toggle_layer_visibility(self.selected_scene, index);
+        }
+        if let Some(index) = pending_layer_lock {
+            self.toggle_layer_lock(self.selected_scene, index);
+        }
+        if let Some(index) = pending_tile_selection {
+            self.selected_tile = index;
+            self.tool = EditorTool::Paint;
+            self.preview_focus = PreviewFocus::None;
         }
     }
 
-    fn draw_right_panel(&mut self, ctx: &egui::Context) {
-        egui::SidePanel::right("right_panel")
-            .min_width(340.0)
-            .resizable(true)
-            .show(ctx, |ui| {
-                let scene_snapshot = self
-                    .bundle
-                    .as_ref()
-                    .and_then(|bundle| bundle.scenes.get(self.selected_scene).cloned());
-                let animation_snapshot = self
-                    .bundle
-                    .as_ref()
-                    .and_then(|bundle| bundle.animations.get(self.selected_animation).cloned());
-                let metasprite_ids = self
-                    .bundle
-                    .as_ref()
-                    .map(|bundle| {
-                        bundle
-                            .metasprites
-                            .iter()
-                            .map(|metasprite| metasprite.id.clone())
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default();
+    fn draw_inspector_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let scene_snapshot = self
+            .bundle
+            .as_ref()
+            .and_then(|bundle| bundle.scenes.get(self.selected_scene).cloned());
+        let animation_snapshot = self
+            .bundle
+            .as_ref()
+            .and_then(|bundle| bundle.animations.get(self.selected_animation).cloned());
+        let metasprite_ids = self
+            .bundle
+            .as_ref()
+            .map(|bundle| {
+                bundle
+                    .metasprites
+                    .iter()
+                    .map(|metasprite| metasprite.id.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let tileset_ids = self
+            .bundle
+            .as_ref()
+            .map(|bundle| {
+                bundle
+                    .tilesets
+                    .iter()
+                    .map(|tileset| tileset.id.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
 
-                let Some(scene_snapshot) = scene_snapshot else {
-                    ui.heading("Inspector");
-                    ui.label("Load a project to inspect it.");
-                    return;
-                };
+        let Some(scene_snapshot) = scene_snapshot else {
+            ui.heading("Inspector");
+            ui.label("Load a project to inspect it.");
+            return;
+        };
 
-                ui.heading("Inspector");
-                ui.label(format!(
-                    "Scene: {} ({}x{} tiles)",
-                    scene_snapshot.id,
-                    scene_snapshot.size_tiles.width,
-                    scene_snapshot.size_tiles.height
-                ));
-                ui.label(format!(
-                    "Chunk: {}x{}  |  Scripts: {}",
-                    scene_snapshot.chunk_size_tiles.width,
-                    scene_snapshot.chunk_size_tiles.height,
-                    scene_snapshot.scripts.len()
-                ));
+        ui.heading("Inspector");
+        ui.label(format!(
+            "Scene: {} ({}x{} tiles)",
+            scene_snapshot.id, scene_snapshot.size_tiles.width, scene_snapshot.size_tiles.height
+        ));
+        ui.label(format!(
+            "Chunk: {}x{}  |  Scripts: {}",
+            scene_snapshot.chunk_size_tiles.width,
+            scene_snapshot.chunk_size_tiles.height,
+            scene_snapshot.scripts.len()
+        ));
 
-                ui.separator();
-                self.draw_project_settings(ui);
-                ui.separator();
-                self.draw_animation_inspector(ui, animation_snapshot.as_ref(), &metasprite_ids);
-                ui.separator();
-                self.draw_spawn_inspector(ui, &scene_snapshot);
-                ui.separator();
-                self.draw_checkpoint_inspector(ui, &scene_snapshot);
-                ui.separator();
-                self.draw_entity_inspector(ui, &scene_snapshot);
-                if self.has_context_preview() {
-                    ui.separator();
-                    self.draw_context_preview(ui, ctx.input(|input| input.time) as f32);
+        ui.separator();
+        self.draw_layer_inspector(ui, &scene_snapshot, &tileset_ids);
+        ui.separator();
+        self.draw_project_settings(ui);
+        ui.separator();
+        self.draw_animation_inspector(ui, animation_snapshot.as_ref(), &metasprite_ids);
+        ui.separator();
+        self.draw_spawn_inspector(ui, &scene_snapshot);
+        ui.separator();
+        self.draw_checkpoint_inspector(ui, &scene_snapshot);
+        ui.separator();
+        self.draw_entity_inspector(ui, &scene_snapshot);
+        if self.has_context_preview() {
+            ui.separator();
+            self.draw_context_preview(ui, ctx.input(|input| input.time) as f32);
+        }
+        ui.separator();
+        self.draw_trigger_inspector(ui, &scene_snapshot);
+        ui.separator();
+        self.draw_tile_editor(ui);
+    }
+
+    fn draw_layer_inspector(
+        &mut self,
+        ui: &mut egui::Ui,
+        scene_snapshot: &SceneResource,
+        tileset_ids: &[String],
+    ) {
+        ui.collapsing("Layers", |ui| {
+            ui.horizontal(|ui| {
+                if ui.button("+ Layer").clicked() {
+                    self.add_layer_to_current_scene();
                 }
-                ui.separator();
-                self.draw_trigger_inspector(ui, &scene_snapshot);
-                ui.separator();
-                self.draw_tile_editor(ui);
-                ui.separator();
-                self.draw_diagnostics(ui);
+                if ui.button("- Remove").clicked() {
+                    self.remove_selected_layer();
+                }
+                if ui.button("Move Up").clicked() {
+                    self.move_selected_layer(-1);
+                }
+                if ui.button("Move Down").clicked() {
+                    self.move_selected_layer(1);
+                }
             });
+
+            for (index, layer) in scene_snapshot.layers.iter().enumerate() {
+                if ui
+                    .selectable_label(
+                        self.selected_layer == index,
+                        format!(
+                            "{}{}{}",
+                            layer.id,
+                            if layer.visible { "" } else { " [hidden]" },
+                            if self.is_layer_locked(self.selected_scene, index) {
+                                " [locked]"
+                            } else {
+                                ""
+                            }
+                        ),
+                    )
+                    .clicked()
+                {
+                    self.select_layer(self.selected_scene, index);
+                }
+            }
+
+            let Some(layer_snapshot) = scene_snapshot.layers.get(self.selected_layer) else {
+                ui.label("No active layer selected.");
+                return;
+            };
+
+            let mut edited = layer_snapshot.clone();
+            let mut changed = false;
+
+            ui.separator();
+            ui.label(format!("Editing '{}'", layer_snapshot.id));
+            changed |= ui.text_edit_singleline(&mut edited.id).changed();
+            changed |= ui.checkbox(&mut edited.visible, "Visible").changed();
+
+            if tileset_ids.is_empty() {
+                ui.label("No tilesets are available yet.");
+            } else {
+                egui::ComboBox::from_label("Tileset")
+                    .selected_text(&edited.tileset_id)
+                    .show_ui(ui, |ui| {
+                        for tileset_id in tileset_ids {
+                            changed |= ui
+                                .selectable_value(
+                                    &mut edited.tileset_id,
+                                    tileset_id.clone(),
+                                    tileset_id,
+                                )
+                                .changed();
+                        }
+                    });
+            }
+
+            ui.horizontal(|ui| {
+                ui.label("Parallax X");
+                changed |= ui
+                    .add(egui::DragValue::new(&mut edited.parallax_x).range(0..=8))
+                    .changed();
+                ui.label("Parallax Y");
+                changed |= ui
+                    .add(egui::DragValue::new(&mut edited.parallax_y).range(0..=8))
+                    .changed();
+            });
+            ui.label(format!("Tile count: {}", edited.tiles.len()));
+
+            ui.horizontal(|ui| {
+                if ui
+                    .button(if self.active_layer_locked() {
+                        "Unlock Active Layer"
+                    } else {
+                        "Lock Active Layer"
+                    })
+                    .clicked()
+                {
+                    self.toggle_layer_lock(self.selected_scene, self.selected_layer);
+                }
+                if ui
+                    .button(if edited.visible {
+                        "Hide Active Layer"
+                    } else {
+                        "Show Active Layer"
+                    })
+                    .clicked()
+                {
+                    self.toggle_layer_visibility(self.selected_scene, self.selected_layer);
+                }
+            });
+
+            if changed {
+                let layer_id = edited.id.clone();
+                self.capture_history();
+                if let Some(target) = self.current_layer_mut() {
+                    *target = edited;
+                }
+                self.sync_selection();
+                self.mark_edited(format!("Updated layer '{}'", layer_id));
+            }
+        });
     }
 
     fn draw_project_settings(&mut self, ui: &mut egui::Ui) {
@@ -2094,9 +3147,23 @@ impl EditorApp {
                     self.selected_entity
                         .and_then(|index| scene.entities.get(index))
                 })
-                .is_some_and(|entity| metasprite_for_entity(bundle, entity, 0.0).is_some()),
+                .is_some_and(|entity| entity_has_animation(bundle, entity)),
             PreviewFocus::None => false,
         }
+    }
+
+    fn needs_animation_repaint(&self) -> bool {
+        let Some(bundle) = &self.bundle else {
+            return false;
+        };
+
+        self.has_context_preview()
+            || bundle.scenes.get(self.selected_scene).is_some_and(|scene| {
+                scene
+                    .entities
+                    .iter()
+                    .any(|entity| entity_has_animation(bundle, entity))
+            })
     }
 
     fn draw_trigger_inspector(&mut self, ui: &mut egui::Ui, scene_snapshot: &SceneResource) {
@@ -2218,26 +3285,46 @@ impl EditorApp {
 
     fn draw_tile_editor(&mut self, ui: &mut egui::Ui) {
         ui.collapsing("Tile Editor", |ui| {
+            let Some(layer) = self.current_layer().cloned() else {
+                return;
+            };
             let Some(bundle) = &self.bundle else {
                 return;
             };
-            let Some(tileset) = bundle.tilesets.first() else {
+            let Some(tileset) = bundle.tileset(&layer.tileset_id) else {
+                ui.label("Active layer tileset is missing.");
                 return;
             };
-            let Some(palette) = bundle.palettes.first() else {
+            let Some(palette) = bundle.palette(&tileset.palette_id) else {
+                ui.label("Active layer palette is missing.");
                 return;
             };
             let Some(tile) = tileset.tiles.get(self.selected_tile) else {
                 return;
             };
 
-            ui.label(format!("Tile {}", self.selected_tile));
+            ui.label(format!(
+                "Layer '{}'  |  Tile {}",
+                layer.id, self.selected_tile
+            ));
             let mut edited = tile.clone();
             let changed = draw_tile_editor_grid(ui, &mut edited, palette);
             if changed {
                 self.capture_history();
                 if let Some(bundle) = &mut self.bundle {
-                    if let Some(tileset) = bundle.tilesets.first_mut() {
+                    let Some(tileset_id) = bundle
+                        .scenes
+                        .get(self.selected_scene)
+                        .and_then(|scene| scene.layers.get(self.selected_layer))
+                        .map(|layer| layer.tileset_id.clone())
+                    else {
+                        return;
+                    };
+                    if let Some(tileset) = bundle
+                        .tilesets
+                        .iter_mut()
+                        .find(|tileset| tileset.id == tileset_id)
+                    {
                         if let Some(tile) = tileset.tiles.get_mut(self.selected_tile) {
                             *tile = edited;
                         }
@@ -2266,105 +3353,1113 @@ impl EditorApp {
         });
     }
 
-    fn draw_central_panel(&mut self, ctx: &egui::Context) {
-        egui::CentralPanel::default().show(ctx, |ui| {
-            if self.bundle.is_none() {
-                ui.vertical_centered(|ui| {
-                    ui.add_space(120.0);
-                    ui.heading("SNES Maker");
-                    ui.label(
-                        "Open a project or create a new template to start building a SNES demo.",
-                    );
-                    if ui.button("Open Project").clicked() {
-                        self.open_project_dialog();
-                    }
-                    if ui.button("Create Template Project").clicked() {
-                        self.new_project_state.open = true;
-                    }
-                });
-                return;
+    fn draw_scene_outliner(&mut self, ui: &mut egui::Ui) {
+        ui.add(
+            egui::TextEdit::singleline(&mut self.outliner_filter)
+                .hint_text("Filter scenes, layers, and objects"),
+        );
+        ui.add_space(6.0);
+
+        let Some(bundle) = &self.bundle else {
+            ui.label("No project loaded.");
+            return;
+        };
+
+        enum PendingSelection {
+            Scene {
+                scene_index: usize,
+                label: String,
+            },
+            Layer {
+                scene_index: usize,
+                layer_index: usize,
+                label: String,
+            },
+            LayerVisibility {
+                scene_index: usize,
+                layer_index: usize,
+            },
+            LayerLock {
+                scene_index: usize,
+                layer_index: usize,
+            },
+            Spawn {
+                scene_index: usize,
+                index: usize,
+                label: String,
+            },
+            Checkpoint {
+                scene_index: usize,
+                index: usize,
+                label: String,
+            },
+            Entity {
+                scene_index: usize,
+                index: usize,
+                label: String,
+            },
+            Trigger {
+                scene_index: usize,
+                index: usize,
+                label: String,
+            },
+            Script {
+                scene_index: usize,
+                label: String,
+            },
+        }
+
+        let filter = self.outliner_filter.trim().to_ascii_lowercase();
+        let mut pending_selection = None;
+
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            for (scene_index, scene) in bundle.scenes.iter().enumerate() {
+                let scene_matches = filter_matches(&filter, &scene.id);
+                let child_matches = scene
+                    .layers
+                    .iter()
+                    .any(|layer| filter_matches(&filter, &layer.id))
+                    || scene
+                        .spawns
+                        .iter()
+                        .any(|spawn| filter_matches(&filter, &spawn.id))
+                    || scene
+                        .checkpoints
+                        .iter()
+                        .any(|checkpoint| filter_matches(&filter, &checkpoint.id))
+                    || scene
+                        .entities
+                        .iter()
+                        .any(|entity| filter_matches(&filter, &entity.id))
+                    || scene
+                        .triggers
+                        .iter()
+                        .any(|trigger| filter_matches(&filter, &trigger.id))
+                    || scene
+                        .scripts
+                        .iter()
+                        .any(|script| filter_matches(&filter, &script.id));
+
+                if !filter.is_empty() && !scene_matches && !child_matches {
+                    continue;
+                }
+
+                egui::CollapsingHeader::new(format!("{} ({:?})", scene.id, scene.kind))
+                    .default_open(self.selected_scene == scene_index)
+                    .show(ui, |ui| {
+                        if ui
+                            .selectable_label(
+                                self.selected_scene == scene_index,
+                                format!(
+                                    "Open scene ({}, {} entities, {} triggers)",
+                                    scene.layers.len(),
+                                    scene.entities.len(),
+                                    scene.triggers.len()
+                                ),
+                            )
+                            .clicked()
+                        {
+                            pending_selection = Some(PendingSelection::Scene {
+                                scene_index,
+                                label: scene.id.clone(),
+                            });
+                        }
+
+                        ui.separator();
+                        ui.label("Layers");
+                        for (layer_index, layer) in scene.layers.iter().enumerate() {
+                            if !filter_matches(&filter, &layer.id) && !filter.is_empty() {
+                                continue;
+                            }
+                            ui.horizontal(|ui| {
+                                if ui
+                                    .selectable_label(
+                                        self.selected_scene == scene_index
+                                            && self.selected_layer == layer_index,
+                                        format!(
+                                            "{}  [{} | parallax {}:{}]",
+                                            layer.id,
+                                            if layer.visible { "visible" } else { "hidden" },
+                                            layer.parallax_x,
+                                            layer.parallax_y
+                                        ),
+                                    )
+                                    .clicked()
+                                {
+                                    pending_selection = Some(PendingSelection::Layer {
+                                        scene_index,
+                                        layer_index,
+                                        label: layer.id.clone(),
+                                    });
+                                }
+                                if ui
+                                    .small_button(if layer.visible { "Hide" } else { "Show" })
+                                    .clicked()
+                                {
+                                    pending_selection = Some(PendingSelection::LayerVisibility {
+                                        scene_index,
+                                        layer_index,
+                                    });
+                                }
+                                if ui
+                                    .small_button(
+                                        if self.is_layer_locked(scene_index, layer_index) {
+                                            "Unlock"
+                                        } else {
+                                            "Lock"
+                                        },
+                                    )
+                                    .clicked()
+                                {
+                                    pending_selection = Some(PendingSelection::LayerLock {
+                                        scene_index,
+                                        layer_index,
+                                    });
+                                }
+                            });
+                        }
+
+                        ui.separator();
+                        ui.label("Scene Objects");
+                        for (index, spawn) in scene.spawns.iter().enumerate() {
+                            if !filter_matches(&filter, &spawn.id) && !filter.is_empty() {
+                                continue;
+                            }
+                            if ui
+                                .selectable_label(
+                                    self.selected_scene == scene_index
+                                        && self.selected_spawn == Some(index),
+                                    format!("Spawn: {}", spawn.id),
+                                )
+                                .clicked()
+                            {
+                                pending_selection = Some(PendingSelection::Spawn {
+                                    scene_index,
+                                    index,
+                                    label: spawn.id.clone(),
+                                });
+                            }
+                        }
+                        for (index, checkpoint) in scene.checkpoints.iter().enumerate() {
+                            if !filter_matches(&filter, &checkpoint.id) && !filter.is_empty() {
+                                continue;
+                            }
+                            if ui
+                                .selectable_label(
+                                    self.selected_scene == scene_index
+                                        && self.selected_checkpoint == Some(index),
+                                    format!("Checkpoint: {}", checkpoint.id),
+                                )
+                                .clicked()
+                            {
+                                pending_selection = Some(PendingSelection::Checkpoint {
+                                    scene_index,
+                                    index,
+                                    label: checkpoint.id.clone(),
+                                });
+                            }
+                        }
+                        for (index, entity) in scene.entities.iter().enumerate() {
+                            if !filter_matches(&filter, &entity.id) && !filter.is_empty() {
+                                continue;
+                            }
+                            if ui
+                                .selectable_label(
+                                    self.selected_scene == scene_index
+                                        && self.selected_entity == Some(index),
+                                    format!("Entity: {} ({})", entity.id, entity.archetype),
+                                )
+                                .clicked()
+                            {
+                                pending_selection = Some(PendingSelection::Entity {
+                                    scene_index,
+                                    index,
+                                    label: entity.id.clone(),
+                                });
+                            }
+                        }
+                        for (index, trigger) in scene.triggers.iter().enumerate() {
+                            if !filter_matches(&filter, &trigger.id) && !filter.is_empty() {
+                                continue;
+                            }
+                            if ui
+                                .selectable_label(
+                                    self.selected_scene == scene_index
+                                        && self.selected_trigger == Some(index),
+                                    format!("Trigger: {} ({:?})", trigger.id, trigger.kind),
+                                )
+                                .clicked()
+                            {
+                                pending_selection = Some(PendingSelection::Trigger {
+                                    scene_index,
+                                    index,
+                                    label: trigger.id.clone(),
+                                });
+                            }
+                        }
+
+                        if !scene.scripts.is_empty() {
+                            ui.separator();
+                            ui.label("Scripts");
+                            for script in &scene.scripts {
+                                if !filter_matches(&filter, &script.id) && !filter.is_empty() {
+                                    continue;
+                                }
+                                if ui
+                                    .selectable_label(false, format!("Script: {}", script.id))
+                                    .clicked()
+                                {
+                                    pending_selection = Some(PendingSelection::Script {
+                                        scene_index,
+                                        label: script.id.clone(),
+                                    });
+                                }
+                            }
+                        }
+                    });
             }
+        });
 
-            let (scene_label, entry_scene) = {
-                let bundle = self.bundle.as_ref().expect("bundle");
-                (
-                    bundle
-                        .scenes
-                        .get(self.selected_scene)
-                        .map(|scene| scene.id.clone())
-                        .unwrap_or_else(|| "no_scene".to_string()),
-                    bundle.manifest.gameplay.entry_scene.clone(),
-                )
-            };
+        if let Some(selection) = pending_selection {
+            match selection {
+                PendingSelection::Scene { scene_index, label } => {
+                    self.selected_scene = scene_index;
+                    self.scene_scroll_offset = Vec2::ZERO;
+                    self.clear_selection();
+                    self.preview_focus = PreviewFocus::None;
+                    self.sync_selection();
+                    self.status = format!("Selected scene '{}'", label);
+                }
+                PendingSelection::Layer {
+                    scene_index,
+                    layer_index,
+                    label,
+                } => {
+                    self.select_layer(scene_index, layer_index);
+                    self.status = format!("Active layer: '{}'", label);
+                }
+                PendingSelection::LayerVisibility {
+                    scene_index,
+                    layer_index,
+                } => {
+                    self.toggle_layer_visibility(scene_index, layer_index);
+                }
+                PendingSelection::LayerLock {
+                    scene_index,
+                    layer_index,
+                } => {
+                    self.toggle_layer_lock(scene_index, layer_index);
+                }
+                PendingSelection::Spawn {
+                    scene_index,
+                    index,
+                    label,
+                } => {
+                    self.selected_scene = scene_index;
+                    self.scene_scroll_offset = Vec2::ZERO;
+                    self.sync_selection();
+                    self.selected_spawn = Some(index);
+                    self.selected_checkpoint = None;
+                    self.selected_entity = None;
+                    self.selected_trigger = None;
+                    self.tool = EditorTool::Spawn;
+                    self.preview_focus = PreviewFocus::None;
+                    self.status = format!("Selected spawn '{}'", label);
+                }
+                PendingSelection::Checkpoint {
+                    scene_index,
+                    index,
+                    label,
+                } => {
+                    self.selected_scene = scene_index;
+                    self.scene_scroll_offset = Vec2::ZERO;
+                    self.sync_selection();
+                    self.selected_spawn = None;
+                    self.selected_checkpoint = Some(index);
+                    self.selected_entity = None;
+                    self.selected_trigger = None;
+                    self.tool = EditorTool::Checkpoint;
+                    self.preview_focus = PreviewFocus::None;
+                    self.status = format!("Selected checkpoint '{}'", label);
+                }
+                PendingSelection::Entity {
+                    scene_index,
+                    index,
+                    label,
+                } => {
+                    self.selected_scene = scene_index;
+                    self.scene_scroll_offset = Vec2::ZERO;
+                    self.sync_selection();
+                    self.selected_spawn = None;
+                    self.selected_checkpoint = None;
+                    self.selected_entity = Some(index);
+                    self.selected_trigger = None;
+                    self.tool = EditorTool::Entity;
+                    self.preview_focus = PreviewFocus::Entity;
+                    self.status = format!("Selected entity '{}'", label);
+                }
+                PendingSelection::Trigger {
+                    scene_index,
+                    index,
+                    label,
+                } => {
+                    self.selected_scene = scene_index;
+                    self.scene_scroll_offset = Vec2::ZERO;
+                    self.sync_selection();
+                    self.selected_spawn = None;
+                    self.selected_checkpoint = None;
+                    self.selected_entity = None;
+                    self.selected_trigger = Some(index);
+                    self.tool = EditorTool::Trigger;
+                    self.preview_focus = PreviewFocus::None;
+                    self.status = format!("Selected trigger '{}'", label);
+                }
+                PendingSelection::Script { scene_index, label } => {
+                    self.selected_scene = scene_index;
+                    self.scene_scroll_offset = Vec2::ZERO;
+                    self.sync_selection();
+                    self.preview_focus = PreviewFocus::None;
+                    self.status = format!(
+                        "Selected script '{}'. A visual event editor can plug in here.",
+                        label
+                    );
+                }
+            }
+        }
+    }
 
-            ui.horizontal(|ui| {
-                ui.heading("Scene Preview");
-                ui.label(format!("{}  |  entry scene: {}", scene_label, entry_scene));
-                ui.separator();
-                ui.label(format!("Tool: {}", self.tool.label()));
-                ui.separator();
-                ui.label("Select drags a box. Two-finger scroll pans. Pinch zooms. Cmd+C / Cmd+V copies and pastes selections.");
-                ui.separator();
-                if ui.button("Build ROM").clicked() {
-                    self.build_current_rom();
+    fn draw_asset_browser(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.add(
+            egui::TextEdit::singleline(&mut self.asset_browser_filter)
+                .hint_text("Filter assets by id or file name"),
+        );
+        ui.add_space(6.0);
+
+        let Some(bundle) = &self.bundle else {
+            ui.label("No project loaded.");
+            return;
+        };
+
+        enum PendingAssetAction {
+            Scene {
+                scene_index: usize,
+                label: String,
+            },
+            Animation {
+                animation_index: usize,
+                label: String,
+            },
+            Status(String),
+            SpriteSource {
+                path: Utf8PathBuf,
+                label: String,
+            },
+        }
+
+        let filter = self.asset_browser_filter.trim().to_ascii_lowercase();
+        let sprite_sources = self.list_project_sprite_sources().unwrap_or_default();
+        let mut pending_action = None;
+
+        ui.label(format!(
+            "{} scene(s) | {} tileset(s) | {} palette(s) | {} metasprite(s) | {} animation(s) | {} dialogue(s)",
+            bundle.scenes.len(),
+            bundle.tilesets.len(),
+            bundle.palettes.len(),
+            bundle.metasprites.len(),
+            bundle.animations.len(),
+            bundle.dialogues.len()
+        ));
+        ui.add_space(4.0);
+
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            ui.collapsing(format!("Scenes ({})", bundle.scenes.len()), |ui| {
+                for (scene_index, scene) in bundle.scenes.iter().enumerate() {
+                    if !filter_matches(&filter, &scene.id) && !filter.is_empty() {
+                        continue;
+                    }
+                    if ui
+                        .selectable_label(self.selected_scene == scene_index, &scene.id)
+                        .clicked()
+                    {
+                        pending_action = Some(PendingAssetAction::Scene {
+                            scene_index,
+                            label: scene.id.clone(),
+                        });
+                    }
                 }
             });
 
-            ui.add_space(8.0);
-            let viewport_height = (ui.available_height() - 96.0).max(220.0);
-            let viewport_size = Vec2::new(ui.available_width(), viewport_height);
-            let bundle = self.bundle.as_ref().expect("bundle");
-            let content_size = scene_content_size(bundle, self.selected_scene, self.scene_zoom);
-            self.scene_scroll_offset = clamp_scene_scroll_offset(
-                self.scene_scroll_offset,
-                content_size,
-                viewport_size,
-            );
-            let outcome = draw_scene_canvas(
-                ui,
-                bundle,
-                self.selected_scene,
-                self.scene_zoom,
-                self.scene_scroll_offset,
-                viewport_size,
-                self.show_grid,
-                self.show_collision,
-                self.selected_tile,
-                self.selected_spawn,
-                self.selected_checkpoint,
-                self.selected_entity,
-                self.selected_trigger,
-                self.selection.as_ref(),
-                self.selection_drag_anchor,
-                self.tool == EditorTool::Select,
-                ctx.input(|input| input.time) as f32,
-            );
-            self.apply_scene_view_gestures(ctx, outcome.viewport_rect, content_size);
-            let clicked_outside_view = self.tool == EditorTool::Select
-                && ctx.input(|input| input.pointer.primary_clicked())
-                && ctx
-                    .input(|input| input.pointer.interact_pos())
-                    .is_some_and(|position| !outcome.viewport_rect.contains(position));
-            if clicked_outside_view && (self.selection.is_some() || self.selection_drag_anchor.is_some())
-            {
-                self.clear_selection();
-                self.status = "Selection cleared".to_string();
-            }
-
-            if let Some((x, y)) = outcome.hovered_tile {
-                ui.label(format!("Hovered tile: ({}, {})", x, y));
-            }
-
-            ui.add_space(12.0);
-            ui.collapsing("Workflow", |ui| {
-                ui.label("1. Use Select to drag a region and copy or paste tiles and objects.");
-                ui.label("2. Paint the stage with tiles and mark solids, ladders, and hazards.");
-                ui.label("3. Add spawns, checkpoints, entities, and triggers from the inspector.");
-                ui.label("4. Import a sprite sheet to create new metasprites and animations.");
-                ui.label("5. Save, then build the ROM.");
+            ui.collapsing(format!("Animations ({})", bundle.animations.len()), |ui| {
+                for (animation_index, animation) in bundle.animations.iter().enumerate() {
+                    if !filter_matches(&filter, &animation.id) && !filter.is_empty() {
+                        continue;
+                    }
+                    if ui
+                        .selectable_label(
+                            self.selected_animation == animation_index,
+                            format!("{} ({} frame(s))", animation.id, animation.frames.len()),
+                        )
+                        .clicked()
+                    {
+                        pending_action = Some(PendingAssetAction::Animation {
+                            animation_index,
+                            label: animation.id.clone(),
+                        });
+                    }
+                }
             });
-            self.apply_canvas_outcome(outcome);
+
+            ui.collapsing(format!("Metasprites ({})", bundle.metasprites.len()), |ui| {
+                for metasprite in &bundle.metasprites {
+                    if !filter_matches(&filter, &metasprite.id) && !filter.is_empty() {
+                        continue;
+                    }
+                    if ui
+                        .selectable_label(
+                            false,
+                            format!("{} ({} piece(s))", metasprite.id, metasprite.pieces.len()),
+                        )
+                        .clicked()
+                    {
+                        pending_action = Some(PendingAssetAction::Status(format!(
+                            "Metasprite '{}' selected. A visual metasprite editor is the next natural step.",
+                            metasprite.id
+                        )));
+                    }
+                }
+            });
+
+            ui.collapsing(format!("Tilesets ({})", bundle.tilesets.len()), |ui| {
+                for tileset in &bundle.tilesets {
+                    if !filter_matches(&filter, &tileset.id) && !filter.is_empty() {
+                        continue;
+                    }
+                    if ui
+                        .selectable_label(
+                            false,
+                            format!("{} ({} tile(s))", tileset.id, tileset.tiles.len()),
+                        )
+                        .clicked()
+                    {
+                        pending_action = Some(PendingAssetAction::Status(format!(
+                            "Tileset '{}' selected with {} tile(s).",
+                            tileset.id,
+                            tileset.tiles.len()
+                        )));
+                    }
+                }
+            });
+
+            ui.collapsing(format!("Palettes ({})", bundle.palettes.len()), |ui| {
+                for palette in &bundle.palettes {
+                    if !filter_matches(&filter, &palette.id) && !filter.is_empty() {
+                        continue;
+                    }
+                    if ui
+                        .selectable_label(
+                            false,
+                            format!("{} ({} color(s))", palette.id, palette.colors.len()),
+                        )
+                        .clicked()
+                    {
+                        pending_action = Some(PendingAssetAction::Status(format!(
+                            "Palette '{}' selected with {} color(s).",
+                            palette.id,
+                            palette.colors.len()
+                        )));
+                    }
+                }
+            });
+
+            ui.collapsing(format!("Dialogues ({})", bundle.dialogues.len()), |ui| {
+                for dialogue in &bundle.dialogues {
+                    if !filter_matches(&filter, &dialogue.id) && !filter.is_empty() {
+                        continue;
+                    }
+                    if ui
+                        .selectable_label(
+                            false,
+                            format!("{} ({} node(s))", dialogue.id, dialogue.nodes.len()),
+                        )
+                        .clicked()
+                    {
+                        pending_action = Some(PendingAssetAction::Status(format!(
+                            "Dialogue '{}' selected. A graph editor would fit naturally here.",
+                            dialogue.id
+                        )));
+                    }
+                }
+            });
+
+            if let Some(scene) = bundle.scenes.get(self.selected_scene) {
+                ui.collapsing(format!("Scripts in '{}' ({})", scene.id, scene.scripts.len()), |ui| {
+                    for script in &scene.scripts {
+                        if !filter_matches(&filter, &script.id) && !filter.is_empty() {
+                            continue;
+                        }
+                        if ui
+                            .selectable_label(
+                                false,
+                                format!("{} ({} command(s))", script.id, script.commands.len()),
+                            )
+                            .clicked()
+                        {
+                            pending_action = Some(PendingAssetAction::Status(format!(
+                                "Script '{}' selected. A visual event editor would make this much faster to author.",
+                                script.id
+                            )));
+                        }
+                    }
+                });
+            }
+
+            ui.collapsing(
+                format!("Sprite Sources ({})", sprite_sources.len()),
+                |ui| match sprite_sources.is_empty() {
+                    true => {
+                        ui.label("No project-local sprite sheets yet.");
+                    }
+                    false => {
+                        for path in &sprite_sources {
+                            let label = self.project_sprite_source_relative_path(path);
+                            if !filter_matches(&filter, &label) && !filter.is_empty() {
+                                continue;
+                            }
+                            if ui.selectable_label(false, &label).clicked() {
+                                pending_action = Some(PendingAssetAction::SpriteSource {
+                                    path: path.clone(),
+                                    label,
+                                });
+                            }
+                        }
+                    }
+                },
+            );
         });
+
+        if let Some(action) = pending_action {
+            match action {
+                PendingAssetAction::Scene { scene_index, label } => {
+                    self.selected_scene = scene_index;
+                    self.scene_scroll_offset = Vec2::ZERO;
+                    self.clear_selection();
+                    self.preview_focus = PreviewFocus::None;
+                    self.sync_selection();
+                    self.status = format!("Selected scene '{}'", label);
+                }
+                PendingAssetAction::Animation {
+                    animation_index,
+                    label,
+                } => {
+                    self.selected_animation = animation_index;
+                    self.preview_focus = PreviewFocus::Animation;
+                    self.status = format!("Selected animation '{}'", label);
+                }
+                PendingAssetAction::Status(message) => {
+                    self.status = message;
+                }
+                PendingAssetAction::SpriteSource { path, label } => {
+                    self.import_state.open = true;
+                    self.load_import_preview_from_path(ctx, path.as_std_path(), label);
+                }
+            }
+        }
+    }
+
+    fn draw_animation_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let Some(bundle) = &self.bundle else {
+            ui.heading("Animation");
+            ui.label("Load a project to preview animations.");
+            return;
+        };
+
+        let metasprite_ids = bundle
+            .metasprites
+            .iter()
+            .map(|metasprite| metasprite.id.clone())
+            .collect::<Vec<_>>();
+        let animation_snapshot = bundle.animations.get(self.selected_animation).cloned();
+
+        ui.heading("Animation");
+        ui.label("Preview the active animation or entity context while editing frame data.");
+        ui.separator();
+        ui.label("Animations");
+        egui::ScrollArea::vertical().max_height(180.0).show(ui, |ui| {
+            for (index, animation) in bundle.animations.iter().enumerate() {
+                if ui
+                    .selectable_label(
+                        self.selected_animation == index,
+                        format!("{} ({} frame(s))", animation.id, animation.frames.len()),
+                    )
+                    .clicked()
+                {
+                    self.selected_animation = index;
+                    self.preview_focus = PreviewFocus::Animation;
+                }
+            }
+        });
+        ui.separator();
+        if self.has_context_preview() {
+            self.draw_context_preview(ui, ctx.input(|input| input.time) as f32);
+        } else if bundle.animations.get(self.selected_animation).is_some() {
+            self.preview_focus = PreviewFocus::Animation;
+            self.draw_context_preview(ui, ctx.input(|input| input.time) as f32);
+        } else {
+            ui.label("Select an animation to preview it here.");
+        }
+        ui.separator();
+        self.draw_animation_inspector(ui, animation_snapshot.as_ref(), &metasprite_ids);
+    }
+
+    fn draw_build_report_tab(&mut self, ui: &mut egui::Ui) {
+        let report_path = self.build_report_path();
+        let mut refresh_report = false;
+        let mut build = false;
+
+        ui.heading("Build Report");
+        ui.label(format!("Report file: {}", report_path));
+        ui.horizontal(|ui| {
+            if ui.button("Build ROM").clicked() {
+                build = true;
+            }
+            if ui.button("Refresh Report").clicked() {
+                refresh_report = true;
+            }
+        });
+
+        if build {
+            self.build_current_rom();
+        }
+        if refresh_report {
+            self.refresh_last_build_report();
+        }
+
+        let Some(outcome) = &self.last_build_outcome else {
+            ui.separator();
+            ui.label("No build report loaded yet. Build the ROM or refresh from disk.");
+            return;
+        };
+
+        ui.separator();
+        ui.label(format!(
+            "ROM: {}",
+            if outcome.rom_built {
+                "built successfully"
+            } else {
+                "build assets only"
+            }
+        ));
+        ui.label(format!("Build directory: {}", outcome.build_dir));
+        ui.label(format!("ROM path: {}", outcome.rom_path));
+        ui.label(format!(
+            "Validation: {} error(s), {} warning(s)",
+            outcome.validation.errors.len(),
+            outcome.validation.warnings.len()
+        ));
+        ui.label(format!(
+            "Assembler: ca65={} ld65={}",
+            outcome.assembler_status.ca65_found, outcome.assembler_status.ld65_found
+        ));
+
+        if !outcome.assembler_status.warnings.is_empty() {
+            ui.separator();
+            ui.label("Assembler warnings");
+            for warning in &outcome.assembler_status.warnings {
+                ui.label(warning);
+            }
+        }
+
+        ui.separator();
+        ui.label("Compiled scenes");
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            for scene in &outcome.compiled_scenes {
+                ui.collapsing(
+                    format!("{} ({} byte(s))", scene.scene_id, scene.byte_len),
+                    |ui| {
+                        if scene.metadata.is_empty() {
+                            ui.label("No scene metadata recorded.");
+                        } else {
+                            for (key, value) in &scene.metadata {
+                                ui.label(format!("{}: {}", key, value));
+                            }
+                        }
+                    },
+                );
+            }
+        });
+    }
+
+    fn draw_playtest_tab(&mut self, ui: &mut egui::Ui) {
+        let emulator = self
+            .bundle
+            .as_ref()
+            .and_then(|bundle| bundle.manifest.editor.preferred_emulator.clone())
+            .unwrap_or_else(|| "ares".to_string());
+        let mut build = false;
+        let mut build_and_launch = false;
+        let mut refresh_report = false;
+
+        ui.heading("Playtest");
+        ui.label(format!("Configured emulator: {}", emulator));
+        ui.horizontal(|ui| {
+            if ui.button("Build ROM").clicked() {
+                build = true;
+            }
+            if ui.button("Build && Launch").clicked() {
+                build_and_launch = true;
+            }
+            if ui.button("Refresh Build Report").clicked() {
+                refresh_report = true;
+            }
+        });
+
+        if build {
+            self.build_current_rom();
+        }
+        if build_and_launch {
+            self.build_and_launch_playtest();
+        }
+        if refresh_report {
+            self.refresh_last_build_report();
+        }
+
+        if !self.playtest_state.last_status.is_empty() {
+            ui.separator();
+            ui.label(&self.playtest_state.last_status);
+        }
+
+        if let Some(outcome) = &self.last_build_outcome {
+            ui.separator();
+            ui.label(format!("Last ROM path: {}", outcome.rom_path));
+            if !outcome.rom_built {
+                ui.label("A playable ROM was not produced yet. Build assets are still available for inspection.");
+            }
+        } else {
+            ui.separator();
+            ui.label("Build the project to generate a ROM and launch a playtest session.");
+        }
+    }
+
+    fn draw_workspace_slot(&mut self, ui: &mut egui::Ui, area: DockArea, ctx: &egui::Context) {
+        let slot = self.workspace.layout.slot(area).clone();
+        let mut pending_active = None;
+        let mut pending_show_tab = None;
+        let mut pending_hide_tab = None;
+        let mut pending_move_tab = None;
+        let mut pending_reorder = None;
+
+        ui.vertical(|ui| {
+            ui.horizontal_wrapped(|ui| {
+                for (index, tab) in slot.tabs.iter().enumerate() {
+                    if ui
+                        .selectable_label(slot.active == index, tab.label())
+                        .clicked()
+                    {
+                        pending_active = Some(index);
+                    }
+                }
+
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.menu_button("+", |ui| {
+                        let mut any_hidden = false;
+                        for tab in DockTab::ALL {
+                            if self.workspace.layout.contains(tab) {
+                                continue;
+                            }
+                            any_hidden = true;
+                            if ui.button(tab.label()).clicked() {
+                                pending_show_tab = Some(tab);
+                                ui.close();
+                            }
+                        }
+                        if !any_hidden {
+                            ui.label("All dock tabs are visible.");
+                        }
+                    });
+
+                    if let Some(active_tab) = slot.active_tab() {
+                        ui.menu_button("Dock", |ui| {
+                            for target in DockArea::ALL {
+                                if ui
+                                    .button(format!("Move to {}", target.label()))
+                                    .clicked()
+                                {
+                                    pending_move_tab = Some((active_tab, target));
+                                    ui.close();
+                                }
+                            }
+                            ui.separator();
+                            if ui.button("Hide Tab").clicked() {
+                                pending_hide_tab = Some(active_tab);
+                                ui.close();
+                            }
+                        });
+
+                        if slot.tabs.len() > 1 {
+                            if ui.small_button(">").clicked() {
+                                pending_reorder = Some(1);
+                            }
+                            if ui.small_button("<").clicked() {
+                                pending_reorder = Some(-1);
+                            }
+                        }
+                    }
+                });
+            });
+            ui.separator();
+
+            match slot.active_tab() {
+                Some(DockTab::Toolbox) => self.draw_toolbox_tab(ui),
+                Some(DockTab::Scene) => self.draw_scene_tab(ui, ctx),
+                Some(DockTab::Inspector) => self.draw_inspector_tab(ui, ctx),
+                Some(DockTab::Outliner) => self.draw_scene_outliner(ui),
+                Some(DockTab::Assets) => self.draw_asset_browser(ui, ctx),
+                Some(DockTab::Animation) => self.draw_animation_tab(ui, ctx),
+                Some(DockTab::Diagnostics) => self.draw_diagnostics(ui),
+                Some(DockTab::BuildReport) => self.draw_build_report_tab(ui),
+                Some(DockTab::Playtest) => self.draw_playtest_tab(ui),
+                None => {
+                    ui.with_layout(Layout::top_down_justified(Align::Min), |ui| {
+                        ui.add_space(16.0);
+                        ui.label(format!(
+                            "{} dock is empty. Use View or the + menu to show a tab.",
+                            area.label()
+                        ));
+                    });
+                }
+            }
+        });
+
+        if let Some(index) = pending_active {
+            self.workspace.layout.set_active_tab(area, index);
+            self.mark_workspace_custom();
+        }
+        if let Some(tab) = pending_show_tab {
+            self.set_dock_tab_visibility(tab, true);
+        }
+        if let Some(tab) = pending_hide_tab {
+            self.set_dock_tab_visibility(tab, false);
+        }
+        if let Some((tab, target)) = pending_move_tab {
+            self.move_dock_tab(tab, target);
+        }
+        if let Some(direction) = pending_reorder {
+            self.move_active_dock_tab_within_slot(area, direction);
+        }
+    }
+
+    fn draw_workspace(&mut self, ctx: &egui::Context) {
+        let previous_left = self.workspace.layout.left.size;
+        let previous_right = self.workspace.layout.right.size;
+        let previous_bottom = self.workspace.layout.bottom.size;
+        let mut left_size = None;
+        let mut right_size = None;
+        let mut bottom_size = None;
+
+        egui::CentralPanel::default().show(ctx, |ui| {
+            if !self.workspace.layout.left.tabs.is_empty() {
+                let panel = egui::SidePanel::left("workspace_left_panel")
+                    .resizable(true)
+                    .min_width(220.0)
+                    .default_width(self.workspace.layout.left.size)
+                    .show_inside(ui, |ui| {
+                        self.draw_workspace_slot(ui, DockArea::Left, ctx);
+                    });
+                left_size = Some(panel.response.rect.width());
+            }
+
+            if !self.workspace.layout.right.tabs.is_empty() {
+                let panel = egui::SidePanel::right("workspace_right_panel")
+                    .resizable(true)
+                    .min_width(260.0)
+                    .default_width(self.workspace.layout.right.size)
+                    .show_inside(ui, |ui| {
+                        self.draw_workspace_slot(ui, DockArea::Right, ctx);
+                    });
+                right_size = Some(panel.response.rect.width());
+            }
+
+            if !self.workspace.layout.bottom.tabs.is_empty() {
+                let panel = egui::TopBottomPanel::bottom("workspace_bottom_panel")
+                    .resizable(true)
+                    .min_height(180.0)
+                    .default_height(self.workspace.layout.bottom.size)
+                    .show_inside(ui, |ui| {
+                        self.draw_workspace_slot(ui, DockArea::Bottom, ctx);
+                    });
+                bottom_size = Some(panel.response.rect.height());
+            }
+
+            self.draw_workspace_slot(ui, DockArea::Center, ctx);
+        });
+
+        let mut size_changed = false;
+        if let Some(size) = left_size {
+            if (size - previous_left).abs() > 0.5 {
+                self.workspace.layout.set_slot_size(DockArea::Left, size);
+                size_changed = true;
+            }
+        }
+        if let Some(size) = right_size {
+            if (size - previous_right).abs() > 0.5 {
+                self.workspace.layout.set_slot_size(DockArea::Right, size);
+                size_changed = true;
+            }
+        }
+        if let Some(size) = bottom_size {
+            if (size - previous_bottom).abs() > 0.5 {
+                self.workspace.layout.set_slot_size(DockArea::Bottom, size);
+                size_changed = true;
+            }
+        }
+        if size_changed {
+            self.mark_workspace_custom();
+        }
+    }
+
+    fn draw_scene_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        if self.bundle.is_none() {
+            ui.vertical_centered(|ui| {
+                ui.add_space(120.0);
+                ui.heading("SNES Maker");
+                ui.label("Open a project or create a new template to start building a SNES demo.");
+                if ui.button("Open Project").clicked() {
+                    self.open_project_dialog();
+                }
+                if ui.button("Create Template Project").clicked() {
+                    self.new_project_state.open = true;
+                }
+            });
+            return;
+        }
+
+        let (scene_label, entry_scene, active_layer_label, active_layer_locked, active_layer_hidden) =
+            {
+                let bundle = self.bundle.as_ref().expect("bundle");
+                let scene = bundle.scenes.get(self.selected_scene);
+                (
+                    scene
+                        .map(|scene| scene.id.clone())
+                        .unwrap_or_else(|| "no_scene".to_string()),
+                    bundle.manifest.gameplay.entry_scene.clone(),
+                    scene
+                        .and_then(|scene| scene.layers.get(self.selected_layer))
+                        .map(|layer| layer.id.clone())
+                        .unwrap_or_else(|| "no_layer".to_string()),
+                    self.active_layer_locked(),
+                    scene
+                        .and_then(|scene| scene.layers.get(self.selected_layer))
+                        .is_some_and(|layer| !layer.visible),
+                )
+            };
+
+        ui.horizontal(|ui| {
+            ui.heading("Scene Preview");
+            ui.label(format!("{}  |  entry scene: {}", scene_label, entry_scene));
+            ui.separator();
+            ui.label(format!(
+                "Layer: {}{}{}",
+                active_layer_label,
+                if active_layer_hidden { " [hidden]" } else { "" },
+                if active_layer_locked { " [locked]" } else { "" }
+            ));
+            ui.separator();
+            ui.label(format!("Tool: {}", self.tool.label()));
+            ui.separator();
+            ui.label("Select drags a box. Alt-click samples the active layer tile. Two-finger scroll pans. Pinch zooms. Cmd+C / Cmd+V copies and pastes selections.");
+            ui.separator();
+            if ui.button("Build ROM").clicked() {
+                self.build_current_rom();
+            }
+        });
+
+        ui.add_space(8.0);
+        let viewport_height = (ui.available_height() - 96.0).max(220.0);
+        let viewport_size = Vec2::new(ui.available_width(), viewport_height);
+        let bundle = self.bundle.as_ref().expect("bundle");
+        let content_size = scene_content_size(bundle, self.selected_scene, self.scene_zoom);
+        self.scene_scroll_offset =
+            clamp_scene_scroll_offset(self.scene_scroll_offset, content_size, viewport_size);
+        let outcome = draw_scene_canvas(
+            ui,
+            bundle,
+            self.selected_scene,
+            self.scene_zoom,
+            self.scene_scroll_offset,
+            viewport_size,
+            self.show_grid,
+            self.show_collision,
+            self.selected_layer,
+            self.selected_tile,
+            self.selected_spawn,
+            self.selected_checkpoint,
+            self.selected_entity,
+            self.selected_trigger,
+            self.selection.as_ref(),
+            self.selection_drag_anchor,
+            self.tool == EditorTool::Select,
+            ctx.input(|input| input.time) as f32,
+        );
+        self.apply_scene_view_gestures(ctx, outcome.viewport_rect, content_size);
+        let clicked_outside_view = self.tool == EditorTool::Select
+            && ctx.input(|input| input.pointer.primary_clicked())
+            && ctx
+                .input(|input| input.pointer.interact_pos())
+                .is_some_and(|position| !outcome.viewport_rect.contains(position));
+        if clicked_outside_view && (self.selection.is_some() || self.selection_drag_anchor.is_some())
+        {
+            self.clear_selection();
+            self.status = "Selection cleared".to_string();
+        }
+
+        if let Some((x, y)) = outcome.hovered_tile {
+            ui.label(format!("Hovered tile: ({}, {})", x, y));
+        }
+
+        if let Some(selection) = &self.selection {
+            ui.add_space(6.0);
+            ui.label(format!(
+                "Selection Actions for {}x{} region",
+                selection.rect.width_tiles(),
+                selection.rect.height_tiles()
+            ));
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("Fill Tiles").clicked() {
+                    self.apply_selection_action(SelectionAction::PaintTile(self.selected_tile as u16));
+                }
+                if ui.button("Clear Tiles").clicked() {
+                    self.apply_selection_action(SelectionAction::PaintTile(0));
+                }
+                if ui.button("Solid On").clicked() {
+                    self.apply_selection_action(SelectionAction::SetSolid(true));
+                }
+                if ui.button("Solid Off").clicked() {
+                    self.apply_selection_action(SelectionAction::SetSolid(false));
+                }
+                if ui.button("Ladder On").clicked() {
+                    self.apply_selection_action(SelectionAction::SetLadder(true));
+                }
+                if ui.button("Ladder Off").clicked() {
+                    self.apply_selection_action(SelectionAction::SetLadder(false));
+                }
+                if ui.button("Hazard On").clicked() {
+                    self.apply_selection_action(SelectionAction::SetHazard(true));
+                }
+                if ui.button("Hazard Off").clicked() {
+                    self.apply_selection_action(SelectionAction::SetHazard(false));
+                }
+            });
+        }
+
+        ui.add_space(12.0);
+        ui.collapsing("Workflow", |ui| {
+            ui.label("1. Use Select to drag a region and copy or paste tiles and objects.");
+            ui.label("2. Paint the stage with tiles, use selection actions for bulk edits, and mark solids, ladders, and hazards.");
+            ui.label("3. Add spawns, checkpoints, entities, and triggers from the inspector.");
+            ui.label("4. Import a sprite sheet to create new metasprites and animations.");
+            ui.label("5. Save, then build the ROM.");
+        });
+        self.apply_canvas_outcome(outcome);
     }
 
     fn apply_scene_view_gestures(
@@ -2415,6 +4510,12 @@ impl EditorApp {
     fn apply_canvas_outcome(&mut self, outcome: SceneCanvasOutcome) {
         self.last_canvas_tile = outcome.hovered_tile;
 
+        if let Some(cell_index) = outcome.sampled_cell {
+            self.sample_tile_from_cell(cell_index);
+            self.active_canvas_cell = None;
+            return;
+        }
+
         if self.tool == EditorTool::Select {
             if let Some(start) = outcome.selection_started {
                 self.selection_drag_anchor = Some(start);
@@ -2446,6 +4547,7 @@ impl EditorApp {
         let selected_trigger = self.selected_trigger;
         let scene_pos = outcome.world_cell_position;
         let collision_value = outcome.primary_cell.is_some();
+        let active_layer_locked = self.active_layer_locked();
 
         enum PendingSceneEdit {
             PaintTile(u16),
@@ -2479,68 +4581,89 @@ impl EditorApp {
             }
         };
 
+        if active_layer_locked && matches!(pending, Some(PendingSceneEdit::PaintTile(_))) {
+            self.active_canvas_cell = None;
+            self.status = self
+                .current_layer()
+                .map(|layer| format!("Layer '{}' is locked.", layer.id))
+                .unwrap_or_else(|| "Active layer is locked.".to_string());
+            return;
+        }
+
         let mut edited = false;
         let mut status = None;
         if let Some(pending) = pending {
             self.capture_history();
-            if let Some(scene) = self.current_scene_mut() {
-                match pending {
-                    PendingSceneEdit::PaintTile(tile_index) => {
-                        if let Some(layer) = scene.layers.first_mut() {
-                            if cell_index < layer.tiles.len() {
-                                layer.tiles[cell_index] = tile_index;
-                                edited = true;
-                                status = Some(if tile_index == 0 {
-                                    "Erased tile".to_string()
-                                } else {
-                                    format!("Painted tile {}", tile_index)
-                                });
-                            }
+            match pending {
+                PendingSceneEdit::PaintTile(tile_index) => {
+                    if let Some(layer) = self.current_layer_mut() {
+                        if cell_index < layer.tiles.len() {
+                            layer.tiles[cell_index] = tile_index;
+                            edited = true;
+                            status = Some(if tile_index == 0 {
+                                format!("Erased tile from '{}'", layer.id)
+                            } else {
+                                format!("Painted tile {} into '{}'", tile_index, layer.id)
+                            });
                         }
                     }
-                    PendingSceneEdit::SetSolid(value) => {
+                }
+                PendingSceneEdit::SetSolid(value) => {
+                    if let Some(scene) = self.current_scene_mut() {
                         if cell_index < scene.collision.solids.len() {
                             scene.collision.solids[cell_index] = value;
                             edited = true;
                             status = Some("Updated solid collision".to_string());
                         }
                     }
-                    PendingSceneEdit::SetLadder(value) => {
+                }
+                PendingSceneEdit::SetLadder(value) => {
+                    if let Some(scene) = self.current_scene_mut() {
                         if cell_index < scene.collision.ladders.len() {
                             scene.collision.ladders[cell_index] = value;
                             edited = true;
                             status = Some("Updated ladder collision".to_string());
                         }
                     }
-                    PendingSceneEdit::SetHazard(value) => {
+                }
+                PendingSceneEdit::SetHazard(value) => {
+                    if let Some(scene) = self.current_scene_mut() {
                         if cell_index < scene.collision.hazards.len() {
                             scene.collision.hazards[cell_index] = value;
                             edited = true;
                             status = Some("Updated hazard collision".to_string());
                         }
                     }
-                    PendingSceneEdit::MoveSpawn(index, position) => {
+                }
+                PendingSceneEdit::MoveSpawn(index, position) => {
+                    if let Some(scene) = self.current_scene_mut() {
                         if let Some(spawn) = scene.spawns.get_mut(index) {
                             spawn.position = position;
                             edited = true;
                             status = Some(format!("Moved spawn '{}'", spawn.id));
                         }
                     }
-                    PendingSceneEdit::MoveCheckpoint(index, position) => {
+                }
+                PendingSceneEdit::MoveCheckpoint(index, position) => {
+                    if let Some(scene) = self.current_scene_mut() {
                         if let Some(checkpoint) = scene.checkpoints.get_mut(index) {
                             checkpoint.position = position;
                             edited = true;
                             status = Some(format!("Moved checkpoint '{}'", checkpoint.id));
                         }
                     }
-                    PendingSceneEdit::MoveEntity(index, position) => {
+                }
+                PendingSceneEdit::MoveEntity(index, position) => {
+                    if let Some(scene) = self.current_scene_mut() {
                         if let Some(entity) = scene.entities.get_mut(index) {
                             entity.position = position;
                             edited = true;
                             status = Some(format!("Moved entity '{}'", entity.id));
                         }
                     }
-                    PendingSceneEdit::MoveTrigger(index, position) => {
+                }
+                PendingSceneEdit::MoveTrigger(index, position) => {
+                    if let Some(scene) = self.current_scene_mut() {
                         if let Some(trigger) = scene.triggers.get_mut(index) {
                             trigger.rect.x = position.x;
                             trigger.rect.y = position.y;
@@ -2577,6 +4700,7 @@ impl EditorApp {
                     ui.label("Cmd+O: open project");
                     ui.label("Cmd+S: save");
                     ui.label("Cmd+C / Cmd+V: copy and paste the current selection");
+                    ui.label("Cmd+Shift+F: fill the current selection with the selected tile");
                     ui.label("Cmd+I: import sprite sheet");
                     ui.label("Cmd+B: build ROM");
                     ui.label("Cmd+R: reload from disk");
@@ -2584,8 +4708,10 @@ impl EditorApp {
                     ui.separator();
                     ui.heading("Scene Editing");
                     ui.label("Use Select to drag a rubber-band region around tiles and objects.");
+                    ui.label("Alt-click the canvas to sample a tile from the active layer.");
                     ui.label("Use two-finger horizontal or vertical scrolling to pan around larger scenes, and pinch to zoom in or out.");
                     ui.label("Use the Paint tool with the tile browser to build the stage.");
+                    ui.label("Use the selection action bar to fill or clear tiles and collision in bulk.");
                     ui.label("Use Solid, Ladder, and Hazard to mark collision directly on the map.");
                     ui.label("Use Spawn, Checkpoint, Entity, and Trigger to place gameplay markers.");
                     ui.separator();
@@ -2598,6 +4724,35 @@ impl EditorApp {
                     ui.label("Dialogue graphs and cutscene scripting are still authored in files for now.");
                 });
             self.show_help = open;
+        }
+
+        if self.save_layout_state.open {
+            let mut open = self.save_layout_state.open;
+            let mut save_layout = false;
+            let mut cancel = false;
+            egui::Window::new("Save Workspace Layout")
+                .open(&mut open)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    ui.label("Layout name");
+                    ui.text_edit_singleline(&mut self.save_layout_state.name);
+                    ui.horizontal(|ui| {
+                        if ui.button("Save").clicked() {
+                            save_layout = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            cancel = true;
+                        }
+                    });
+                });
+            if save_layout {
+                self.save_current_workspace_layout();
+                open = false;
+            }
+            if cancel {
+                open = false;
+            }
+            self.save_layout_state.open = open;
         }
 
         if self.import_state.open {
@@ -2795,17 +4950,18 @@ impl eframe::App for EditorApp {
         self.run_shortcuts(ctx);
         self.handle_close_request(ctx);
         self.draw_menu_bar(ctx);
-        self.draw_left_panel(ctx);
-        self.draw_right_panel(ctx);
-        self.draw_central_panel(ctx);
+        self.draw_workspace(ctx);
         self.draw_windows(ctx);
-        ctx.request_repaint_after(Duration::from_millis(100));
+        if self.needs_animation_repaint() {
+            ctx.request_repaint_after(Duration::from_millis(16));
+        }
     }
 }
 
 struct SceneCanvasOutcome {
     viewport_rect: Rect,
     hovered_tile: Option<(usize, usize)>,
+    sampled_cell: Option<usize>,
     primary_cell: Option<usize>,
     secondary_cell: Option<usize>,
     world_cell_position: PointI16,
@@ -2819,6 +4975,7 @@ impl Default for SceneCanvasOutcome {
         Self {
             viewport_rect: Rect::NOTHING,
             hovered_tile: None,
+            sampled_cell: None,
             primary_cell: None,
             secondary_cell: None,
             world_cell_position: PointI16 { x: 0, y: 0 },
@@ -2839,6 +4996,7 @@ fn draw_scene_canvas(
     viewport_size: Vec2,
     show_grid: bool,
     show_collision: bool,
+    selected_layer: usize,
     selected_tile: usize,
     selected_spawn: Option<usize>,
     selected_checkpoint: Option<usize>,
@@ -2853,18 +5011,21 @@ fn draw_scene_canvas(
         ui.label("No scene selected.");
         return SceneCanvasOutcome::default();
     };
-    let Some(layer) = scene.layers.first() else {
+    if scene.layers.is_empty() {
         ui.label("Scene has no tile layer.");
         return SceneCanvasOutcome::default();
-    };
-    let Some(tileset) = bundle.tileset(&layer.tileset_id) else {
-        ui.label("Layer references a missing tileset.");
-        return SceneCanvasOutcome::default();
-    };
-    let Some(palette) = bundle.palette(&tileset.palette_id) else {
-        ui.label("Tileset references a missing palette.");
-        return SceneCanvasOutcome::default();
-    };
+    }
+    let selected_layer = selected_layer.min(scene.layers.len().saturating_sub(1));
+    let render_layers = scene
+        .layers
+        .iter()
+        .filter(|layer| layer.visible)
+        .filter_map(|layer| {
+            let tileset = bundle.tileset(&layer.tileset_id)?;
+            let palette = bundle.palette(&tileset.palette_id)?;
+            Some((layer, tileset, palette))
+        })
+        .collect::<Vec<_>>();
 
     let cell_size = 8.0 * zoom;
     let desired_size = Vec2::new(
@@ -2898,10 +5059,15 @@ fn draw_scene_canvas(
                 Vec2::splat(cell_size),
             );
 
-            let tile_index = layer.tiles.get(cell_index).copied().unwrap_or_default() as usize;
-            if let Some(tile) = tileset.tiles.get(tile_index) {
-                draw_tile_pixels(&painter, cell_rect, tile, palette);
-            } else {
+            let mut drew_tile = false;
+            for (layer, tileset, palette) in &render_layers {
+                let tile_index = layer.tiles.get(cell_index).copied().unwrap_or_default() as usize;
+                if let Some(tile) = tileset.tiles.get(tile_index) {
+                    draw_tile_pixels(&painter, cell_rect, tile, palette);
+                    drew_tile = true;
+                }
+            }
+            if !drew_tile {
                 painter.rect_filled(cell_rect, 0.0, Color32::BLACK);
             }
 
@@ -2989,7 +5155,8 @@ fn draw_scene_canvas(
         draw_scene_selection_overlay(&painter, rect, zoom, scene, selection);
     }
 
-    let selected_rect = selected_tile_preview_rect(rect, scene, selected_tile, zoom);
+    let selected_rect =
+        selected_tile_preview_rect(rect, scene, selected_layer, selected_tile, zoom);
     if let Some(highlight) = selected_rect {
         painter.rect_stroke(
             highlight,
@@ -3003,6 +5170,14 @@ fn draw_scene_canvas(
     let hovered_tile = hover_pos.and_then(|position| {
         world_tile_from_pos(position, rect, scene, zoom).map(|(x, y, _)| (x, y))
     });
+    let sampling_mode = !selection_mode && ui.input(|input| input.modifiers.alt);
+    let sampled_cell = if sampling_mode && response.clicked_by(egui::PointerButton::Primary) {
+        response.interact_pointer_pos().and_then(|position| {
+            world_tile_from_pos(position, rect, scene, zoom).map(|(_, _, index)| index)
+        })
+    } else {
+        None
+    };
 
     let interact_tile = response.interact_pointer_pos().and_then(|position| {
         world_tile_from_pos(position, rect, scene, zoom).map(|(x, y, _)| (x, y))
@@ -3043,13 +5218,14 @@ fn draw_scene_canvas(
         }
     }
 
-    let primary_cell = if !selection_mode && ui.input(|input| input.pointer.primary_down()) {
-        hover_pos.and_then(|position| {
-            world_tile_from_pos(position, rect, scene, zoom).map(|(_, _, index)| index)
-        })
-    } else {
-        None
-    };
+    let primary_cell =
+        if !selection_mode && !sampling_mode && ui.input(|input| input.pointer.primary_down()) {
+            hover_pos.and_then(|position| {
+                world_tile_from_pos(position, rect, scene, zoom).map(|(_, _, index)| index)
+            })
+        } else {
+            None
+        };
 
     let secondary_cell = if !selection_mode && ui.input(|input| input.pointer.secondary_down()) {
         hover_pos.and_then(|position| {
@@ -3070,6 +5246,7 @@ fn draw_scene_canvas(
     SceneCanvasOutcome {
         viewport_rect,
         hovered_tile,
+        sampled_cell,
         primary_cell,
         secondary_cell,
         world_cell_position,
@@ -3664,10 +5841,11 @@ fn world_tile_from_pos(
 fn selected_tile_preview_rect(
     rect: Rect,
     scene: &SceneResource,
+    selected_layer: usize,
     selected_tile: usize,
     zoom: f32,
 ) -> Option<Rect> {
-    let layer = scene.layers.first()?;
+    let layer = scene.layers.get(selected_layer)?;
     let index = layer
         .tiles
         .iter()
@@ -3725,6 +5903,13 @@ fn metasprite_for_entity<'a>(
     bundle
         .animation(&idle_id)
         .and_then(|animation| metasprite_for_animation_frame(bundle, animation, time_seconds))
+}
+
+fn entity_has_animation(bundle: &ProjectBundle, entity: &EntityPlacement) -> bool {
+    bundle.animation(&entity.archetype).is_some()
+        || bundle
+            .animation(&format!("{}_idle", entity.archetype))
+            .is_some()
 }
 
 fn find_tileset_for_metasprite<'a>(
@@ -4002,6 +6187,10 @@ fn color_distance_squared(a: &RgbaColor, b: &RgbaColor) -> u32 {
 fn fit_size(size: Vec2, max: Vec2) -> Vec2 {
     let scale = (max.x / size.x).min(max.y / size.y).min(1.0);
     size * scale
+}
+
+fn filter_matches(filter: &str, candidate: &str) -> bool {
+    filter.is_empty() || candidate.to_ascii_lowercase().contains(filter)
 }
 
 fn to_color32(color: &RgbaColor) -> Color32 {

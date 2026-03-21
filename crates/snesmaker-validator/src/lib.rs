@@ -656,19 +656,21 @@ mod tests {
 
     #[test]
     fn catches_palette_overflow() {
-        let mut bundle = ProjectBundle::default();
-        bundle.palettes = vec![PaletteResource {
-            id: "overflow".to_string(),
-            name: "Overflow".to_string(),
-            colors: (0..17)
-                .map(|index| RgbaColor {
-                    r: index,
-                    g: index,
-                    b: index,
-                    a: 255,
-                })
-                .collect(),
-        }];
+        let bundle = ProjectBundle {
+            palettes: vec![PaletteResource {
+                id: "overflow".to_string(),
+                name: "Overflow".to_string(),
+                colors: (0..17)
+                    .map(|index| RgbaColor {
+                        r: index,
+                        g: index,
+                        b: index,
+                        a: 255,
+                    })
+                    .collect(),
+            }],
+            ..ProjectBundle::default()
+        };
 
         let report = validate_project(&bundle);
         assert!(

@@ -258,6 +258,6 @@ mod tests {
         let trace = simulate_trace(&profile, &inputs);
         let expected_x: Vec<i32> = trace.iter().map(|frame| frame.x_fp).collect();
         assert_eq!(expected_x, vec![90, 270, 506, 798, 1034]);
-        assert_eq!(trace[1].grounded, false);
+        assert!(!trace[1].grounded);
     }
 }
