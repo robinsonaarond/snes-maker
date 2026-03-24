@@ -1,7 +1,7 @@
 {
   "project_root": "examples/megaman_like_demo",
   "build_dir": "examples/megaman_like_demo/build",
-  "rom_path": "examples/megaman_like_demo/build/megaman_like_demo-1774123808000-B1C0.sfc",
+  "rom_path": "examples/megaman_like_demo/build/megaman_like_demo-1774123972125-B1C0.sfc",
   "stable_rom_path": "examples/megaman_like_demo/build/megaman_like_demo.sfc",
   "report_path": "examples/megaman_like_demo/build/build-report.json",
   "rom_built": true,

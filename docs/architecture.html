@@ -1,0 +1,279 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>SNES Maker Architecture</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --bg: #f4efe4;
+        --panel: #fffaf0;
+        --ink: #1f1b16;
+        --muted: #6b5f52;
+        --line: #d8ccb8;
+        --accent: #a54d2d;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        font-family: Georgia, "Times New Roman", serif;
+        background:
+          radial-gradient(circle at top, rgba(165, 77, 45, 0.08), transparent 35%),
+          linear-gradient(180deg, #f8f2e8 0%, var(--bg) 100%);
+        color: var(--ink);
+      }
+
+      main {
+        max-width: 1200px;
+        margin: 0 auto;
+        padding: 32px 20px 56px;
+      }
+
+      h1,
+      h2 {
+        margin: 0 0 12px;
+        line-height: 1.1;
+      }
+
+      h1 {
+        font-size: clamp(2rem, 4vw, 3.4rem);
+      }
+
+      h2 {
+        font-size: clamp(1.35rem, 2vw, 1.8rem);
+      }
+
+      p,
+      li {
+        font-size: 1.02rem;
+        line-height: 1.6;
+      }
+
+      .lede {
+        max-width: 72ch;
+        color: var(--muted);
+        margin-bottom: 28px;
+      }
+
+      .card {
+        background: rgba(255, 250, 240, 0.92);
+        border: 1px solid var(--line);
+        border-radius: 18px;
+        padding: 20px;
+        box-shadow: 0 18px 50px rgba(64, 40, 24, 0.08);
+        margin-bottom: 22px;
+        overflow-x: auto;
+      }
+
+      .meta {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px 18px;
+        margin-bottom: 20px;
+        color: var(--muted);
+        font-size: 0.95rem;
+      }
+
+      a {
+        color: var(--accent);
+      }
+
+      code {
+        font-family: "SFMono-Regular", Menlo, Consolas, monospace;
+        font-size: 0.94em;
+      }
+
+      ul {
+        margin: 10px 0 0;
+        padding-left: 20px;
+      }
+
+      .mermaid {
+        min-width: 900px;
+      }
+
+      @media (max-width: 960px) {
+        .mermaid {
+          min-width: 760px;
+        }
+      }
+
+      @media (max-width: 760px) {
+        main {
+          padding: 22px 14px 40px;
+        }
+
+        .card {
+          padding: 16px;
+          border-radius: 14px;
+        }
+
+        .mermaid {
+          min-width: 680px;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>SNES Maker Architecture</h1>
+      <p class="lede">
+        Browser-friendly local viewer for the Mermaid diagrams in
+        <code>docs/architecture.md</code>.
+      </p>
+
+      <div class="meta">
+        <span>Source: <a href="./architecture.md">architecture.md</a></span>
+        <span>Open this file directly in a browser</span>
+        <span>Requires internet once for Mermaid from CDN</span>
+      </div>
+
+      <section class="card">
+        <h2>System Architecture</h2>
+        <div class="mermaid">
+flowchart TB
+    user["Designer / Developer"]
+
+    subgraph surfaces["Application Surfaces"]
+        cli["snesmaker-cli<br/>new / check / build-rom / run"]
+        editor["snesmaker-editor<br/>egui / eframe desktop editor"]
+    end
+
+    subgraph core["Shared Core Crates"]
+        project["snesmaker-project<br/>schema, load/save, template generation"]
+        events["snesmaker-events<br/>dialogue graph + event script IR"]
+        validator["snesmaker-validator<br/>diagnostics, SNES limits, build budgets"]
+        platformer["snesmaker-platformer<br/>scene compiler + deterministic playtest sim"]
+        export["snesmaker-export<br/>runtime staging, build orchestration, build report"]
+        assets["snesmaker-assets<br/>PNG to palette / tileset import helpers"]
+    end
+
+    subgraph storage["Project Files And Generated Data"]
+        manifest["project.toml<br/>meta, build, editor, gameplay settings"]
+        content["content/**/*.ron<br/>scenes, dialogues, palettes, tilesets,<br/>metasprites, animations"]
+        sprite_sources["content/sprite_sources/*.png<br/>source sprite sheets"]
+        workspace[".snesmaker/*.ron<br/>editor layouts, favorites, snippets, brushes"]
+        builddir["build/<br/>generated .inc files, build-report.json,<br/>ROM artifacts"]
+        runtime["runtime/snes<br/>main.s + linker.cfg"]
+    end
+
+    subgraph external["External Tools"]
+        assembler["ca65 / ld65<br/>optional cc65 toolchain"]
+        emulator["Emulator<br/>(for example ares)"]
+        rom["SNES ROM (.sfc)"]
+    end
+
+    user --> cli
+    user --> editor
+
+    cli -->|"new / check"| project
+    cli -->|"check diagnostics"| validator
+    cli -->|"build-rom / run"| export
+
+    editor -->|"load/edit/save project"| project
+    editor -->|"diagnostics + quick fixes"| validator
+    editor -->|"in-editor playtest + trace tools"| platformer
+    editor -->|"ROM build + build report + launcher"| export
+    editor <-->|"workspace state"| workspace
+
+    project <--> manifest
+    project <--> content
+    project --> events
+
+    validator --> project
+    validator --> events
+
+    platformer --> project
+
+    export --> project
+    export --> validator
+    export --> platformer
+    export --> runtime
+    export --> builddir
+    export --> assembler
+    assembler --> rom
+    rom --> emulator
+
+    assets -->|"reads PNG sprite sheets"| sprite_sources
+    assets -->|"produces palette / tileset resources"| project
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>Main Runtime And Build Flow</h2>
+        <div class="mermaid">
+sequenceDiagram
+    participant UI as Editor or CLI
+    participant Project as snesmaker-project
+    participant Validator as snesmaker-validator
+    participant Export as snesmaker-export
+    participant Platformer as snesmaker-platformer
+    participant Runtime as runtime/snes
+    participant Toolchain as ca65/ld65
+    participant Output as build/
+    participant Emulator as Emulator
+
+    UI->>Project: Load project.toml + content/**/*.ron
+    UI->>Validator: Validate ProjectBundle
+    Validator-->>UI: Diagnostics + budget summary
+
+    opt In-editor preview
+        UI->>Platformer: Create PlaytestSession / simulate_trace
+        Platformer-->>UI: Deterministic preview state
+    end
+
+    opt Build or run
+        UI->>Project: Save current bundle
+        UI->>Export: build_rom(project_root)
+        Export->>Project: Reload ProjectBundle
+        Export->>Validator: Revalidate bundle
+        Export->>Platformer: Compile supported scenes
+        Export->>Runtime: Copy main.s + linker.cfg
+        Export->>Output: Write generated/header.inc
+        Export->>Output: Write generated/project_data.inc
+        Export->>Output: Write build-report.json
+
+        alt ca65 and ld65 available
+            Export->>Toolchain: Assemble and link
+            Toolchain-->>Output: Built .sfc ROM
+            Output-->>Emulator: Launch ROM when requested
+        else Toolchain missing
+            Export-->>UI: Return warnings and generated build assets only
+        end
+    end
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>Viewing Tips</h2>
+        <ul>
+          <li>Fastest browser option: open <code>docs/architecture.html</code>.</li>
+          <li>Fastest editor option: preview <code>docs/architecture.md</code> in VS Code or Cursor.</li>
+          <li>If you want this to work fully offline too, I can vendor Mermaid or pre-render these as SVG.</li>
+        </ul>
+      </section>
+    </main>
+
+    <script type="module">
+      import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+
+      mermaid.initialize({
+        startOnLoad: true,
+        theme: "neutral",
+        securityLevel: "loose",
+        flowchart: {
+          curve: "basis",
+          useMaxWidth: false,
+        },
+        sequence: {
+          useMaxWidth: false,
+        },
+      });
+    </script>
+  </body>
+</html>
