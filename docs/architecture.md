@@ -45,6 +45,7 @@ flowchart TB
     cli -->|"build-rom / run"| export
 
     editor -->|"load/edit/save project"| project
+    editor -->|"shared sprite-sheet import pipeline"| assets
     editor -->|"diagnostics + quick fixes"| validator
     editor -->|"in-editor playtest + trace tools"| platformer
     editor -->|"ROM build + build report + launcher"| export
@@ -121,4 +122,5 @@ sequenceDiagram
 - `snesmaker-project` is the center of the design. Both entry points and most supporting crates work from `ProjectBundle`.
 - `snesmaker-validator` is reused by the CLI, the editor, and the exporter so diagnostics stay consistent across workflows.
 - `snesmaker-platformer` serves two roles today: deterministic in-editor playtesting and scene compilation for the current side-scroller runtime path.
-- `snesmaker-assets` is a workspace utility crate in this snapshot. It reads PNG sprite sheets and produces `PaletteResource` / `TilesetResource`, but it is not yet on the primary CLI/editor dependency path.
+- `snesmaker-assets` is now on the editor import path. The editor's sprite-sheet import UI calls shared `snesmaker-assets` import helpers so import id generation, duplicate handling, and asset construction live outside the UI shell.
+- `snesmaker-editor` is no longer only a single giant entry file. The animation, events, diagnostics, import, playtest, asset-browser, outliner, auto-tiling, and scene-canvas workflows now live in focused modules under `crates/snesmaker-editor/src/`.

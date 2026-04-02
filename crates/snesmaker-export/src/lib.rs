@@ -154,11 +154,16 @@ fn compile_scenes(bundle: &ProjectBundle) -> Result<Vec<CompiledScene>> {
     let mut scenes = Vec::with_capacity(bundle.scenes.len());
 
     for scene in &bundle.scenes {
+        let resolved_scene = bundle.resolve_scene(scene);
         let module = modules
             .iter()
-            .find(|module| module.supports(scene))
+            .find(|module| module.supports(&resolved_scene))
             .ok_or_else(|| anyhow!("no genre module can compile scene '{}'", scene.id))?;
-        scenes.push(module.scene_compiler().compile_scene(bundle, scene)?);
+        scenes.push(
+            module
+                .scene_compiler()
+                .compile_scene(bundle, &resolved_scene)?,
+        );
     }
 
     Ok(scenes)
@@ -683,7 +688,7 @@ struct RuntimeVisualPieceBuild {
 
 fn build_bg_assets(bundle: &ProjectBundle) -> Result<BgAssets> {
     let scene = bundle
-        .scene(&bundle.manifest.gameplay.entry_scene)
+        .resolved_scene(&bundle.manifest.gameplay.entry_scene)
         .ok_or_else(|| {
             anyhow!(
                 "entry scene '{}' is missing",
@@ -711,7 +716,7 @@ fn build_bg_assets(bundle: &ProjectBundle) -> Result<BgAssets> {
 
     let palette_bytes = encode_palette_bytes(palette);
     let tile_bytes = encode_4bpp_tiles(tileset)?;
-    let tilemap = build_display_tilemap(scene, layer, tileset)?;
+    let tilemap = build_display_tilemap(&scene, layer, tileset)?;
     let tilemap_bytes = tilemap
         .iter()
         .flat_map(|entry| entry.to_le_bytes())
@@ -731,7 +736,7 @@ fn build_bg_assets(bundle: &ProjectBundle) -> Result<BgAssets> {
 
 fn build_player_assets(bundle: &ProjectBundle) -> Result<PlayerAssets> {
     let scene = bundle
-        .scene(&bundle.manifest.gameplay.entry_scene)
+        .resolved_scene(&bundle.manifest.gameplay.entry_scene)
         .ok_or_else(|| {
             anyhow!(
                 "entry scene '{}' is missing",
@@ -832,13 +837,14 @@ fn build_player_assets(bundle: &ProjectBundle) -> Result<PlayerAssets> {
         id: "generated_runtime_obj_tiles".to_string(),
         palette_id: player_palette.id.clone(),
         name: "Generated Runtime OBJ Tiles".to_string(),
+        adjacency_rules: Vec::new(),
         tiles: runtime_tiles,
     };
     let obj_tile_bytes = encode_4bpp_tiles(&obj_tileset)?;
 
     let world_width_pixels = DISPLAY_MAP_WIDTH_TILES * 8;
-    let scaled_x = scale_scene_x(scene, spawn.position.x);
-    let scaled_y = scale_scene_y(scene, spawn.position.y);
+    let scaled_x = scale_scene_x(&scene, spawn.position.x);
+    let scaled_y = scale_scene_y(&scene, spawn.position.y);
     let ground_y = scaled_y.saturating_sub(16);
     let start_y = ground_y;
     let entity_index_by_id = scene
@@ -854,13 +860,13 @@ fn build_player_assets(bundle: &ProjectBundle) -> Result<PlayerAssets> {
             .ok_or_else(|| anyhow!("missing runtime visual for entity '{}'", entity.id))?;
         let action = encode_entity_action(entity, &entity_index_by_id)?;
         let (movement_kind, movement_speed, patrol_min_x, patrol_max_x) =
-            encode_entity_movement(scene, entity);
-        let scaled_hitbox_x = scale_scene_delta_x(scene, entity.hitbox.x) as i8;
-        let scaled_hitbox_y = scale_scene_delta_y(scene, entity.hitbox.y) as i8;
-        let scaled_hitbox_w = scale_scene_width(scene, entity.hitbox.width).max(1) as u8;
-        let scaled_hitbox_h = scale_scene_height(scene, entity.hitbox.height).max(1) as u8;
-        let scaled_entity_x = scale_scene_x(scene, entity.position.x) as u16;
-        let scaled_entity_y = scale_scene_y(scene, entity.position.y) as u16;
+            encode_entity_movement(&scene, entity);
+        let scaled_hitbox_x = scale_scene_delta_x(&scene, entity.hitbox.x) as i8;
+        let scaled_hitbox_y = scale_scene_delta_y(&scene, entity.hitbox.y) as i8;
+        let scaled_hitbox_w = scale_scene_width(&scene, entity.hitbox.width).max(1) as u8;
+        let scaled_hitbox_h = scale_scene_height(&scene, entity.hitbox.height).max(1) as u8;
+        let scaled_entity_x = scale_scene_x(&scene, entity.position.x) as u16;
+        let scaled_entity_y = scale_scene_y(&scene, entity.position.y) as u16;
         let flags = (u8::from(entity.active)) | (u8::from(entity.one_shot) << 1);
 
         entity_bytes.push(match entity.kind {
@@ -1071,7 +1077,8 @@ fn build_visual_from_metasprite(
                     metasprite.id
                 )
             })?;
-        let mut attr = 0x30;
+        let mut attr =
+            ((piece.priority.min(3) & 0x03) << 4) | ((piece.palette_slot.min(7) & 0x07) << 1);
         if piece.h_flip {
             attr |= 0x40;
         }
@@ -1394,6 +1401,7 @@ mod tests {
             id: "test".to_string(),
             palette_id: "p".to_string(),
             name: "Test".to_string(),
+            adjacency_rules: Vec::new(),
             tiles: vec![snesmaker_project::Tile8 {
                 pixels: vec![
                     1, 1, 1, 1, 0, 0, 0, 0, 2, 2, 2, 2, 0, 0, 0, 0, 4, 4, 4, 4, 0, 0, 0, 0, 8, 8,
@@ -1409,6 +1417,26 @@ mod tests {
         assert_eq!(bytes[1], 0x00);
         assert_eq!(bytes[2], 0x00);
         assert_eq!(bytes[3], 0xF0);
+    }
+
+    #[test]
+    fn encodes_piece_priority_and_palette_slot_in_attr() {
+        let mut bundle = snesmaker_project::demo_bundle();
+        let metasprite = bundle
+            .metasprites
+            .first_mut()
+            .expect("demo bundle metasprite");
+        let piece = metasprite.pieces.first_mut().expect("demo bundle piece");
+        piece.palette_slot = 5;
+        piece.priority = 1;
+        piece.h_flip = true;
+        piece.v_flip = true;
+
+        let visual =
+            build_visual_from_metasprite(&bundle, &bundle.metasprites[0], "default_palette")
+                .expect("build runtime visual");
+
+        assert_eq!(visual.pieces[0].attr, 0xDA);
     }
 
     #[test]

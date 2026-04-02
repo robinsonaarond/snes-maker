@@ -775,6 +775,7 @@ mod tests {
             entities: vec![],
             triggers: vec![],
             scripts: vec![],
+            prefab_instances: vec![],
         }
     }
 

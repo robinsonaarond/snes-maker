@@ -4,35 +4,68 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use camino::{Utf8Path, Utf8PathBuf};
 use eframe::egui::{
-    self, Align, Align2, Color32, ColorImage, FontId, Key, KeyboardShortcut, Layout, Modifiers,
-    Pos2, Rect, Sense, StrokeKind, TextureHandle, TextureOptions, Vec2, ViewportCommand,
+    self, Align, Align2, Color32, ColorImage, FontId, Id, Key, KeyboardShortcut, LayerId, Layout,
+    Modifiers, Order, Pos2, Rect, Sense, StrokeKind, TextureHandle, TextureOptions, Vec2,
+    ViewportCommand,
 };
-use image::RgbaImage;
 use rfd::FileDialog;
+use snesmaker_assets::{
+    SpriteSheetImportRequest,
+    import_sprite_sheet_into_bundle as import_sprite_sheet_into_bundle_shared,
+    suggest_sprite_sheet_ids,
+};
 use snesmaker_events::{DialogueGraph, EventCommand, EventScript, TriggerKind};
 use snesmaker_export::{BuildOutcome, build_rom};
 use snesmaker_platformer::{InputFrame, PlaytestSession, simulate_trace};
 use snesmaker_project::{
-    default_entity_hitbox, slugify, AnimationFrame, AnimationResource, Checkpoint, CombatProfile,
-    EntityAction, EntityKind, EntityPlacement, Facing, HealthHudStyle, MetaspriteResource,
-    MovementPattern, PaletteResource, PointI16, ProjectBundle, RectI16, RgbaColor, SceneResource,
-    SpawnPoint, SpriteTileRef, Tile8, TileLayer, TilesetResource, TriggerVolume, PhysicsProfile,
-    PROJECT_SPRITE_SOURCE_DIR,
+    AnimationFrame, AnimationResource, Checkpoint, CombatProfile, EntityAction, EntityKind,
+    EntityPlacement, Facing, HealthHudStyle, MetaspriteResource, MovementPattern,
+    PROJECT_SPRITE_SOURCE_DIR, PaletteResource, PhysicsProfile, PointI16, PrefabEntityOverride,
+    PrefabInstance, PrefabResource, PrefabTriggerOverride, ProjectBundle, RectI16, RgbaColor,
+    SceneResource, SpawnPoint, SpriteTileRef, Tile8, TileLayer, TilesetResource, TriggerVolume,
+    default_entity_hitbox, slugify,
 };
 use snesmaker_validator::{
     Diagnostic, MAX_COLORS_PER_PALETTE, MAX_METASPRITE_TILES_HARD, MAX_METASPRITE_TILES_WARN,
     MAX_PALETTES, MAX_TILESET_TILES, ROM_BANK_SIZE, Severity, ValidationReport, validate_project,
 };
 
+mod animation_editor;
+mod asset_browser;
+mod autotile;
+mod diagnostics_panel;
+mod event_editor;
+mod import_panel;
+mod outliner_panel;
+mod playtest_panel;
+mod scene_canvas;
 mod workspace;
 
+use animation_editor::{
+    draw_animation_inspector as draw_animation_inspector_impl,
+    draw_animation_tab as draw_animation_tab_impl,
+    draw_context_preview as draw_context_preview_impl,
+    has_context_preview as has_context_preview_impl,
+    needs_animation_repaint as needs_animation_repaint_impl,
+};
+use autotile::{hovered_adjacency_debug, rebuild_scene_adjacency, rule_source_label};
+use diagnostics_panel::{DiagnosticGrouping, DiagnosticsViewState};
+use event_editor::{
+    dialogue_preview_text as dialogue_preview_text_impl, draw_events_tab as draw_events_tab_impl,
+    draw_trigger_inspector as draw_trigger_inspector_impl,
+    navigate_to_event_diagnostic as navigate_to_event_diagnostic_impl,
+    script_preview_text as script_preview_text_impl,
+};
+use import_panel::{LoadedSheetPreview, SpriteSheetImportState};
+use playtest_panel::{PlaytestStartMode, PlaytestState};
 use workspace::{
-    DockArea, DockLayout, DockSlot, DockTab, SavedDockLayout, SavedSceneSnippet, SavedTileBrush,
-    WorkspaceAddons, WorkspaceFile, copy_workspace_file, load_workspace_addons,
-    load_workspace_file, save_workspace_addons, save_workspace_file,
+    DockArea, DockLayout, DockTab, SaveLayoutState, SavedDockLayout, SavedSceneSnippet,
+    SavedTileBrush, WorkspaceAddons, WorkspaceFile, WorkspacePreset, WorkspaceState,
+    copy_workspace_file, load_workspace_addons, load_workspace_file, save_workspace_addons,
+    save_workspace_file,
 };
 
 const HISTORY_LIMIT: usize = 64;
@@ -75,6 +108,7 @@ enum EditorTool {
     Checkpoint,
     Entity,
     Trigger,
+    Prefab,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,6 +125,7 @@ enum SceneObjectGroup {
     Checkpoints,
     Entities,
     Triggers,
+    Prefabs,
     Scripts,
 }
 
@@ -101,44 +136,8 @@ impl SceneObjectGroup {
             Self::Checkpoints => "Checkpoints",
             Self::Entities => "Entities",
             Self::Triggers => "Triggers",
+            Self::Prefabs => "Prefabs",
             Self::Scripts => "Scripts",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-enum DiagnosticGrouping {
-    #[default]
-    Severity,
-    Code,
-    Path,
-}
-
-impl DiagnosticGrouping {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Severity => "Severity",
-            Self::Code => "Code",
-            Self::Path => "Path",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Default)]
-struct DiagnosticsViewState {
-    search: String,
-    show_errors: bool,
-    show_warnings: bool,
-    grouping: DiagnosticGrouping,
-}
-
-impl DiagnosticsViewState {
-    fn new() -> Self {
-        Self {
-            search: String::new(),
-            show_errors: true,
-            show_warnings: true,
-            grouping: DiagnosticGrouping::Severity,
         }
     }
 }
@@ -156,6 +155,7 @@ impl EditorTool {
             Self::Checkpoint => "Checkpoint",
             Self::Entity => "Entity",
             Self::Trigger => "Trigger",
+            Self::Prefab => "Prefab",
         }
     }
 }
@@ -233,149 +233,44 @@ struct SceneClipboard {
     triggers: Vec<TriggerVolume>,
 }
 
+#[derive(Debug, Clone)]
+enum AssetDragPayload {
+    Prefab { id: String, label: String },
+    Brush { name: String, label: String },
+    LegacySnippet { name: String, label: String },
+    Script { id: String, label: String },
+    Visual { id: String, label: String },
+}
+
+impl AssetDragPayload {
+    fn label(&self) -> &str {
+        match self {
+            Self::Prefab { label, .. }
+            | Self::Brush { label, .. }
+            | Self::LegacySnippet { label, .. }
+            | Self::Script { label, .. }
+            | Self::Visual { label, .. } => label,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum PreviewFocus {
     #[default]
     None,
+    Metasprite,
     Animation,
     Entity,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WorkspacePreset {
-    LevelDesign,
-    Animation,
-    Eventing,
-    Debug,
-    Custom,
-}
-
-impl WorkspacePreset {
-    fn label(self) -> &'static str {
-        match self {
-            Self::LevelDesign => "Level Design",
-            Self::Animation => "Animation",
-            Self::Eventing => "Eventing",
-            Self::Debug => "Debug",
-            Self::Custom => "Custom",
-        }
-    }
-
-    fn layout(self) -> DockLayout {
-        match self {
-            Self::LevelDesign => DockLayout {
-                show_status_bar: true,
-                left: DockSlot::new(320.0, vec![DockTab::Toolbox, DockTab::Outliner], 0),
-                center: DockSlot::new(0.0, vec![DockTab::Scene], 0),
-                right: DockSlot::new(380.0, vec![DockTab::Inspector, DockTab::Animation], 0),
-                bottom: DockSlot::new(
-                    280.0,
-                    vec![DockTab::Assets, DockTab::Diagnostics, DockTab::BuildReport, DockTab::Playtest],
-                    0,
-                ),
-            },
-            Self::Animation => DockLayout {
-                show_status_bar: true,
-                left: DockSlot::new(320.0, vec![DockTab::Assets, DockTab::Toolbox], 0),
-                center: DockSlot::new(0.0, vec![DockTab::Scene], 0),
-                right: DockSlot::new(380.0, vec![DockTab::Animation, DockTab::Inspector], 0),
-                bottom: DockSlot::new(260.0, vec![DockTab::Diagnostics, DockTab::BuildReport], 0),
-            },
-            Self::Eventing => DockLayout {
-                show_status_bar: true,
-                left: DockSlot::new(320.0, vec![DockTab::Outliner, DockTab::Assets], 0),
-                center: DockSlot::new(0.0, vec![DockTab::Scene], 0),
-                right: DockSlot::new(380.0, vec![DockTab::Inspector, DockTab::Diagnostics], 0),
-                bottom: DockSlot::new(260.0, vec![DockTab::BuildReport, DockTab::Playtest], 0),
-            },
-            Self::Debug => DockLayout {
-                show_status_bar: true,
-                left: DockSlot::new(320.0, vec![DockTab::Toolbox, DockTab::Outliner], 1),
-                center: DockSlot::new(0.0, vec![DockTab::Scene], 0),
-                right: DockSlot::new(380.0, vec![DockTab::Inspector, DockTab::Animation], 0),
-                bottom: DockSlot::new(
-                    300.0,
-                    vec![DockTab::Diagnostics, DockTab::BuildReport, DockTab::Playtest, DockTab::Assets],
-                    0,
-                ),
-            },
-            Self::Custom => WorkspacePreset::LevelDesign.layout(),
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
-struct WorkspaceState {
-    layout: DockLayout,
-    saved_layouts: Vec<SavedDockLayout>,
-    active_saved_layout: Option<String>,
-}
-
-impl WorkspaceState {
-    fn for_preset(preset: WorkspacePreset) -> Self {
-        Self {
-            layout: preset.layout(),
-            saved_layouts: Vec::new(),
-            active_saved_layout: None,
-        }
-    }
-}
-
-#[derive(Default)]
-struct SaveLayoutState {
-    open: bool,
-    name: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PlaytestStartMode {
-    SceneStart,
-    SelectedSpawn,
-    SelectedCheckpoint,
-}
-
-impl PlaytestStartMode {
-    fn label(self) -> &'static str {
-        match self {
-            Self::SceneStart => "Scene Start",
-            Self::SelectedSpawn => "Selected Spawn",
-            Self::SelectedCheckpoint => "Selected Checkpoint",
-        }
-    }
-}
-
-struct PlaytestState {
-    last_status: String,
-    session: Option<PlaytestSession>,
-    playing: bool,
-    speed_multiplier: f32,
-    accumulated_seconds: f32,
-    selected_physics_id: String,
-    start_mode: PlaytestStartMode,
-    show_camera_bounds: bool,
-    show_spawns: bool,
-    show_checkpoints: bool,
-    show_triggers: bool,
-    show_entities: bool,
-}
-
-impl Default for PlaytestState {
-    fn default() -> Self {
-        Self {
-            last_status: String::new(),
-            session: None,
-            playing: false,
-            speed_multiplier: 1.0,
-            accumulated_seconds: 0.0,
-            selected_physics_id: String::new(),
-            start_mode: PlaytestStartMode::SceneStart,
-            show_camera_bounds: true,
-            show_spawns: true,
-            show_checkpoints: true,
-            show_triggers: true,
-            show_entities: true,
-        }
-    }
+struct MetaspriteDragState {
+    metasprite_index: usize,
+    piece_index: usize,
+    pointer_origin: Pos2,
+    piece_origin: PointI16,
+    history_captured: bool,
+    moved: bool,
 }
 
 #[derive(Default)]
@@ -424,62 +319,6 @@ struct NewProjectState {
     destination: String,
 }
 
-struct LoadedSheetPreview {
-    rgba: Vec<u8>,
-    size: [usize; 2],
-    texture: TextureHandle,
-}
-
-#[derive(Default)]
-struct SpriteSheetImportState {
-    open: bool,
-    source_path: String,
-    base_id: String,
-    animation_id: String,
-    frame_width_px: u32,
-    frame_height_px: u32,
-    frame_count: usize,
-    columns: usize,
-    frame_duration: u8,
-    target_tileset_id: String,
-    target_palette_id: String,
-    status: String,
-    preview: Option<LoadedSheetPreview>,
-}
-
-impl SpriteSheetImportState {
-    fn with_defaults() -> Self {
-        Self {
-            open: false,
-            source_path: String::new(),
-            base_id: "player_run".to_string(),
-            animation_id: "player_run".to_string(),
-            frame_width_px: 16,
-            frame_height_px: 16,
-            frame_count: 1,
-            columns: 1,
-            frame_duration: 8,
-            target_tileset_id: String::new(),
-            target_palette_id: String::new(),
-            status: String::new(),
-            preview: None,
-        }
-    }
-
-    fn sync_to_bundle(&mut self, bundle: &ProjectBundle) {
-        if self.target_tileset_id.is_empty() {
-            if let Some(tileset) = bundle.tilesets.first() {
-                self.target_tileset_id = tileset.id.clone();
-            }
-        }
-        if self.target_palette_id.is_empty() {
-            if let Some(palette) = bundle.palettes.first() {
-                self.target_palette_id = palette.id.clone();
-            }
-        }
-    }
-}
-
 struct EditorApp {
     project_root: Utf8PathBuf,
     bundle: Option<ProjectBundle>,
@@ -490,14 +329,33 @@ struct EditorApp {
     selected_layer: usize,
     selected_tile: usize,
     selected_animation: usize,
+    selected_dialogue: Option<usize>,
+    selected_dialogue_node: Option<usize>,
+    selected_script: Option<usize>,
+    selected_metasprite: Option<usize>,
+    selected_metasprite_piece: Option<usize>,
     selected_spawn: Option<usize>,
     selected_checkpoint: Option<usize>,
     selected_entity: Option<usize>,
     selected_trigger: Option<usize>,
+    selected_prefab_instance: Option<usize>,
     preview_focus: PreviewFocus,
+    animation_preview_playing: bool,
+    animation_preview_loop: bool,
+    animation_preview_scrub_frame: u32,
+    animation_preview_play_anchor_seconds: f32,
+    animation_preview_play_anchor_tick: u32,
+    animation_preview_speed: f32,
+    animation_preview_facing: Facing,
+    show_metasprite_anchor: bool,
+    show_metasprite_bounds: bool,
+    show_entity_hitbox_preview: bool,
+    metasprite_drag_state: Option<MetaspriteDragState>,
+    metasprite_place_mode: bool,
     tool: EditorTool,
     show_grid: bool,
     show_collision: bool,
+    show_adjacency_debug: bool,
     show_help: bool,
     scene_zoom: f32,
     scene_scroll_offset: Vec2,
@@ -506,6 +364,7 @@ struct EditorApp {
     selection: Option<SceneSelection>,
     selection_drag_anchor: Option<(usize, usize)>,
     clipboard: Option<SceneClipboard>,
+    asset_drag_payload: Option<AssetDragPayload>,
     last_canvas_tile: Option<(usize, usize)>,
     confirm_exit: bool,
     import_state: SpriteSheetImportState,
@@ -538,14 +397,33 @@ impl EditorApp {
             selected_layer: 0,
             selected_tile: 0,
             selected_animation: 0,
+            selected_dialogue: Some(0),
+            selected_dialogue_node: Some(0),
+            selected_script: Some(0),
+            selected_metasprite: Some(0),
+            selected_metasprite_piece: Some(0),
             selected_spawn: Some(0),
             selected_checkpoint: Some(0),
             selected_entity: Some(0),
             selected_trigger: Some(0),
+            selected_prefab_instance: Some(0),
             preview_focus: PreviewFocus::None,
+            animation_preview_playing: true,
+            animation_preview_loop: true,
+            animation_preview_scrub_frame: 0,
+            animation_preview_play_anchor_seconds: 0.0,
+            animation_preview_play_anchor_tick: 0,
+            animation_preview_speed: 1.0,
+            animation_preview_facing: Facing::Right,
+            show_metasprite_anchor: true,
+            show_metasprite_bounds: true,
+            show_entity_hitbox_preview: false,
+            metasprite_drag_state: None,
+            metasprite_place_mode: false,
             tool: EditorTool::Select,
             show_grid: true,
             show_collision: true,
+            show_adjacency_debug: true,
             show_help: false,
             scene_zoom: 8.0,
             scene_scroll_offset: Vec2::ZERO,
@@ -554,6 +432,7 @@ impl EditorApp {
             selection: None,
             selection_drag_anchor: None,
             clipboard: None,
+            asset_drag_payload: None,
             last_canvas_tile: None,
             confirm_exit: false,
             import_state: SpriteSheetImportState::with_defaults(),
@@ -594,9 +473,12 @@ impl EditorApp {
                 self.active_canvas_cell = None;
                 self.selection = None;
                 self.selection_drag_anchor = None;
+                self.asset_drag_payload = None;
                 self.last_canvas_tile = None;
                 self.preview_focus = PreviewFocus::None;
                 self.scene_scroll_offset = Vec2::ZERO;
+                self.metasprite_drag_state = None;
+                self.metasprite_place_mode = false;
                 self.locked_layers.clear();
                 self.solo_layer = None;
                 self.solo_group = None;
@@ -617,9 +499,12 @@ impl EditorApp {
                 self.active_canvas_cell = None;
                 self.selection = None;
                 self.selection_drag_anchor = None;
+                self.asset_drag_payload = None;
                 self.last_canvas_tile = None;
                 self.preview_focus = PreviewFocus::None;
                 self.scene_scroll_offset = Vec2::ZERO;
+                self.metasprite_drag_state = None;
+                self.metasprite_place_mode = false;
                 self.locked_layers.clear();
                 self.solo_layer = None;
                 self.solo_group = None;
@@ -640,10 +525,16 @@ impl EditorApp {
             self.selected_layer = 0;
             self.selected_tile = 0;
             self.selected_animation = 0;
+            self.selected_dialogue = None;
+            self.selected_dialogue_node = None;
+            self.selected_script = None;
+            self.selected_metasprite = None;
+            self.selected_metasprite_piece = None;
             self.selected_spawn = None;
             self.selected_checkpoint = None;
             self.selected_entity = None;
             self.selected_trigger = None;
+            self.selected_prefab_instance = None;
             return;
         };
 
@@ -653,6 +544,10 @@ impl EditorApp {
         self.selected_animation = self
             .selected_animation
             .min(bundle.animations.len().saturating_sub(1));
+        self.selected_dialogue =
+            sanitize_optional_index(self.selected_dialogue, bundle.dialogues.len());
+        self.selected_metasprite =
+            sanitize_optional_index(self.selected_metasprite, bundle.metasprites.len());
         self.import_state.sync_to_bundle(bundle);
 
         if let Some(scene) = bundle.scenes.get(self.selected_scene) {
@@ -675,6 +570,12 @@ impl EditorApp {
                 sanitize_optional_index(self.selected_entity, scene.entities.len());
             self.selected_trigger =
                 sanitize_optional_index(self.selected_trigger, scene.triggers.len());
+            self.selected_prefab_instance = sanitize_optional_index(
+                self.selected_prefab_instance,
+                scene.prefab_instances.len(),
+            );
+            self.selected_script =
+                sanitize_optional_index(self.selected_script, scene.scripts.len());
         } else {
             self.selected_layer = 0;
             self.selected_tile = 0;
@@ -682,13 +583,41 @@ impl EditorApp {
             self.selected_checkpoint = None;
             self.selected_entity = None;
             self.selected_trigger = None;
+            self.selected_prefab_instance = None;
+            self.selected_script = None;
         }
+
+        self.selected_dialogue_node = self
+            .selected_dialogue
+            .and_then(|index| bundle.dialogues.get(index))
+            .and_then(|dialogue| {
+                sanitize_optional_index(self.selected_dialogue_node, dialogue.nodes.len())
+            });
+        self.selected_metasprite_piece = self
+            .selected_metasprite
+            .and_then(|index| bundle.metasprites.get(index))
+            .and_then(|metasprite| {
+                sanitize_optional_index(self.selected_metasprite_piece, metasprite.pieces.len())
+            });
 
         if self.preview_focus == PreviewFocus::Entity && self.selected_entity.is_none() {
             self.preview_focus = PreviewFocus::None;
         }
+        if self.preview_focus == PreviewFocus::Metasprite && self.selected_metasprite.is_none() {
+            self.preview_focus = PreviewFocus::None;
+        }
         if self.preview_focus == PreviewFocus::Animation && bundle.animations.is_empty() {
             self.preview_focus = PreviewFocus::None;
+        }
+        if self
+            .metasprite_drag_state
+            .as_ref()
+            .is_some_and(|drag| self.selected_metasprite != Some(drag.metasprite_index))
+        {
+            self.metasprite_drag_state = None;
+        }
+        if self.preview_focus != PreviewFocus::Metasprite {
+            self.metasprite_place_mode = false;
         }
     }
 
@@ -753,6 +682,10 @@ impl EditorApp {
     }
 
     fn navigate_to_diagnostic_path(&mut self, path: &str) {
+        if navigate_to_event_diagnostic_impl(self, path) {
+            return;
+        }
+
         if path == "project.toml" {
             self.workspace.layout.show_tab(DockTab::Inspector);
             self.status = "Opened project settings in the inspector.".to_string();
@@ -789,7 +722,9 @@ impl EditorApp {
         }
     }
 
+    #[allow(unreachable_code)]
     fn diagnostic_has_quick_fix(&self, diagnostic: &Diagnostic) -> bool {
+        return self.diagnostic_has_quick_fix_impl(diagnostic);
         matches!(
             diagnostic.code.as_str(),
             "manifest.missing_entry_scene"
@@ -804,7 +739,10 @@ impl EditorApp {
         )
     }
 
+    #[allow(unreachable_code)]
     fn apply_diagnostic_quick_fix(&mut self, diagnostic: &Diagnostic) {
+        self.apply_diagnostic_quick_fix_impl(diagnostic);
+        return;
         let Some(bundle) = &self.bundle else {
             return;
         };
@@ -819,21 +757,34 @@ impl EditorApp {
                 }
             }
             "asset.palette_too_large" => {
-                if let Some(palette_id) = diagnostic.path.as_deref().and_then(|path| path.strip_prefix("palette:")) {
+                if let Some(palette_id) = diagnostic
+                    .path
+                    .as_deref()
+                    .and_then(|path| path.strip_prefix("palette:"))
+                {
                     if let Some(palette) = edited_bundle
                         .palettes
                         .iter_mut()
                         .find(|palette| palette.id == palette_id)
                     {
                         palette.colors.truncate(MAX_COLORS_PER_PALETTE);
-                        status = Some(format!("Trimmed palette '{}' to {} colors", palette.id, MAX_COLORS_PER_PALETTE));
+                        status = Some(format!(
+                            "Trimmed palette '{}' to {} colors",
+                            palette.id, MAX_COLORS_PER_PALETTE
+                        ));
                     }
                 }
             }
             "asset.missing_palette" => {
-                let first_palette = edited_bundle.palettes.first().map(|palette| palette.id.clone());
+                let first_palette = edited_bundle
+                    .palettes
+                    .first()
+                    .map(|palette| palette.id.clone());
                 if let (Some(tileset_id), Some(palette_id)) = (
-                    diagnostic.path.as_deref().and_then(|path| path.strip_prefix("tileset:")),
+                    diagnostic
+                        .path
+                        .as_deref()
+                        .and_then(|path| path.strip_prefix("tileset:")),
                     first_palette,
                 ) {
                     if let Some(tileset) = edited_bundle
@@ -842,17 +793,34 @@ impl EditorApp {
                         .find(|tileset| tileset.id == tileset_id)
                     {
                         tileset.palette_id = palette_id.clone();
-                        status = Some(format!("Reassigned '{}' to palette '{}'", tileset.id, palette_id));
+                        status = Some(format!(
+                            "Reassigned '{}' to palette '{}'",
+                            tileset.id, palette_id
+                        ));
                     }
                 }
             }
             "scene.trigger_missing_script" => {
-                if let Some(scene_id) = diagnostic.path.as_deref().and_then(|path| path.strip_prefix("scene:")) {
-                    if let Some(scene) = edited_bundle.scenes.iter_mut().find(|scene| scene.id == scene_id) {
+                if let Some(scene_id) = diagnostic
+                    .path
+                    .as_deref()
+                    .and_then(|path| path.strip_prefix("scene:"))
+                    .map(|path| path.split(':').next().unwrap_or(path))
+                {
+                    if let Some(scene) = edited_bundle
+                        .scenes
+                        .iter_mut()
+                        .find(|scene| scene.id == scene_id)
+                    {
                         let missing_script_ids = scene
                             .triggers
                             .iter()
-                            .filter(|trigger| scene.scripts.iter().all(|script| script.id != trigger.script_id))
+                            .filter(|trigger| {
+                                scene
+                                    .scripts
+                                    .iter()
+                                    .all(|script| script.id != trigger.script_id)
+                            })
                             .map(|trigger| trigger.script_id.clone())
                             .collect::<Vec<_>>();
                         for script_id in &missing_script_ids {
@@ -862,26 +830,36 @@ impl EditorApp {
                             });
                         }
                         if !missing_script_ids.is_empty() {
-                            status = Some(format!("Added {} missing script stub(s) to '{}'", missing_script_ids.len(), scene.id));
+                            status = Some(format!(
+                                "Added {} missing script stub(s) to '{}'",
+                                missing_script_ids.len(),
+                                scene.id
+                            ));
                         }
                     }
                 }
             }
             "script.dialogue_missing" => {
                 let placeholder_id = "auto_dialogue".to_string();
-                if edited_bundle.dialogues.iter().all(|dialogue| dialogue.id != placeholder_id) {
-                    edited_bundle.dialogues.push(snesmaker_events::DialogueGraph {
-                        id: placeholder_id.clone(),
-                        opening_node: "start".to_string(),
-                        nodes: vec![snesmaker_events::DialogueNode {
-                            id: "start".to_string(),
-                            speaker: "System".to_string(),
-                            text: "Placeholder dialogue".to_string(),
-                            commands: Vec::new(),
-                            choices: Vec::new(),
-                            next: None,
-                        }],
-                    });
+                if edited_bundle
+                    .dialogues
+                    .iter()
+                    .all(|dialogue| dialogue.id != placeholder_id)
+                {
+                    edited_bundle
+                        .dialogues
+                        .push(snesmaker_events::DialogueGraph {
+                            id: placeholder_id.clone(),
+                            opening_node: "start".to_string(),
+                            nodes: vec![snesmaker_events::DialogueNode {
+                                id: "start".to_string(),
+                                speaker: "System".to_string(),
+                                text: "Placeholder dialogue".to_string(),
+                                commands: Vec::new(),
+                                choices: Vec::new(),
+                                next: None,
+                            }],
+                        });
                 }
 
                 let valid_dialogues = edited_bundle
@@ -893,7 +871,11 @@ impl EditorApp {
                 for scene in &mut edited_bundle.scenes {
                     for script in &mut scene.scripts {
                         for command in &mut script.commands {
-                            if let snesmaker_events::EventCommand::ShowDialogue { dialogue_id, .. } = command {
+                            if let snesmaker_events::EventCommand::ShowDialogue {
+                                dialogue_id,
+                                ..
+                            } = command
+                            {
                                 if !valid_dialogues.contains(dialogue_id) {
                                     *dialogue_id = placeholder_id.clone();
                                 }
@@ -901,7 +883,9 @@ impl EditorApp {
                         }
                     }
                 }
-                status = Some("Redirected missing dialogue references to a placeholder dialogue".to_string());
+                status = Some(
+                    "Redirected missing dialogue references to a placeholder dialogue".to_string(),
+                );
             }
             "script.target_scene_missing" => {
                 let fallback_scene = edited_bundle.scenes.first().map(|scene| scene.id.clone());
@@ -914,7 +898,10 @@ impl EditorApp {
                     for scene in &mut edited_bundle.scenes {
                         for script in &mut scene.scripts {
                             for command in &mut script.commands {
-                                if let snesmaker_events::EventCommand::LoadScene { scene_id, .. } = command {
+                                if let snesmaker_events::EventCommand::LoadScene {
+                                    scene_id, ..
+                                } = command
+                                {
                                     if !valid_scenes.contains(scene_id) {
                                         *scene_id = fallback_scene.clone();
                                     }
@@ -922,7 +909,10 @@ impl EditorApp {
                             }
                         }
                     }
-                    status = Some(format!("Redirected missing scene loads to '{}'", fallback_scene));
+                    status = Some(format!(
+                        "Redirected missing scene loads to '{}'",
+                        fallback_scene
+                    ));
                 }
             }
             "scene.duplicate_id" => {
@@ -986,8 +976,7 @@ impl EditorApp {
                 self.workspace.layout = workspace_file.current_layout;
                 self.workspace.saved_layouts = workspace_file.saved_layouts;
                 self.workspace.active_saved_layout = workspace_file.active_saved_layout;
-                self.workspace_preset =
-                    Self::detect_workspace_preset(&self.workspace.layout);
+                self.workspace_preset = Self::detect_workspace_preset(&self.workspace.layout);
                 let active_saved_layout = self
                     .workspace
                     .active_saved_layout
@@ -1147,7 +1136,9 @@ impl EditorApp {
     }
 
     fn move_active_dock_tab_within_slot(&mut self, area: DockArea, direction: i32) {
-        self.workspace.layout.move_active_within_slot(area, direction);
+        self.workspace
+            .layout
+            .move_active_within_slot(area, direction);
         self.mark_workspace_custom();
     }
 
@@ -1167,6 +1158,12 @@ impl EditorApp {
         self.bundle
             .as_ref()
             .and_then(|bundle| bundle.scenes.get(self.selected_scene))
+    }
+
+    fn resolved_current_scene(&self) -> Option<SceneResource> {
+        self.bundle
+            .as_ref()
+            .and_then(|bundle| bundle.resolved_scene_by_index(self.selected_scene))
     }
 
     fn layer(
@@ -1205,6 +1202,59 @@ impl EditorApp {
         let tileset = bundle.tileset(&layer.tileset_id)?;
         let palette = bundle.palette(&tileset.palette_id)?;
         Some((tileset, palette))
+    }
+
+    fn apply_adjacency_rules_to_current_scene(&mut self, rect: TileSelectionRect) -> usize {
+        let layer_index = self.selected_layer;
+        let Some(tileset) = self
+            .active_tileset_and_palette()
+            .map(|(tileset, _)| tileset.clone())
+        else {
+            return 0;
+        };
+        if tileset.adjacency_rules.is_empty() {
+            return 0;
+        }
+
+        self.current_scene_mut()
+            .map(|scene| rebuild_scene_adjacency(scene, layer_index, &tileset, rect))
+            .unwrap_or(0)
+    }
+
+    fn rebuild_adjacency_for_rect(&mut self, rect: TileSelectionRect, label: &str) {
+        let Some(scene_snapshot) = self.current_scene().cloned() else {
+            return;
+        };
+        let Some(tileset) = self
+            .active_tileset_and_palette()
+            .map(|(tileset, _)| tileset.clone())
+        else {
+            self.status = "Active layer tileset is missing.".to_string();
+            return;
+        };
+        if tileset.adjacency_rules.is_empty() {
+            self.status = format!("No auto-tiling rules are defined for '{}'.", tileset.name);
+            return;
+        }
+
+        let layer_index = self
+            .selected_layer
+            .min(scene_snapshot.layers.len().saturating_sub(1));
+        let mut updated_scene = scene_snapshot.clone();
+        let changed = rebuild_scene_adjacency(&mut updated_scene, layer_index, &tileset, rect);
+        if changed == 0 {
+            self.status = format!("No auto-tiling changes were needed for {}.", label);
+            return;
+        }
+
+        self.capture_history();
+        if let Some(scene) = self.current_scene_mut() {
+            *scene = updated_scene;
+        }
+        self.mark_edited(format!(
+            "Rebuilt auto-tiling for {} ({} tile(s) updated)",
+            label, changed
+        ));
     }
 
     fn is_layer_locked(&self, scene_index: usize, layer_index: usize) -> bool {
@@ -1661,6 +1711,17 @@ impl EditorApp {
                     .map(|selection| (selection.rect.min_x, selection.rect.min_y))
             })
             .unwrap_or((0, 0));
+        self.paste_clipboard_at_anchor(clipboard, anchor);
+    }
+
+    fn paste_clipboard_at_anchor(&mut self, clipboard: SceneClipboard, anchor: (usize, usize)) {
+        if self.active_layer_locked() {
+            self.status = self
+                .current_layer()
+                .map(|layer| format!("Layer '{}' is locked.", layer.id))
+                .unwrap_or_else(|| "Active layer is locked.".to_string());
+            return;
+        }
         let origin = PointI16 {
             x: (anchor.0 * 8) as i16,
             y: (anchor.1 * 8) as i16,
@@ -1769,20 +1830,97 @@ impl EditorApp {
         }
 
         self.selection = Some(new_selection);
+        let autotile_changes = self.apply_adjacency_rules_to_current_scene(pasted_rect);
         let layer_name = self
             .current_layer()
             .map(|layer| layer.id.as_str())
             .unwrap_or("layer");
-        self.mark_edited(format!(
+        let status = format!(
             "Pasted selection into '{}' at {}, {}",
             layer_name, anchor.0, anchor.1
-        ));
+        );
+        if autotile_changes > 0 {
+            self.mark_edited(format!("{status} + auto-tiling"));
+        } else {
+            self.mark_edited(status);
+        }
+    }
+
+    fn apply_asset_drop_to_scene(&mut self, payload: AssetDragPayload, anchor: (usize, usize)) {
+        match payload {
+            AssetDragPayload::Prefab { id, .. } => {
+                self.place_prefab_instance_at(&id, anchor);
+            }
+            AssetDragPayload::Brush { name, .. } => {
+                self.load_brush_into_clipboard(&name);
+                if let Some(clipboard) = self.clipboard.clone() {
+                    self.paste_clipboard_at_anchor(clipboard, anchor);
+                }
+            }
+            AssetDragPayload::LegacySnippet { name, .. } => {
+                self.load_snippet_into_clipboard(&name);
+                if let Some(clipboard) = self.clipboard.clone() {
+                    self.paste_clipboard_at_anchor(clipboard, anchor);
+                }
+            }
+            AssetDragPayload::Script { .. } => {
+                self.status =
+                    "Drop scripts onto trigger fields or prefab trigger overrides.".to_string();
+            }
+            AssetDragPayload::Visual { .. } => {
+                self.status =
+                    "Drop visuals onto entity visual fields or use the Animation tab.".to_string();
+            }
+        }
+    }
+
+    fn handle_scene_asset_drop(&mut self, ctx: &egui::Context, outcome: &SceneCanvasOutcome) {
+        if !ctx.input(|input| input.pointer.any_released()) {
+            return;
+        }
+
+        let Some(payload) = self.asset_drag_payload.clone() else {
+            return;
+        };
+
+        if let Some(anchor) = outcome.hovered_tile {
+            self.apply_asset_drop_to_scene(payload, anchor);
+        }
+        self.asset_drag_payload = None;
+    }
+
+    fn draw_asset_drag_preview(&self, ctx: &egui::Context) {
+        let Some(payload) = &self.asset_drag_payload else {
+            return;
+        };
+        let Some(pointer_pos) = ctx.input(|input| input.pointer.latest_pos()) else {
+            return;
+        };
+
+        let painter =
+            ctx.layer_painter(LayerId::new(Order::Tooltip, Id::new("asset_drag_preview")));
+        let text = format!("Drop: {}", payload.label());
+        let font = FontId::proportional(13.0);
+        let galley = painter.layout_no_wrap(text, font.clone(), Color32::WHITE);
+        let rect = Rect::from_min_size(
+            pointer_pos + Vec2::new(16.0, 16.0),
+            galley.size() + Vec2::new(16.0, 12.0),
+        );
+        painter.rect_filled(rect, 6.0, Color32::from_rgba_premultiplied(18, 26, 34, 232));
+        painter.rect_stroke(
+            rect,
+            6.0,
+            (1.0, Color32::from_rgb(118, 144, 172)),
+            StrokeKind::Inside,
+        );
+        painter.galley(rect.min + Vec2::new(8.0, 6.0), galley, Color32::WHITE);
     }
 
     fn is_asset_favorite(&self, kind: &str, id: &str) -> bool {
         let favorites = &self.workspace_addons.editor_favorites;
         match kind {
             "scene" => favorites.scenes.iter().any(|value| value == id),
+            "prefab" => favorites.prefabs.iter().any(|value| value == id),
             "palette" => favorites.palettes.iter().any(|value| value == id),
             "tileset" => favorites.tilesets.iter().any(|value| value == id),
             "metasprite" => favorites.metasprites.iter().any(|value| value == id),
@@ -1796,6 +1934,7 @@ impl EditorApp {
     fn toggle_asset_favorite(&mut self, kind: &str, id: &str) {
         let values = match kind {
             "scene" => &mut self.workspace_addons.editor_favorites.scenes,
+            "prefab" => &mut self.workspace_addons.editor_favorites.prefabs,
             "palette" => &mut self.workspace_addons.editor_favorites.palettes,
             "tileset" => &mut self.workspace_addons.editor_favorites.tilesets,
             "metasprite" => &mut self.workspace_addons.editor_favorites.metasprites,
@@ -1831,6 +1970,35 @@ impl EditorApp {
         next_unique_layer_id(&used, prefix)
     }
 
+    fn next_prefab_id(&self, prefix: &str) -> String {
+        let used = self
+            .bundle
+            .as_ref()
+            .map(|bundle| {
+                bundle
+                    .unique_ids()
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect::<BTreeSet<_>>()
+            })
+            .unwrap_or_default();
+        next_unique_layer_id(&used, prefix)
+    }
+
+    fn next_prefab_instance_id(&self, prefab_id: &str) -> String {
+        let used = self
+            .current_scene()
+            .map(|scene| {
+                scene
+                    .prefab_instances
+                    .iter()
+                    .map(|instance| instance.id.clone())
+                    .collect::<BTreeSet<_>>()
+            })
+            .unwrap_or_default();
+        next_unique_layer_id(&used, &format!("{}_instance", prefab_id))
+    }
+
     fn save_selection_as_brush(&mut self) {
         let Some(selection) = &self.selection else {
             self.status = "Select a region before saving a brush.".to_string();
@@ -1861,15 +2029,30 @@ impl EditorApp {
                 brush
                     .tiles
                     .push(layer.tiles.get(cell_index).copied().unwrap_or_default());
-                brush
-                    .solids
-                    .push(scene.collision.solids.get(cell_index).copied().unwrap_or(false));
-                brush
-                    .ladders
-                    .push(scene.collision.ladders.get(cell_index).copied().unwrap_or(false));
-                brush
-                    .hazards
-                    .push(scene.collision.hazards.get(cell_index).copied().unwrap_or(false));
+                brush.solids.push(
+                    scene
+                        .collision
+                        .solids
+                        .get(cell_index)
+                        .copied()
+                        .unwrap_or(false),
+                );
+                brush.ladders.push(
+                    scene
+                        .collision
+                        .ladders
+                        .get(cell_index)
+                        .copied()
+                        .unwrap_or(false),
+                );
+                brush.hazards.push(
+                    scene
+                        .collision
+                        .hazards
+                        .get(cell_index)
+                        .copied()
+                        .unwrap_or(false),
+                );
             }
         }
 
@@ -1880,9 +2063,9 @@ impl EditorApp {
         self.status = format!("Saved brush '{}'", label);
     }
 
-    fn save_selection_as_snippet(&mut self) {
+    fn save_selection_as_prefab(&mut self) {
         let Some(selection) = &self.selection else {
-            self.status = "Select a region before saving a snippet.".to_string();
+            self.status = "Select a region before saving a prefab.".to_string();
             return;
         };
         let Some(scene) = self.current_scene() else {
@@ -1893,37 +2076,51 @@ impl EditorApp {
         let height = selection.rect.height_tiles();
         let scene_width = scene.size_tiles.width as usize;
         let origin = selection.rect.origin_pixels();
-        let mut snippet = SavedSceneSnippet {
-            name: self.next_snippet_name("scene_snippet"),
+        let prefab_id = self.next_prefab_id("scene_prefab");
+        let mut prefab = PrefabResource {
+            id: prefab_id.clone(),
+            name: prefab_id.clone(),
             source_scene_id: Some(scene.id.clone()),
             scene_kind: scene.kind,
             size_tiles: snesmaker_project::GridSize {
                 width: width as u16,
                 height: height as u16,
             },
-            ..SavedSceneSnippet::default()
+            ..PrefabResource::default()
         };
 
         for tile_y in selection.rect.min_y..=selection.rect.max_y {
             for tile_x in selection.rect.min_x..=selection.rect.max_x {
                 let cell_index = tile_y * scene_width + tile_x;
-                snippet
-                    .collision
-                    .solids
-                    .push(scene.collision.solids.get(cell_index).copied().unwrap_or(false));
-                snippet
-                    .collision
-                    .ladders
-                    .push(scene.collision.ladders.get(cell_index).copied().unwrap_or(false));
-                snippet
-                    .collision
-                    .hazards
-                    .push(scene.collision.hazards.get(cell_index).copied().unwrap_or(false));
+                prefab.collision.solids.push(
+                    scene
+                        .collision
+                        .solids
+                        .get(cell_index)
+                        .copied()
+                        .unwrap_or(false),
+                );
+                prefab.collision.ladders.push(
+                    scene
+                        .collision
+                        .ladders
+                        .get(cell_index)
+                        .copied()
+                        .unwrap_or(false),
+                );
+                prefab.collision.hazards.push(
+                    scene
+                        .collision
+                        .hazards
+                        .get(cell_index)
+                        .copied()
+                        .unwrap_or(false),
+                );
             }
         }
 
         for layer in &scene.layers {
-            let mut snippet_layer = TileLayer {
+            let mut prefab_layer = TileLayer {
                 id: layer.id.clone(),
                 tileset_id: layer.tileset_id.clone(),
                 visible: layer.visible,
@@ -1934,15 +2131,15 @@ impl EditorApp {
             for tile_y in selection.rect.min_y..=selection.rect.max_y {
                 for tile_x in selection.rect.min_x..=selection.rect.max_x {
                     let cell_index = tile_y * scene_width + tile_x;
-                    snippet_layer
+                    prefab_layer
                         .tiles
                         .push(layer.tiles.get(cell_index).copied().unwrap_or_default());
                 }
             }
-            snippet.layers.push(snippet_layer);
+            prefab.layers.push(prefab_layer);
         }
 
-        snippet.spawns = selection
+        prefab.spawns = selection
             .spawns
             .iter()
             .filter_map(|index| scene.spawns.get(*index))
@@ -1953,7 +2150,7 @@ impl EditorApp {
                 spawn
             })
             .collect();
-        snippet.checkpoints = selection
+        prefab.checkpoints = selection
             .checkpoints
             .iter()
             .filter_map(|index| scene.checkpoints.get(*index))
@@ -1964,7 +2161,7 @@ impl EditorApp {
                 checkpoint
             })
             .collect();
-        snippet.entities = selection
+        prefab.entities = selection
             .entities
             .iter()
             .filter_map(|index| scene.entities.get(*index))
@@ -1975,7 +2172,7 @@ impl EditorApp {
                 entity
             })
             .collect();
-        snippet.triggers = selection
+        prefab.triggers = selection
             .triggers
             .iter()
             .filter_map(|index| scene.triggers.get(*index))
@@ -1987,11 +2184,51 @@ impl EditorApp {
             })
             .collect();
 
-        let label = snippet.name.clone();
-        self.workspace_addons.scene_library.snippets.push(snippet);
-        self.workspace_addons.scene_library.normalize();
-        self.persist_workspace_addons();
-        self.status = format!("Saved scene snippet '{}'", label);
+        let label = prefab.name.clone();
+        self.capture_history();
+        if let Some(bundle) = &mut self.bundle {
+            bundle.prefabs.push(prefab);
+            bundle.prefabs.sort_by(|left, right| {
+                left.name
+                    .cmp(&right.name)
+                    .then_with(|| left.id.cmp(&right.id))
+            });
+        }
+        self.mark_edited(format!("Saved prefab '{}'", label));
+    }
+
+    fn place_prefab_instance_at(&mut self, prefab_id: &str, tile_anchor: (usize, usize)) {
+        let Some(prefab) = self
+            .bundle
+            .as_ref()
+            .and_then(|bundle| bundle.prefab(prefab_id))
+            .cloned()
+        else {
+            self.status = format!("Prefab '{}' is missing.", prefab_id);
+            return;
+        };
+
+        let instance_id = self.next_prefab_instance_id(prefab_id);
+        self.capture_history();
+        if let Some(scene) = self.current_scene_mut() {
+            scene.prefab_instances.push(PrefabInstance {
+                id: instance_id.clone(),
+                prefab_id: prefab.id.clone(),
+                position: PointI16 {
+                    x: (tile_anchor.0 * 8) as i16,
+                    y: (tile_anchor.1 * 8) as i16,
+                },
+                entity_overrides: Vec::new(),
+                trigger_overrides: Vec::new(),
+            });
+            self.selected_prefab_instance = Some(scene.prefab_instances.len() - 1);
+        }
+        self.tool = EditorTool::Prefab;
+        self.preview_focus = PreviewFocus::None;
+        self.mark_edited(format!(
+            "Placed prefab '{}' as instance '{}'",
+            prefab.name, instance_id
+        ));
     }
 
     fn load_brush_into_clipboard(&mut self, name: &str) {
@@ -2018,6 +2255,35 @@ impl EditorApp {
             triggers: Vec::new(),
         });
         self.status = format!("Loaded brush '{}' into the clipboard", brush.name);
+    }
+
+    fn load_prefab_into_clipboard(&mut self, id: &str) {
+        let Some(prefab) = self
+            .bundle
+            .as_ref()
+            .and_then(|bundle| bundle.prefab(id))
+            .cloned()
+        else {
+            return;
+        };
+        let tiles = prefab
+            .layers
+            .first()
+            .map(|layer| layer.tiles.clone())
+            .unwrap_or_default();
+        self.clipboard = Some(SceneClipboard {
+            width_tiles: prefab.size_tiles.width as usize,
+            height_tiles: prefab.size_tiles.height as usize,
+            tiles,
+            solids: prefab.collision.solids,
+            ladders: prefab.collision.ladders,
+            hazards: prefab.collision.hazards,
+            spawns: prefab.spawns,
+            checkpoints: prefab.checkpoints,
+            entities: prefab.entities,
+            triggers: prefab.triggers,
+        });
+        self.status = format!("Loaded prefab '{}' into the clipboard", prefab.name);
     }
 
     fn load_snippet_into_clipboard(&mut self, name: &str) {
@@ -2048,10 +2314,69 @@ impl EditorApp {
             entities: snippet.entities,
             triggers: snippet.triggers,
         });
-        self.status = format!(
-            "Loaded scene snippet '{}' into the clipboard",
-            snippet.name
-        );
+        self.status = format!("Loaded scene snippet '{}' into the clipboard", snippet.name);
+    }
+
+    fn promote_legacy_snippet_to_prefab(&mut self, name: &str) {
+        let Some(snippet) = self
+            .workspace_addons
+            .scene_library
+            .snippets
+            .iter()
+            .find(|snippet| snippet.name.eq_ignore_ascii_case(name))
+            .cloned()
+        else {
+            return;
+        };
+
+        let prefab_id = self.next_prefab_id(&snippet.name);
+        let prefab = PrefabResource {
+            id: prefab_id.clone(),
+            name: snippet.name.clone(),
+            source_scene_id: snippet.source_scene_id.clone(),
+            scene_kind: snippet.scene_kind,
+            size_tiles: snippet.size_tiles,
+            layers: snippet.layers.clone(),
+            collision: snippet.collision.clone(),
+            spawns: snippet.spawns.clone(),
+            checkpoints: snippet.checkpoints.clone(),
+            entities: snippet.entities.clone(),
+            triggers: snippet.triggers.clone(),
+        };
+
+        self.capture_history();
+        if let Some(bundle) = &mut self.bundle {
+            bundle.prefabs.push(prefab);
+            bundle.prefabs.sort_by(|left, right| {
+                left.name
+                    .cmp(&right.name)
+                    .then_with(|| left.id.cmp(&right.id))
+            });
+        }
+        self.mark_edited(format!(
+            "Promoted legacy snippet '{}' to prefab '{}'",
+            snippet.name, prefab_id
+        ));
+    }
+
+    fn swap_prefab_instance_source(&mut self, instance_index: usize, prefab_id: &str) {
+        let Some(prefab) = self
+            .bundle
+            .as_ref()
+            .and_then(|bundle| bundle.prefab(prefab_id))
+        else {
+            return;
+        };
+        let prefab_name = prefab.name.clone();
+        self.capture_history();
+        if let Some(scene) = self.current_scene_mut() {
+            if let Some(instance) = scene.prefab_instances.get_mut(instance_index) {
+                instance.prefab_id = prefab_id.to_string();
+                instance.entity_overrides.clear();
+                instance.trigger_overrides.clear();
+            }
+        }
+        self.mark_edited(format!("Retargeted prefab instance to '{}'", prefab_name));
     }
 
     fn sample_tile_from_cell(&mut self, cell_index: usize) {
@@ -2126,6 +2451,7 @@ impl EditorApp {
         }
 
         if edited {
+            let autotile_changes = self.apply_adjacency_rules_to_current_scene(rect);
             let status = match action {
                 SelectionAction::PaintTile(0) => {
                     format!(
@@ -2167,7 +2493,11 @@ impl EditorApp {
                     width_tiles, height_tiles
                 ),
             };
-            self.mark_edited(status);
+            if autotile_changes > 0 {
+                self.mark_edited(format!("{status} + auto-tiling"));
+            } else {
+                self.mark_edited(status);
+            }
         }
     }
 
@@ -2198,7 +2528,12 @@ impl EditorApp {
                 }
             }
         }
-        self.mark_edited("Drew a line across the current selection");
+        let autotile_changes = self.apply_adjacency_rules_to_current_scene(selection_rect);
+        if autotile_changes > 0 {
+            self.mark_edited("Drew a line across the current selection + auto-tiling");
+        } else {
+            self.mark_edited("Drew a line across the current selection");
+        }
     }
 
     fn mirror_selection(&mut self, horizontal: bool) {
@@ -2244,11 +2579,17 @@ impl EditorApp {
                 }
             }
         }
-        self.mark_edited(if horizontal {
+        let autotile_changes = self.apply_adjacency_rules_to_current_scene(selection_rect);
+        let status = if horizontal {
             "Mirrored the current selection horizontally"
         } else {
             "Mirrored the current selection vertically"
-        });
+        };
+        if autotile_changes > 0 {
+            self.mark_edited(format!("{status} + auto-tiling"));
+        } else {
+            self.mark_edited(status);
+        }
     }
 
     fn flood_fill_from_hovered_tile(&mut self) {
@@ -2274,8 +2615,8 @@ impl EditorApp {
                     return;
                 };
                 if source_tile == replacement {
-                    self.status = "Flood fill skipped because the target tile already matches."
-                        .to_string();
+                    self.status =
+                        "Flood fill skipped because the target tile already matches.".to_string();
                     return;
                 }
 
@@ -2305,7 +2646,21 @@ impl EditorApp {
                 }
             }
         }
-        self.mark_edited("Flood-filled the current layer");
+        let flood_rect = self
+            .current_scene()
+            .map(|scene| TileSelectionRect {
+                min_x: 0,
+                min_y: 0,
+                max_x: scene.size_tiles.width.saturating_sub(1) as usize,
+                max_y: scene.size_tiles.height.saturating_sub(1) as usize,
+            })
+            .unwrap_or_default();
+        let autotile_changes = self.apply_adjacency_rules_to_current_scene(flood_rect);
+        if autotile_changes > 0 {
+            self.mark_edited("Flood-filled the current layer + auto-tiling");
+        } else {
+            self.mark_edited("Flood-filled the current layer");
+        }
     }
 
     fn project_sprite_source_dir(&self) -> Utf8PathBuf {
@@ -2393,6 +2748,22 @@ impl EditorApp {
                     parts.join(" | ")
                 }
             }
+            "prefab" => {
+                let Some(prefab) = bundle.prefab(id) else {
+                    return "Missing prefab".to_string();
+                };
+                let object_count = prefab.spawns.len()
+                    + prefab.checkpoints.len()
+                    + prefab.entities.len()
+                    + prefab.triggers.len();
+                let mut parts = Vec::new();
+                if let Some(source_scene_id) = prefab.source_scene_id.as_deref() {
+                    parts.push(format!("source {}", source_scene_id));
+                }
+                parts.push(format!("{} layer(s)", prefab.layers.len()));
+                parts.push(format!("{} object(s)", object_count));
+                parts.join(" | ")
+            }
             "palette" => {
                 let tilesets = bundle
                     .tilesets
@@ -2419,7 +2790,12 @@ impl EditorApp {
                 let animations = bundle
                     .animations
                     .iter()
-                    .filter(|animation| animation.frames.iter().any(|frame| frame.metasprite_id == id))
+                    .filter(|animation| {
+                        animation
+                            .frames
+                            .iter()
+                            .any(|frame| frame.metasprite_id == id)
+                    })
                     .count();
                 let entities = bundle
                     .scenes
@@ -2427,7 +2803,10 @@ impl EditorApp {
                     .flat_map(|scene| scene.entities.iter())
                     .filter(|entity| entity.archetype == id)
                     .count();
-                format!("{} animation(s) | {} entity placement(s)", animations, entities)
+                format!(
+                    "{} animation(s) | {} entity placement(s)",
+                    animations, entities
+                )
             }
             "animation" => {
                 let entities = bundle
@@ -2482,21 +2861,36 @@ impl EditorApp {
     }
 
     fn seed_import_ids_from_path(&mut self, path: &Path) {
-        let stem = path
+        let source_label = path
             .file_stem()
             .and_then(|stem| stem.to_str())
-            .map(slugify)
-            .unwrap_or_else(|| "imported_sprite".to_string());
+            .unwrap_or("imported_sprite");
         let should_seed_base =
             self.import_state.base_id.is_empty() || self.import_state.base_id == "player_run";
         let should_seed_animation = self.import_state.animation_id.is_empty()
             || self.import_state.animation_id == "player_run";
+        let suggested = self
+            .bundle
+            .as_ref()
+            .map(|bundle| suggest_sprite_sheet_ids(bundle, source_label))
+            .unwrap_or_else(|| {
+                let stem = slugify(source_label);
+                let stem = if stem.is_empty() {
+                    "imported_sprite".to_string()
+                } else {
+                    stem
+                };
+                snesmaker_assets::SuggestedImportIds {
+                    base_id: stem.clone(),
+                    animation_id: format!("{stem}_anim"),
+                }
+            });
 
         if should_seed_base {
-            self.import_state.base_id = stem.clone();
+            self.import_state.base_id = suggested.base_id;
         }
         if should_seed_animation {
-            self.import_state.animation_id = stem;
+            self.import_state.animation_id = suggested.animation_id;
         }
     }
 
@@ -2586,8 +2980,7 @@ impl EditorApp {
             .and_then(|text| {
                 serde_json::from_str::<BuildOutcome>(&text)
                     .with_context(|| format!("failed to parse {}", path))
-            })
-        {
+            }) {
             Ok(outcome) => {
                 self.last_build_outcome = Some(outcome);
             }
@@ -2667,10 +3060,7 @@ impl EditorApp {
 
                 match Command::new(&emulator).arg(&outcome.rom_path).spawn() {
                     Ok(_) => {
-                        let message = format!(
-                            "Launched '{}' with {}",
-                            emulator, outcome.rom_path
-                        );
+                        let message = format!("Launched '{}' with {}", emulator, outcome.rom_path);
                         self.playtest_state.last_status = message.clone();
                         self.status = message;
                     }
@@ -2706,8 +3096,11 @@ impl EditorApp {
             .or_else(|| bundle.manifest.gameplay.physics_presets.first().cloned())
     }
 
+    #[allow(unreachable_code)]
     fn reset_playtest_session(&mut self) {
-        let Some(scene) = self.current_scene().cloned() else {
+        self.reset_playtest_session_impl();
+        return;
+        let Some(scene) = self.resolved_current_scene() else {
             self.playtest_state.session = None;
             return;
         };
@@ -2725,7 +3118,10 @@ impl EditorApp {
                     format!("Started '{}' from its default start", scene.id);
             }
             PlaytestStartMode::SelectedSpawn => {
-                if let Some(index) = self.selected_spawn.and_then(|index| scene.spawns.get(index)) {
+                if let Some(index) = self
+                    .selected_spawn
+                    .and_then(|index| scene.spawns.get(index))
+                {
                     let _ = session.reset_to_spawn_id(&index.id);
                     self.playtest_state.last_status =
                         format!("Started '{}' from spawn '{}'", scene.id, index.id);
@@ -2741,10 +3137,8 @@ impl EditorApp {
                     .and_then(|index| scene.checkpoints.get(index))
                 {
                     let _ = session.reset_to_checkpoint_id(&index.id);
-                    self.playtest_state.last_status = format!(
-                        "Started '{}' from checkpoint '{}'",
-                        scene.id, index.id
-                    );
+                    self.playtest_state.last_status =
+                        format!("Started '{}' from checkpoint '{}'", scene.id, index.id);
                 } else {
                     session.reset_to_default_start();
                     self.playtest_state.last_status =
@@ -2759,7 +3153,10 @@ impl EditorApp {
         self.playtest_state.selected_physics_id = profile_id;
     }
 
+    #[allow(unreachable_code)]
     fn step_playtest_session(&mut self, input: InputFrame) {
+        self.step_playtest_session_impl(input);
+        return;
         if self.playtest_state.session.is_none() {
             self.reset_playtest_session();
         }
@@ -2914,9 +3311,10 @@ impl EditorApp {
         };
 
         let mut edited_bundle = bundle.clone();
-        let result = import_sprite_sheet_into_bundle(
+        let request = self.import_state.to_request();
+        let result = import_sprite_sheet_into_bundle_shared(
             &mut edited_bundle,
-            &self.import_state,
+            &request,
             &preview.rgba,
             preview.size,
         );
@@ -2925,7 +3323,10 @@ impl EditorApp {
             Ok(summary) => {
                 self.capture_history();
                 self.bundle = Some(edited_bundle);
-                self.mark_edited(summary);
+                self.mark_edited(format!(
+                    "Imported {} frame(s) into '{}' and created animation '{}'",
+                    request.frame_count, summary.tileset_id, summary.animation_id
+                ));
                 self.import_state.status = "Imported sprite sheet.".to_string();
                 self.sync_selection();
             }
@@ -3130,7 +3531,10 @@ impl EditorApp {
                     ui.separator();
                     ui.label("Workspace");
                     workspace_changed |= ui
-                        .checkbox(&mut self.workspace.layout.show_status_bar, "Show Status Bar")
+                        .checkbox(
+                            &mut self.workspace.layout.show_status_bar,
+                            "Show Status Bar",
+                        )
                         .changed();
                     ui.separator();
                     ui.label("Dock Tabs");
@@ -3219,7 +3623,7 @@ impl EditorApp {
         let mut pending_layer_visibility = None;
         let mut pending_layer_lock = None;
         let mut pending_tile_selection = None;
-        let Some(bundle) = &self.bundle else {
+        let Some(bundle) = self.bundle.clone() else {
             ui.heading("Project");
             ui.label("No project loaded.");
             if ui.button("Open Project...").clicked() {
@@ -3262,13 +3666,11 @@ impl EditorApp {
                             pending_layer_visibility = Some(index);
                         }
                         if ui
-                            .small_button(
-                                if self.is_layer_locked(self.selected_scene, index) {
-                                    "Unlock"
-                                } else {
-                                    "Lock"
-                                },
-                            )
+                            .small_button(if self.is_layer_locked(self.selected_scene, index) {
+                                "Unlock"
+                            } else {
+                                "Lock"
+                            })
                             .clicked()
                         {
                             pending_layer_lock = Some(index);
@@ -3292,6 +3694,7 @@ impl EditorApp {
                 EditorTool::Checkpoint,
                 EditorTool::Entity,
                 EditorTool::Trigger,
+                EditorTool::Prefab,
             ] {
                 ui.selectable_value(&mut self.tool, tool, tool.label());
             }
@@ -3303,7 +3706,11 @@ impl EditorApp {
             format!(
                 "Layer: {}{}{}",
                 active_layer.id,
-                if active_layer.visible { "" } else { " [hidden]" },
+                if active_layer.visible {
+                    ""
+                } else {
+                    " [hidden]"
+                },
                 if self.active_layer_locked() {
                     " [locked]"
                 } else {
@@ -3313,25 +3720,103 @@ impl EditorApp {
         });
         let active_tileset = self
             .active_tileset_and_palette()
-            .map(|(tileset, palette)| (tileset.name.clone(), tileset.tiles.clone(), palette.clone()));
+            .map(|(tileset, palette)| (tileset.clone(), palette.clone()));
         if let Some(label) = active_layer_label {
             ui.label(label);
         }
-        if let Some((tileset_name, tiles, palette)) = active_tileset {
-            ui.label(format!("Tileset: {}", tileset_name));
+        if let Some((tileset, palette)) = active_tileset {
+            ui.label(format!("Tileset: {}", tileset.name));
             egui::ScrollArea::vertical()
                 .max_height(260.0)
                 .show(ui, |ui| {
                     ui.horizontal_wrapped(|ui| {
-                        for (index, tile) in tiles.iter().enumerate() {
-                            let response =
-                                draw_tile_button(ui, tile, &palette, 2.0, self.selected_tile == index);
+                        for (index, tile) in tileset.tiles.iter().enumerate() {
+                            let response = draw_tile_button(
+                                ui,
+                                tile,
+                                &palette,
+                                2.0,
+                                self.selected_tile == index,
+                            );
                             if response.clicked() {
                                 pending_tile_selection = Some(index);
                             }
                         }
                     });
                 });
+
+            ui.separator();
+            ui.heading("Auto-Tiling");
+            if tileset.adjacency_rules.is_empty() {
+                ui.label("No adjacency rules are defined for this tileset yet.");
+            } else {
+                ui.checkbox(&mut self.show_adjacency_debug, "Debug hovered tile");
+                for rule in &tileset.adjacency_rules {
+                    let label = if rule.name.trim().is_empty() {
+                        rule.id.as_str()
+                    } else {
+                        rule.name.as_str()
+                    };
+                    ui.small(format!(
+                        "{} [{}] -> {} variant mask(s)",
+                        label,
+                        rule_source_label(rule.source),
+                        rule.mask_tiles.len()
+                    ));
+                }
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("Rebuild Selection").clicked() {
+                        if let Some(selection) = self.selection.as_ref() {
+                            self.rebuild_adjacency_for_rect(selection.rect, "the selection");
+                        } else {
+                            self.status =
+                                "Select a region before rebuilding auto-tiling.".to_string();
+                        }
+                    }
+                    if ui.button("Rebuild Scene").clicked() {
+                        if let Some(scene) = self.current_scene() {
+                            self.rebuild_adjacency_for_rect(
+                                TileSelectionRect {
+                                    min_x: 0,
+                                    min_y: 0,
+                                    max_x: scene.size_tiles.width.saturating_sub(1) as usize,
+                                    max_y: scene.size_tiles.height.saturating_sub(1) as usize,
+                                },
+                                "the scene",
+                            );
+                        }
+                    }
+                });
+
+                if self.show_adjacency_debug {
+                    if let (Some(scene), Some(hovered_tile)) =
+                        (self.current_scene(), self.last_canvas_tile)
+                    {
+                        let debug = hovered_adjacency_debug(
+                            scene,
+                            self.selected_layer
+                                .min(scene.layers.len().saturating_sub(1)),
+                            &tileset,
+                            hovered_tile,
+                        );
+                        if debug.is_empty() {
+                            ui.small("Hover a participating tile to inspect its adjacency mask.");
+                        } else {
+                            for entry in debug {
+                                ui.small(format!(
+                                    "{} [{}] mask {:04b} -> tile {}",
+                                    entry.rule_name,
+                                    rule_source_label(entry.source),
+                                    entry.mask,
+                                    entry.tile_index
+                                ));
+                            }
+                        }
+                    } else {
+                        ui.small("Hover a tile in the scene to inspect adjacency.");
+                    }
+                }
+            }
         } else {
             ui.label("Active layer tileset or palette is missing.");
         }
@@ -3407,6 +3892,17 @@ impl EditorApp {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
+        let prefab_ids = self
+            .bundle
+            .as_ref()
+            .map(|bundle| {
+                bundle
+                    .prefabs
+                    .iter()
+                    .map(|prefab| prefab.id.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
 
         let Some(scene_snapshot) = scene_snapshot else {
             ui.heading("Inspector");
@@ -3432,6 +3928,8 @@ impl EditorApp {
         self.draw_project_settings(ui);
         ui.separator();
         self.draw_animation_inspector(ui, animation_snapshot.as_ref(), &metasprite_ids);
+        ui.separator();
+        self.draw_prefab_instance_inspector(ui, &scene_snapshot, &prefab_ids);
         ui.separator();
         self.draw_spawn_inspector(ui, &scene_snapshot);
         ui.separator();
@@ -3641,83 +4139,330 @@ impl EditorApp {
         animation_snapshot: Option<&AnimationResource>,
         metasprite_ids: &[String],
     ) {
-        ui.collapsing("Animation Frames", |ui| {
-            let Some(animation_snapshot) = animation_snapshot else {
-                ui.label("No animation selected.");
-                return;
-            };
+        draw_animation_inspector_impl(self, ui, animation_snapshot, metasprite_ids);
+    }
 
-            ui.label(format!("Selected animation: {}", animation_snapshot.id));
-            if metasprite_ids.is_empty() {
-                ui.label("Import or create a metasprite to start building frames.");
-                return;
+    fn draw_prefab_instance_inspector(
+        &mut self,
+        ui: &mut egui::Ui,
+        scene_snapshot: &SceneResource,
+        prefab_ids: &[String],
+    ) {
+        ui.collapsing("Prefab Instances", |ui| {
+            ui.horizontal(|ui| {
+                if ui.button("+ Instance").clicked() {
+                    if let Some(prefab_id) = prefab_ids.first() {
+                        self.place_prefab_instance_at(
+                            prefab_id,
+                            self.last_canvas_tile.unwrap_or((0, 0)),
+                        );
+                    } else {
+                        self.status = "Create or save a prefab before placing one.".to_string();
+                    }
+                }
+                if ui.button("- Remove").clicked() {
+                    if let Some(index) = self.selected_prefab_instance {
+                        self.capture_history();
+                        if let Some(scene) = self.current_scene_mut() {
+                            if index < scene.prefab_instances.len() {
+                                scene.prefab_instances.remove(index);
+                            }
+                        }
+                        self.selected_prefab_instance = None;
+                        self.mark_edited("Removed prefab instance");
+                    }
+                }
+            });
+
+            for (index, instance) in scene_snapshot.prefab_instances.iter().enumerate() {
+                let label = format!("{} ({})", instance.id, instance.prefab_id);
+                if ui
+                    .selectable_label(self.selected_prefab_instance == Some(index), label)
+                    .clicked()
+                {
+                    self.selected_prefab_instance = Some(index);
+                    self.tool = EditorTool::Prefab;
+                    self.preview_focus = PreviewFocus::None;
+                }
             }
 
-            let mut edited = animation_snapshot.clone();
-            let mut changed = false;
-            let mut remove_index = None;
+            if let Some(index) = self.selected_prefab_instance {
+                if let Some(instance) = scene_snapshot.prefab_instances.get(index) {
+                    let mut edited = instance.clone();
+                    let mut changed = false;
 
-            for (index, frame) in edited.frames.iter_mut().enumerate() {
-                ui.group(|ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(format!("Frame {}", index + 1));
-                        egui::ComboBox::from_id_salt((
-                            "animation_frame",
-                            self.selected_animation,
-                            index,
-                        ))
-                        .selected_text(&frame.metasprite_id)
+                    changed |= ui.text_edit_singleline(&mut edited.id).changed();
+                    let source_prefab = self
+                        .bundle
+                        .as_ref()
+                        .and_then(|bundle| bundle.prefab(&edited.prefab_id))
+                        .cloned();
+
+                    let source_button =
+                        ui.button(format!("Drop Prefab Here: {}", edited.prefab_id));
+                    if let Some(AssetDragPayload::Prefab { id, .. }) =
+                        self.asset_drag_payload.clone()
+                    {
+                        if source_button.hovered() && ui.input(|input| input.pointer.any_released())
+                        {
+                            self.asset_drag_payload = None;
+                            self.swap_prefab_instance_source(index, &id);
+                            return;
+                        }
+                    }
+
+                    egui::ComboBox::from_label("Source Prefab")
+                        .selected_text(if edited.prefab_id.is_empty() {
+                            "Choose prefab"
+                        } else {
+                            edited.prefab_id.as_str()
+                        })
                         .show_ui(ui, |ui| {
-                            for metasprite_id in metasprite_ids {
+                            for prefab_id in prefab_ids {
                                 changed |= ui
                                     .selectable_value(
-                                        &mut frame.metasprite_id,
-                                        metasprite_id.clone(),
-                                        metasprite_id,
+                                        &mut edited.prefab_id,
+                                        prefab_id.clone(),
+                                        prefab_id,
                                     )
                                     .changed();
                             }
                         });
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("Duration");
-                        changed |= ui
-                            .add(egui::DragValue::new(&mut frame.duration_frames).range(1..=120))
-                            .changed();
-                        if ui.button("Remove").clicked() {
-                            remove_index = Some(index);
+                    if edited.prefab_id != instance.prefab_id {
+                        edited.entity_overrides.clear();
+                        edited.trigger_overrides.clear();
+                    }
+                    changed |= ui
+                        .add(egui::DragValue::new(&mut edited.position.x).speed(1))
+                        .changed();
+                    changed |= ui
+                        .add(egui::DragValue::new(&mut edited.position.y).speed(1))
+                        .changed();
+                    if ui.button("Place Prefab In Scene").clicked() {
+                        self.tool = EditorTool::Prefab;
+                        self.preview_focus = PreviewFocus::None;
+                    }
+
+                    if let Some(prefab) = source_prefab {
+                        let display_name = if prefab.name.trim().is_empty() {
+                            prefab.id.as_str()
+                        } else {
+                            prefab.name.as_str()
+                        };
+                        ui.label(format!(
+                            "Source: {}  |  {}x{} tiles  |  {} entity(s)  |  {} trigger(s)",
+                            display_name,
+                            prefab.size_tiles.width,
+                            prefab.size_tiles.height,
+                            prefab.entities.len(),
+                            prefab.triggers.len()
+                        ));
+                        if let Some(source_scene_id) = prefab.source_scene_id.as_deref() {
+                            ui.small(format!("Captured from scene '{}'", source_scene_id));
                         }
-                    });
-                });
-            }
 
-            if let Some(index) = remove_index {
-                edited.frames.remove(index);
-                changed = true;
-            }
+                        if !prefab.entities.is_empty() {
+                            ui.separator();
+                            ui.label("Entity Overrides");
+                            for source_entity in &prefab.entities {
+                                let override_index =
+                                    edited.entity_overrides.iter().position(|override_entry| {
+                                        override_entry.entity_id == source_entity.id
+                                    });
+                                let mut override_entry = override_index
+                                    .map(|index| edited.entity_overrides[index].clone())
+                                    .unwrap_or_else(|| PrefabEntityOverride {
+                                        entity_id: source_entity.id.clone(),
+                                        ..Default::default()
+                                    });
+                                ui.group(|ui| {
+                                    ui.label(format!(
+                                        "{} ({})",
+                                        source_entity.id, source_entity.archetype
+                                    ));
+                                    let mut use_position = override_entry.position.is_some();
+                                    if ui
+                                        .checkbox(&mut use_position, "Override position")
+                                        .changed()
+                                    {
+                                        override_entry.position =
+                                            use_position.then_some(source_entity.position);
+                                        changed = true;
+                                    }
+                                    if let Some(position) = &mut override_entry.position {
+                                        ui.horizontal(|ui| {
+                                            ui.label("x");
+                                            changed |= ui
+                                                .add(egui::DragValue::new(&mut position.x).speed(1))
+                                                .changed();
+                                            ui.label("y");
+                                            changed |= ui
+                                                .add(egui::DragValue::new(&mut position.y).speed(1))
+                                                .changed();
+                                        });
+                                    }
+                                    let mut use_facing = override_entry.facing.is_some();
+                                    if ui.checkbox(&mut use_facing, "Override facing").changed() {
+                                        override_entry.facing = if use_facing {
+                                            Some(source_entity.facing)
+                                        } else {
+                                            None
+                                        };
+                                        changed = true;
+                                    }
+                                    if let Some(facing) = &mut override_entry.facing {
+                                        egui::ComboBox::from_id_salt((
+                                            "prefab_entity_facing",
+                                            index,
+                                            source_entity.id.as_str(),
+                                        ))
+                                        .selected_text(match facing {
+                                            Facing::Left => "Left",
+                                            Facing::Right => "Right",
+                                        })
+                                        .show_ui(
+                                            ui,
+                                            |ui| {
+                                                changed |= ui
+                                                    .selectable_value(facing, Facing::Left, "Left")
+                                                    .changed();
+                                                changed |= ui
+                                                    .selectable_value(
+                                                        facing,
+                                                        Facing::Right,
+                                                        "Right",
+                                                    )
+                                                    .changed();
+                                            },
+                                        );
+                                    }
+                                    let mut use_active = override_entry.active.is_some();
+                                    if ui.checkbox(&mut use_active, "Override active").changed() {
+                                        override_entry.active = if use_active {
+                                            Some(source_entity.active)
+                                        } else {
+                                            None
+                                        };
+                                        changed = true;
+                                    }
+                                    if let Some(active) = &mut override_entry.active {
+                                        changed |=
+                                            ui.checkbox(active, "Initially Active").changed();
+                                    }
+                                    let mut use_one_shot = override_entry.one_shot.is_some();
+                                    if ui
+                                        .checkbox(&mut use_one_shot, "Override one-shot")
+                                        .changed()
+                                    {
+                                        override_entry.one_shot = if use_one_shot {
+                                            Some(source_entity.one_shot)
+                                        } else {
+                                            None
+                                        };
+                                        changed = true;
+                                    }
+                                    if let Some(one_shot) = &mut override_entry.one_shot {
+                                        changed |= ui
+                                            .checkbox(one_shot, "Deactivate After Trigger")
+                                            .changed();
+                                    }
+                                });
+                                upsert_prefab_entity_override(
+                                    &mut edited.entity_overrides,
+                                    override_entry,
+                                );
+                            }
+                        }
 
-            ui.horizontal(|ui| {
-                if ui.button("+ Frame").clicked() {
-                    let next = edited.frames.last().cloned().unwrap_or(AnimationFrame {
-                        metasprite_id: metasprite_ids[0].clone(),
-                        duration_frames: 8,
-                    });
-                    edited.frames.push(next);
-                    changed = true;
-                }
-                if ui.button("Preview Animation").clicked() {
-                    self.preview_focus = PreviewFocus::Animation;
-                }
-            });
+                        if !prefab.triggers.is_empty() {
+                            ui.separator();
+                            ui.label("Trigger Overrides");
+                            for source_trigger in &prefab.triggers {
+                                let override_index =
+                                    edited.trigger_overrides.iter().position(|override_entry| {
+                                        override_entry.trigger_id == source_trigger.id
+                                    });
+                                let mut override_entry = override_index
+                                    .map(|index| edited.trigger_overrides[index].clone())
+                                    .unwrap_or_else(|| PrefabTriggerOverride {
+                                        trigger_id: source_trigger.id.clone(),
+                                        ..Default::default()
+                                    });
+                                ui.group(|ui| {
+                                    ui.label(format!(
+                                        "{} -> {}",
+                                        source_trigger.id, source_trigger.script_id
+                                    ));
+                                    let mut use_position = override_entry.position.is_some();
+                                    if ui
+                                        .checkbox(&mut use_position, "Override position")
+                                        .changed()
+                                    {
+                                        override_entry.position =
+                                            use_position.then_some(PointI16 {
+                                                x: source_trigger.rect.x,
+                                                y: source_trigger.rect.y,
+                                            });
+                                        changed = true;
+                                    }
+                                    if let Some(position) = &mut override_entry.position {
+                                        ui.horizontal(|ui| {
+                                            ui.label("x");
+                                            changed |= ui
+                                                .add(egui::DragValue::new(&mut position.x).speed(1))
+                                                .changed();
+                                            ui.label("y");
+                                            changed |= ui
+                                                .add(egui::DragValue::new(&mut position.y).speed(1))
+                                                .changed();
+                                        });
+                                    }
+                                    let mut use_script = override_entry.script_id.is_some();
+                                    if ui.checkbox(&mut use_script, "Override script").changed() {
+                                        override_entry.script_id = if use_script {
+                                            Some(source_trigger.script_id.clone())
+                                        } else {
+                                            None
+                                        };
+                                        changed = true;
+                                    }
+                                    if let Some(script_id) = &mut override_entry.script_id {
+                                        changed |= ui.text_edit_singleline(script_id).changed();
+                                        if let Some(AssetDragPayload::Script { id, .. }) =
+                                            self.asset_drag_payload.clone()
+                                        {
+                                            let drop_response = ui
+                                                .button(format!("Drop Script Here: {}", script_id));
+                                            if drop_response.hovered()
+                                                && ui.input(|input| input.pointer.any_released())
+                                            {
+                                                *script_id = id;
+                                                self.asset_drag_payload = None;
+                                                changed = true;
+                                            }
+                                        }
+                                    }
+                                });
+                                upsert_prefab_trigger_override(
+                                    &mut edited.trigger_overrides,
+                                    override_entry,
+                                );
+                            }
+                        }
+                    } else {
+                        ui.label("The source prefab for this instance is missing.");
+                    }
 
-            if changed {
-                self.capture_history();
-                if let Some(bundle) = &mut self.bundle {
-                    if let Some(animation) = bundle.animations.get_mut(self.selected_animation) {
-                        *animation = edited;
+                    if changed {
+                        self.capture_history();
+                        if let Some(scene) = self.current_scene_mut() {
+                            if let Some(target) = scene.prefab_instances.get_mut(index) {
+                                *target = edited;
+                            }
+                        }
+                        self.mark_edited("Updated prefab instance");
                     }
                 }
-                self.mark_edited(format!("Updated animation '{}'", animation_snapshot.id));
             }
         });
     }
@@ -3952,6 +4697,18 @@ impl EditorApp {
                                     .changed();
                             }
                         });
+                    if let Some(AssetDragPayload::Visual { id, .. }) =
+                        self.asset_drag_payload.clone()
+                    {
+                        let drop_response =
+                            ui.button(format!("Drop Visual Here: {}", edited.archetype));
+                        if drop_response.hovered() && ui.input(|input| input.pointer.any_released())
+                        {
+                            edited.archetype = id;
+                            self.asset_drag_payload = None;
+                            changed = true;
+                        }
+                    }
                     changed |= ui
                         .add(egui::DragValue::new(&mut edited.position.x).speed(1))
                         .changed();
@@ -4229,193 +4986,23 @@ impl EditorApp {
     }
 
     fn draw_context_preview(&mut self, ui: &mut egui::Ui, time_seconds: f32) {
-        let Some(bundle) = &self.bundle else {
-            return;
-        };
+        draw_context_preview_impl(self, ui, time_seconds);
+    }
 
-        match self.preview_focus {
-            PreviewFocus::Animation => {
-                let Some(animation) = bundle.animations.get(self.selected_animation) else {
-                    return;
-                };
-                ui.collapsing("Animation Preview", |ui| {
-                    ui.label(format!("Selected animation: {}", animation.id));
-                    draw_animation_preview(ui, bundle, self.selected_animation, time_seconds);
-                });
-            }
-            PreviewFocus::Entity => {
-                let Some(scene) = bundle.scenes.get(self.selected_scene) else {
-                    return;
-                };
-                let Some(index) = self.selected_entity else {
-                    return;
-                };
-                let Some(entity) = scene.entities.get(index) else {
-                    return;
-                };
-                if metasprite_for_entity(bundle, entity, time_seconds).is_none() {
-                    return;
-                }
-                ui.collapsing("Animation Preview", |ui| {
-                    ui.label(format!(
-                        "Selected entity: {} ({})",
-                        entity.id, entity.archetype
-                    ));
-                    draw_entity_preview(ui, bundle, entity, time_seconds);
-                });
-            }
-            PreviewFocus::None => {}
-        }
+    fn draw_events_tab(&mut self, ui: &mut egui::Ui) {
+        draw_events_tab_impl(self, ui);
     }
 
     fn has_context_preview(&self) -> bool {
-        let Some(bundle) = &self.bundle else {
-            return false;
-        };
-
-        match self.preview_focus {
-            PreviewFocus::Animation => bundle.animations.get(self.selected_animation).is_some(),
-            PreviewFocus::Entity => bundle
-                .scenes
-                .get(self.selected_scene)
-                .and_then(|scene| {
-                    self.selected_entity
-                        .and_then(|index| scene.entities.get(index))
-                })
-                .is_some_and(|entity| entity_has_animation(bundle, entity)),
-            PreviewFocus::None => false,
-        }
+        has_context_preview_impl(self)
     }
 
     fn needs_animation_repaint(&self) -> bool {
-        let Some(bundle) = &self.bundle else {
-            return false;
-        };
-
-        self.has_context_preview()
-            || bundle.scenes.get(self.selected_scene).is_some_and(|scene| {
-                scene
-                    .entities
-                    .iter()
-                    .any(|entity| entity_has_animation(bundle, entity))
-            })
+        needs_animation_repaint_impl(self)
     }
 
     fn draw_trigger_inspector(&mut self, ui: &mut egui::Ui, scene_snapshot: &SceneResource) {
-        ui.collapsing("Triggers", |ui| {
-            ui.horizontal(|ui| {
-                if ui.button("+ Trigger").clicked() {
-                    self.capture_history();
-                    if let Some(scene) = self.current_scene_mut() {
-                        let next_index = scene.triggers.len() + 1;
-                        scene.triggers.push(TriggerVolume {
-                            id: format!("trigger_{}", next_index),
-                            kind: TriggerKind::Touch,
-                            rect: RectI16 {
-                                x: 8,
-                                y: 8,
-                                width: 16,
-                                height: 16,
-                            },
-                            script_id: "start_dialogue".to_string(),
-                        });
-                        self.selected_trigger = Some(scene.triggers.len() - 1);
-                    }
-                    self.tool = EditorTool::Trigger;
-                    self.preview_focus = PreviewFocus::None;
-                    self.mark_edited("Added trigger");
-                }
-                if ui.button("- Remove").clicked() {
-                    if let Some(index) = self.selected_trigger {
-                        self.capture_history();
-                        if let Some(scene) = self.current_scene_mut() {
-                            if index < scene.triggers.len() {
-                                scene.triggers.remove(index);
-                            }
-                        }
-                        self.selected_trigger = None;
-                        self.preview_focus = PreviewFocus::None;
-                        self.mark_edited("Removed trigger");
-                    }
-                }
-            });
-
-            for (index, trigger) in scene_snapshot.triggers.iter().enumerate() {
-                if ui
-                    .selectable_label(
-                        self.selected_trigger == Some(index),
-                        format!("{} ({:?})", trigger.id, trigger.kind),
-                    )
-                    .clicked()
-                {
-                    self.selected_trigger = Some(index);
-                    self.tool = EditorTool::Trigger;
-                    self.preview_focus = PreviewFocus::None;
-                }
-            }
-
-            if let Some(index) = self.selected_trigger {
-                if let Some(trigger) = scene_snapshot.triggers.get(index) {
-                    let mut edited = trigger.clone();
-                    let mut changed = false;
-                    changed |= ui.text_edit_singleline(&mut edited.id).changed();
-                    changed |= ui.text_edit_singleline(&mut edited.script_id).changed();
-                    changed |= ui
-                        .add(egui::DragValue::new(&mut edited.rect.x).speed(1))
-                        .changed();
-                    changed |= ui
-                        .add(egui::DragValue::new(&mut edited.rect.y).speed(1))
-                        .changed();
-                    changed |= ui
-                        .add(egui::DragValue::new(&mut edited.rect.width).speed(1))
-                        .changed();
-                    changed |= ui
-                        .add(egui::DragValue::new(&mut edited.rect.height).speed(1))
-                        .changed();
-                    egui::ComboBox::from_label("Kind")
-                        .selected_text(format!("{:?}", edited.kind))
-                        .show_ui(ui, |ui| {
-                            changed |= ui
-                                .selectable_value(&mut edited.kind, TriggerKind::Touch, "Touch")
-                                .changed();
-                            changed |= ui
-                                .selectable_value(
-                                    &mut edited.kind,
-                                    TriggerKind::Interact,
-                                    "Interact",
-                                )
-                                .changed();
-                            changed |= ui
-                                .selectable_value(
-                                    &mut edited.kind,
-                                    TriggerKind::EnterScene,
-                                    "EnterScene",
-                                )
-                                .changed();
-                            changed |= ui
-                                .selectable_value(
-                                    &mut edited.kind,
-                                    TriggerKind::DefeatAllEnemies,
-                                    "DefeatAllEnemies",
-                                )
-                                .changed();
-                        });
-                    if ui.button("Place Trigger In Scene").clicked() {
-                        self.tool = EditorTool::Trigger;
-                        self.preview_focus = PreviewFocus::None;
-                    }
-                    if changed {
-                        self.capture_history();
-                        if let Some(scene) = self.current_scene_mut() {
-                            if let Some(target) = scene.triggers.get_mut(index) {
-                                *target = edited;
-                            }
-                        }
-                        self.mark_edited("Updated trigger");
-                    }
-                }
-            }
-        });
+        draw_trigger_inspector_impl(self, ui, scene_snapshot);
     }
 
     fn draw_tile_editor(&mut self, ui: &mut egui::Ui) {
@@ -4470,7 +5057,10 @@ impl EditorApp {
         });
     }
 
+    #[allow(unreachable_code)]
     fn draw_diagnostics(&mut self, ui: &mut egui::Ui) {
+        self.draw_diagnostics_panel(ui);
+        return;
         let mut navigate_to = None;
         let mut quick_fix = None;
 
@@ -4524,9 +5114,9 @@ impl EditorApp {
                 .unwrap_or(1);
             let tile_fraction = (tile_peak as f32 / MAX_TILESET_TILES as f32).clamp(0.0, 1.0);
             let total_palette_capacity = MAX_PALETTES * MAX_COLORS_PER_PALETTE;
-            let palette_fraction =
-                (self.report.budgets.palette_colors as f32 / total_palette_capacity as f32)
-                    .clamp(0.0, 1.0);
+            let palette_fraction = (self.report.budgets.palette_colors as f32
+                / total_palette_capacity as f32)
+                .clamp(0.0, 1.0);
             let rom_fraction = (self.report.budgets.estimated_rom_banks as f32
                 / max_rom_banks as f32)
                 .clamp(0.0, 1.0);
@@ -4534,49 +5124,43 @@ impl EditorApp {
                 / MAX_METASPRITE_TILES_HARD as f32)
                 .clamp(0.0, 1.0);
             let rom_bytes_capacity = max_rom_banks * ROM_BANK_SIZE;
-            let rom_bytes_fraction =
-                (self.report.budgets.estimated_rom_bytes as f32 / rom_bytes_capacity as f32)
-                    .clamp(0.0, 1.0);
-            let metasprite_warning = self.report.budgets.metasprite_piece_peak
-                >= MAX_METASPRITE_TILES_WARN;
+            let rom_bytes_fraction = (self.report.budgets.estimated_rom_bytes as f32
+                / rom_bytes_capacity as f32)
+                .clamp(0.0, 1.0);
+            let metasprite_warning =
+                self.report.budgets.metasprite_piece_peak >= MAX_METASPRITE_TILES_WARN;
 
             ui.label("Tileset peak");
             ui.add(
-                egui::ProgressBar::new(tile_fraction).text(format!(
-                    "{} / {} tiles",
-                    tile_peak, MAX_TILESET_TILES
-                )),
+                egui::ProgressBar::new(tile_fraction)
+                    .text(format!("{} / {} tiles", tile_peak, MAX_TILESET_TILES)),
             );
             ui.label("Palette colors");
-            ui.add(
-                egui::ProgressBar::new(palette_fraction).text(format!(
-                    "{} / {} colors",
-                    self.report.budgets.palette_colors, total_palette_capacity
-                )),
-            );
+            ui.add(egui::ProgressBar::new(palette_fraction).text(format!(
+                "{} / {} colors",
+                self.report.budgets.palette_colors, total_palette_capacity
+            )));
             ui.label("Metasprite peak");
-            ui.add(
-                egui::ProgressBar::new(metasprite_fraction).text(format!(
-                    "{} / {} pieces{}",
-                    self.report.budgets.metasprite_piece_peak,
-                    MAX_METASPRITE_TILES_HARD,
-                    if metasprite_warning { " (warning zone)" } else { "" }
-                )),
-            );
+            ui.add(egui::ProgressBar::new(metasprite_fraction).text(format!(
+                "{} / {} pieces{}",
+                self.report.budgets.metasprite_piece_peak,
+                MAX_METASPRITE_TILES_HARD,
+                if metasprite_warning {
+                    " (warning zone)"
+                } else {
+                    ""
+                }
+            )));
             ui.label("ROM banks");
-            ui.add(
-                egui::ProgressBar::new(rom_fraction).text(format!(
-                    "{} / {} bank(s)",
-                    self.report.budgets.estimated_rom_banks, max_rom_banks
-                )),
-            );
+            ui.add(egui::ProgressBar::new(rom_fraction).text(format!(
+                "{} / {} bank(s)",
+                self.report.budgets.estimated_rom_banks, max_rom_banks
+            )));
             ui.label("ROM bytes");
-            ui.add(
-                egui::ProgressBar::new(rom_bytes_fraction).text(format!(
-                    "{} / {} bytes",
-                    self.report.budgets.estimated_rom_bytes, rom_bytes_capacity
-                )),
-            );
+            ui.add(egui::ProgressBar::new(rom_bytes_fraction).text(format!(
+                "{} / {} bytes",
+                self.report.budgets.estimated_rom_bytes, rom_bytes_capacity
+            )));
         });
 
         let diagnostics = self.filtered_diagnostics();
@@ -4587,10 +5171,9 @@ impl EditorApp {
             ui.separator();
             match self.diagnostics_view.grouping {
                 DiagnosticGrouping::Severity => {
-                    for (heading, severity) in [
-                        ("Errors", Severity::Error),
-                        ("Warnings", Severity::Warning),
-                    ] {
+                    for (heading, severity) in
+                        [("Errors", Severity::Error), ("Warnings", Severity::Warning)]
+                    {
                         let group = diagnostics
                             .iter()
                             .filter(|diagnostic| diagnostic.severity == severity)
@@ -4668,7 +5251,10 @@ impl EditorApp {
         }
     }
 
+    #[allow(unreachable_code)]
     fn draw_scene_outliner(&mut self, ui: &mut egui::Ui) {
+        self.draw_scene_outliner_panel(ui);
+        return;
         ui.add(
             egui::TextEdit::singleline(&mut self.outliner_filter)
                 .hint_text("Filter scenes, layers, and objects"),
@@ -4806,10 +5392,12 @@ impl EditorApp {
             },
             Script {
                 scene_index: usize,
+                script_index: usize,
                 label: String,
             },
             ScriptIsolate {
                 scene_index: usize,
+                script_index: usize,
                 label: String,
             },
         }
@@ -4880,12 +5468,13 @@ impl EditorApp {
                         ui.horizontal(|ui| {
                             ui.label("Layers");
                             if ui
-                                .small_button(if self.is_layer_soloed(scene_index, self.selected_layer)
-                                {
-                                    "Clear Solo"
-                                } else {
-                                    "Solo Active"
-                                })
+                                .small_button(
+                                    if self.is_layer_soloed(scene_index, self.selected_layer) {
+                                        "Clear Solo"
+                                    } else {
+                                        "Solo Active"
+                                    },
+                                )
                                 .clicked()
                             {
                                 pending_action = Some(PendingOutlinerAction::LayerSolo {
@@ -4925,8 +5514,7 @@ impl EditorApp {
                                     .small_button(if layer.visible { "Hide" } else { "Show" })
                                     .clicked()
                                 {
-                                    pending_action =
-                                        Some(PendingOutlinerAction::LayerVisibility {
+                                    pending_action = Some(PendingOutlinerAction::LayerVisibility {
                                         scene_index,
                                         layer_index,
                                     });
@@ -4947,11 +5535,13 @@ impl EditorApp {
                                     });
                                 }
                                 if ui
-                                    .small_button(if self.is_layer_soloed(scene_index, layer_index) {
-                                        "Unsolo"
-                                    } else {
-                                        "Solo"
-                                    })
+                                    .small_button(
+                                        if self.is_layer_soloed(scene_index, layer_index) {
+                                            "Unsolo"
+                                        } else {
+                                            "Solo"
+                                        },
+                                    )
                                     .clicked()
                                 {
                                     pending_action = Some(PendingOutlinerAction::LayerSolo {
@@ -4976,7 +5566,11 @@ impl EditorApp {
 
                         ui.separator();
                         ui.horizontal(|ui| {
-                            ui.label(format!("{} ({})", SceneObjectGroup::Spawns.label(), scene.spawns.len()));
+                            ui.label(format!(
+                                "{} ({})",
+                                SceneObjectGroup::Spawns.label(),
+                                scene.spawns.len()
+                            ));
                             if ui
                                 .small_button(if self.is_group_soloed(SceneObjectGroup::Spawns) {
                                     "Unsolo"
@@ -4985,8 +5579,9 @@ impl EditorApp {
                                 })
                                 .clicked()
                             {
-                                pending_action =
-                                    Some(PendingOutlinerAction::GroupSolo(SceneObjectGroup::Spawns));
+                                pending_action = Some(PendingOutlinerAction::GroupSolo(
+                                    SceneObjectGroup::Spawns,
+                                ));
                             }
                         });
                         for (index, spawn) in scene.spawns.iter().enumerate() {
@@ -5015,11 +5610,10 @@ impl EditorApp {
                                     });
                                 }
                                 if ui.small_button("Dup").clicked() {
-                                    pending_action =
-                                        Some(PendingOutlinerAction::SpawnDuplicate {
-                                            scene_index,
-                                            index,
-                                        });
+                                    pending_action = Some(PendingOutlinerAction::SpawnDuplicate {
+                                        scene_index,
+                                        index,
+                                    });
                                 }
                                 if ui.small_button("Isolate").clicked() {
                                     pending_action = Some(PendingOutlinerAction::SpawnIsolate {
@@ -5037,12 +5631,13 @@ impl EditorApp {
                                 scene.checkpoints.len()
                             ));
                             if ui
-                                .small_button(if self.is_group_soloed(SceneObjectGroup::Checkpoints)
-                                {
-                                    "Unsolo"
-                                } else {
-                                    "Solo"
-                                })
+                                .small_button(
+                                    if self.is_group_soloed(SceneObjectGroup::Checkpoints) {
+                                        "Unsolo"
+                                    } else {
+                                        "Solo"
+                                    },
+                                )
                                 .clicked()
                             {
                                 pending_action = Some(PendingOutlinerAction::GroupSolo(
@@ -5076,20 +5671,18 @@ impl EditorApp {
                                     });
                                 }
                                 if ui.small_button("Dup").clicked() {
-                                    pending_action = Some(
-                                        PendingOutlinerAction::CheckpointDuplicate {
+                                    pending_action =
+                                        Some(PendingOutlinerAction::CheckpointDuplicate {
                                             scene_index,
                                             index,
-                                        },
-                                    );
+                                        });
                                 }
                                 if ui.small_button("Isolate").clicked() {
-                                    pending_action = Some(
-                                        PendingOutlinerAction::CheckpointIsolate {
+                                    pending_action =
+                                        Some(PendingOutlinerAction::CheckpointIsolate {
                                             scene_index,
                                             index,
-                                        },
-                                    );
+                                        });
                                 }
                             });
                         }
@@ -5139,11 +5732,10 @@ impl EditorApp {
                                     });
                                 }
                                 if ui.small_button("Dup").clicked() {
-                                    pending_action =
-                                        Some(PendingOutlinerAction::EntityDuplicate {
-                                            scene_index,
-                                            index,
-                                        });
+                                    pending_action = Some(PendingOutlinerAction::EntityDuplicate {
+                                        scene_index,
+                                        index,
+                                    });
                                 }
                                 if ui.small_button("Isolate").clicked() {
                                     pending_action = Some(PendingOutlinerAction::EntityIsolate {
@@ -5223,12 +5815,13 @@ impl EditorApp {
                                     scene.scripts.len()
                                 ));
                                 if ui
-                                    .small_button(if self.is_group_soloed(SceneObjectGroup::Scripts)
-                                    {
-                                        "Unsolo"
-                                    } else {
-                                        "Solo"
-                                    })
+                                    .small_button(
+                                        if self.is_group_soloed(SceneObjectGroup::Scripts) {
+                                            "Unsolo"
+                                        } else {
+                                            "Solo"
+                                        },
+                                    )
                                     .clicked()
                                 {
                                     pending_action = Some(PendingOutlinerAction::GroupSolo(
@@ -5236,7 +5829,7 @@ impl EditorApp {
                                     ));
                                 }
                             });
-                            for script in &scene.scripts {
+                            for (script_index, script) in scene.scripts.iter().enumerate() {
                                 if !filter_matches(&filter, &script.id) && !filter.is_empty() {
                                     continue;
                                 }
@@ -5247,16 +5840,17 @@ impl EditorApp {
                                     {
                                         pending_action = Some(PendingOutlinerAction::Script {
                                             scene_index,
+                                            script_index,
                                             label: script.id.clone(),
                                         });
                                     }
                                     if ui.small_button("Isolate").clicked() {
-                                        pending_action = Some(
-                                            PendingOutlinerAction::ScriptIsolate {
+                                        pending_action =
+                                            Some(PendingOutlinerAction::ScriptIsolate {
                                                 scene_index,
+                                                script_index,
                                                 label: script.id.clone(),
-                                            },
-                                        );
+                                            });
                                     }
                                 });
                             }
@@ -5365,7 +5959,11 @@ impl EditorApp {
                                 .as_ref()
                                 .and_then(|bundle| bundle.scenes.get(scene_index))
                                 .map(|scene| {
-                                    scene.spawns.iter().map(|entry| entry.id.clone()).collect::<BTreeSet<_>>()
+                                    scene
+                                        .spawns
+                                        .iter()
+                                        .map(|entry| entry.id.clone())
+                                        .collect::<BTreeSet<_>>()
                                 })
                                 .unwrap_or_default();
                             spawn.id = next_unique_layer_id(&existing, &spawn.id);
@@ -5447,7 +6045,8 @@ impl EditorApp {
                                 .as_ref()
                                 .and_then(|bundle| bundle.scenes.get(scene_index))
                                 .map(|scene| {
-                                    scene.checkpoints
+                                    scene
+                                        .checkpoints
                                         .iter()
                                         .map(|entry| entry.id.clone())
                                         .collect::<BTreeSet<_>>()
@@ -5533,7 +6132,11 @@ impl EditorApp {
                                 .as_ref()
                                 .and_then(|bundle| bundle.scenes.get(scene_index))
                                 .map(|scene| {
-                                    scene.entities.iter().map(|entry| entry.id.clone()).collect::<BTreeSet<_>>()
+                                    scene
+                                        .entities
+                                        .iter()
+                                        .map(|entry| entry.id.clone())
+                                        .collect::<BTreeSet<_>>()
                                 })
                                 .unwrap_or_default();
                             entity.id = next_unique_layer_id(&existing, &entity.id);
@@ -5617,7 +6220,11 @@ impl EditorApp {
                                 .as_ref()
                                 .and_then(|bundle| bundle.scenes.get(scene_index))
                                 .map(|scene| {
-                                    scene.triggers.iter().map(|entry| entry.id.clone()).collect::<BTreeSet<_>>()
+                                    scene
+                                        .triggers
+                                        .iter()
+                                        .map(|entry| entry.id.clone())
+                                        .collect::<BTreeSet<_>>()
                                 })
                                 .unwrap_or_default();
                             trigger.id = next_unique_layer_id(&existing, &trigger.id);
@@ -5656,28 +6263,33 @@ impl EditorApp {
                         self.focus_trigger_rect(&format!("trigger '{}'", label), rect);
                     }
                 }
-                PendingOutlinerAction::Script { scene_index, label } => {
-                    self.selected_scene = scene_index;
-                    self.scene_scroll_offset = Vec2::ZERO;
-                    self.sync_selection();
-                    self.preview_focus = PreviewFocus::None;
-                    self.status = format!(
-                        "Selected script '{}'. A visual event editor can plug in here.",
-                        label
-                    );
+                PendingOutlinerAction::Script {
+                    scene_index,
+                    script_index,
+                    label,
+                } => {
+                    self.select_script(scene_index, script_index);
+                    self.status = format!("Selected script '{}'", label);
                 }
-                PendingOutlinerAction::ScriptIsolate { scene_index, label } => {
+                PendingOutlinerAction::ScriptIsolate {
+                    scene_index,
+                    script_index,
+                    label,
+                } => {
                     self.selected_scene = scene_index;
                     self.solo_group = Some(SceneObjectGroup::Scripts);
                     self.sync_selection();
-                    self.preview_focus = PreviewFocus::None;
+                    self.select_script(scene_index, script_index);
                     self.status = format!("Isolated script group around '{}'", label);
                 }
             }
         }
     }
 
+    #[allow(unreachable_code)]
     fn draw_asset_browser(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        self.draw_asset_browser_panel(ui, ctx);
+        return;
         ui.add(
             egui::TextEdit::singleline(&mut self.asset_browser_filter)
                 .hint_text("Filter assets by id or file name"),
@@ -5694,8 +6306,22 @@ impl EditorApp {
                 scene_index: usize,
                 label: String,
             },
+            LoadPrefab(String),
+            Metasprite {
+                metasprite_index: usize,
+                label: String,
+            },
             Animation {
                 animation_index: usize,
+                label: String,
+            },
+            Dialogue {
+                dialogue_index: usize,
+                label: String,
+            },
+            Script {
+                scene_index: usize,
+                script_index: usize,
                 label: String,
             },
             Status(String),
@@ -5709,6 +6335,7 @@ impl EditorApp {
             },
             LoadBrush(String),
             LoadSnippet(String),
+            PromoteLegacySnippet(String),
         }
 
         let filter = self.asset_browser_filter.trim().to_ascii_lowercase();
@@ -5717,8 +6344,9 @@ impl EditorApp {
         let mut pending_action = None;
 
         ui.label(format!(
-            "{} scene(s) | {} tileset(s) | {} palette(s) | {} metasprite(s) | {} animation(s) | {} dialogue(s)",
+            "{} scene(s) | {} prefab(s) | {} tileset(s) | {} palette(s) | {} metasprite(s) | {} animation(s) | {} dialogue(s)",
             bundle.scenes.len(),
+            bundle.prefabs.len(),
             bundle.tilesets.len(),
             bundle.palettes.len(),
             bundle.metasprites.len(),
@@ -5728,6 +6356,7 @@ impl EditorApp {
         ui.label(format!(
             "{} favorite(s) | {} snippet(s) | {} brush(es)",
             self.workspace_addons.editor_favorites.scenes.len()
+                + self.workspace_addons.editor_favorites.prefabs.len()
                 + self.workspace_addons.editor_favorites.palettes.len()
                 + self.workspace_addons.editor_favorites.tilesets.len()
                 + self.workspace_addons.editor_favorites.metasprites.len()
@@ -5757,10 +6386,7 @@ impl EditorApp {
                                     label: scene.id.clone(),
                                 });
                             }
-                            ui.small(format!(
-                                "{}",
-                                self.asset_usage_summary("scene", &scene.id)
-                            ));
+                            ui.small(format!("{}", self.asset_usage_summary("scene", &scene.id)));
                             ui.horizontal(|ui| {
                                 if ui
                                     .small_button(if self.is_asset_favorite("scene", &scene.id) {
@@ -5781,6 +6407,87 @@ impl EditorApp {
                 }
             });
 
+            ui.collapsing(format!("Prefabs ({})", bundle.prefabs.len()), |ui| {
+                if bundle.prefabs.is_empty() {
+                    ui.label("Save a selection as a prefab from the Scene tab.");
+                } else {
+                    for prefab in &bundle.prefabs {
+                        let matches_name = filter_matches(&filter, &prefab.name);
+                        let matches_id = filter_matches(&filter, &prefab.id);
+                        if !filter.is_empty() && !matches_name && !matches_id {
+                            continue;
+                        }
+                        ui.horizontal(|ui| {
+                            draw_prefab_thumbnail(ui, &bundle, prefab);
+                            ui.vertical(|ui| {
+                                let label =
+                                    if prefab.name.trim().is_empty() || prefab.name == prefab.id {
+                                        format!(
+                                            "{} ({}x{} tiles, {} object(s))",
+                                            prefab.id,
+                                            prefab.size_tiles.width,
+                                            prefab.size_tiles.height,
+                                            prefab.spawns.len()
+                                                + prefab.checkpoints.len()
+                                                + prefab.entities.len()
+                                                + prefab.triggers.len()
+                                        )
+                                    } else {
+                                        format!(
+                                            "{} [{}] ({}x{} tiles, {} object(s))",
+                                            prefab.name,
+                                            prefab.id,
+                                            prefab.size_tiles.width,
+                                            prefab.size_tiles.height,
+                                            prefab.spawns.len()
+                                                + prefab.checkpoints.len()
+                                                + prefab.entities.len()
+                                                + prefab.triggers.len()
+                                        )
+                                    };
+                                let response = ui.selectable_label(false, label);
+                                if response.drag_started() {
+                                    self.asset_drag_payload = Some(AssetDragPayload::Prefab {
+                                        id: prefab.id.clone(),
+                                        label: if prefab.name.trim().is_empty() {
+                                            prefab.id.clone()
+                                        } else {
+                                            prefab.name.clone()
+                                        },
+                                    });
+                                }
+                                if response.clicked() {
+                                    pending_action =
+                                        Some(PendingAssetAction::LoadPrefab(prefab.id.clone()));
+                                }
+                                ui.small(self.asset_usage_summary("prefab", &prefab.id));
+                                ui.horizontal(|ui| {
+                                    if ui.small_button("Load").clicked() {
+                                        pending_action =
+                                            Some(PendingAssetAction::LoadPrefab(prefab.id.clone()));
+                                    }
+                                    if ui
+                                        .small_button(
+                                            if self.is_asset_favorite("prefab", &prefab.id) {
+                                                "Unstar"
+                                            } else {
+                                                "Star"
+                                            },
+                                        )
+                                        .clicked()
+                                    {
+                                        pending_action = Some(PendingAssetAction::ToggleFavorite {
+                                            kind: "prefab",
+                                            id: prefab.id.clone(),
+                                        });
+                                    }
+                                });
+                            });
+                        });
+                    }
+                }
+            });
+
             ui.collapsing(format!("Animations ({})", bundle.animations.len()), |ui| {
                 for (animation_index, animation) in bundle.animations.iter().enumerate() {
                     if !filter_matches(&filter, &animation.id) && !filter.is_empty() {
@@ -5789,13 +6496,19 @@ impl EditorApp {
                     ui.horizontal(|ui| {
                         draw_animation_thumbnail(ui, &bundle, animation_index, time_seconds);
                         ui.vertical(|ui| {
-                            if ui
-                                .selectable_label(
-                                    self.selected_animation == animation_index,
-                                    format!("{} ({} frame(s))", animation.id, animation.frames.len()),
-                                )
-                                .clicked()
-                            {
+                            let label =
+                                format!("{} ({} frame(s))", animation.id, animation.frames.len());
+                            let response = ui.selectable_label(
+                                self.selected_animation == animation_index,
+                                label,
+                            );
+                            if response.drag_started() {
+                                self.asset_drag_payload = Some(AssetDragPayload::Visual {
+                                    id: animation.id.clone(),
+                                    label: animation.id.clone(),
+                                });
+                            }
+                            if response.clicked() {
                                 pending_action = Some(PendingAssetAction::Animation {
                                     animation_index,
                                     label: animation.id.clone(),
@@ -5803,11 +6516,13 @@ impl EditorApp {
                             }
                             ui.small(self.asset_usage_summary("animation", &animation.id));
                             if ui
-                                .small_button(if self.is_asset_favorite("animation", &animation.id) {
-                                    "Unstar"
-                                } else {
-                                    "Star"
-                                })
+                                .small_button(
+                                    if self.is_asset_favorite("animation", &animation.id) {
+                                        "Unstar"
+                                    } else {
+                                        "Star"
+                                    },
+                                )
                                 .clicked()
                             {
                                 pending_action = Some(PendingAssetAction::ToggleFavorite {
@@ -5820,44 +6535,58 @@ impl EditorApp {
                 }
             });
 
-            ui.collapsing(format!("Metasprites ({})", bundle.metasprites.len()), |ui| {
-                for metasprite in &bundle.metasprites {
-                    if !filter_matches(&filter, &metasprite.id) && !filter.is_empty() {
-                        continue;
-                    }
-                    ui.horizontal(|ui| {
-                        draw_metasprite_thumbnail(ui, &bundle, metasprite);
-                        ui.vertical(|ui| {
-                            if ui
-                                .selectable_label(
-                                    false,
-                                    format!("{} ({} piece(s))", metasprite.id, metasprite.pieces.len()),
-                                )
-                                .clicked()
-                            {
-                                pending_action = Some(PendingAssetAction::Status(format!(
-                                    "Metasprite '{}' selected. Use the Animation tab for visual editing.",
-                                    metasprite.id
-                                )));
-                            }
-                            ui.small(self.asset_usage_summary("metasprite", &metasprite.id));
-                            if ui
-                                .small_button(if self.is_asset_favorite("metasprite", &metasprite.id) {
-                                    "Unstar"
-                                } else {
-                                    "Star"
-                                })
-                                .clicked()
-                            {
-                                pending_action = Some(PendingAssetAction::ToggleFavorite {
-                                    kind: "metasprite",
-                                    id: metasprite.id.clone(),
-                                });
-                            }
+            ui.collapsing(
+                format!("Metasprites ({})", bundle.metasprites.len()),
+                |ui| {
+                    for (metasprite_index, metasprite) in bundle.metasprites.iter().enumerate() {
+                        if !filter_matches(&filter, &metasprite.id) && !filter.is_empty() {
+                            continue;
+                        }
+                        ui.horizontal(|ui| {
+                            draw_metasprite_thumbnail(ui, &bundle, metasprite);
+                            ui.vertical(|ui| {
+                                let label = format!(
+                                    "{} ({} piece(s))",
+                                    metasprite.id,
+                                    metasprite.pieces.len()
+                                );
+                                let response = ui.selectable_label(
+                                    self.selected_metasprite == Some(metasprite_index),
+                                    label,
+                                );
+                                if response.drag_started() {
+                                    self.asset_drag_payload = Some(AssetDragPayload::Visual {
+                                        id: metasprite.id.clone(),
+                                        label: metasprite.id.clone(),
+                                    });
+                                }
+                                if response.clicked() {
+                                    pending_action = Some(PendingAssetAction::Metasprite {
+                                        metasprite_index,
+                                        label: metasprite.id.clone(),
+                                    });
+                                }
+                                ui.small(self.asset_usage_summary("metasprite", &metasprite.id));
+                                if ui
+                                    .small_button(
+                                        if self.is_asset_favorite("metasprite", &metasprite.id) {
+                                            "Unstar"
+                                        } else {
+                                            "Star"
+                                        },
+                                    )
+                                    .clicked()
+                                {
+                                    pending_action = Some(PendingAssetAction::ToggleFavorite {
+                                        kind: "metasprite",
+                                        id: metasprite.id.clone(),
+                                    });
+                                }
+                            });
                         });
-                    });
-                }
-            });
+                    }
+                },
+            );
 
             ui.collapsing(format!("Tilesets ({})", bundle.tilesets.len()), |ui| {
                 for tileset in &bundle.tilesets {
@@ -5952,7 +6681,7 @@ impl EditorApp {
             });
 
             ui.collapsing(format!("Dialogues ({})", bundle.dialogues.len()), |ui| {
-                for dialogue in &bundle.dialogues {
+                for (dialogue_index, dialogue) in bundle.dialogues.iter().enumerate() {
                     if !filter_matches(&filter, &dialogue.id) && !filter.is_empty() {
                         continue;
                     }
@@ -5964,26 +6693,26 @@ impl EditorApp {
                             Color32::from_rgb(214, 132, 84),
                         );
                         ui.vertical(|ui| {
-                        if ui
-                            .selectable_label(
-                                false,
-                                format!("{} ({} node(s))", dialogue.id, dialogue.nodes.len()),
-                            )
-                            .clicked()
-                        {
-                            pending_action = Some(PendingAssetAction::Status(format!(
-                                "Dialogue '{}' selected. A graph editor would fit naturally here.",
-                                dialogue.id
-                            )));
-                        }
-                        ui.small(self.asset_usage_summary("dialogue", &dialogue.id));
-                        if ui
-                            .small_button(if self.is_asset_favorite("dialogue", &dialogue.id) {
-                                "Unstar"
-                            } else {
-                                "Star"
-                            })
-                            .clicked()
+                            if ui
+                                .selectable_label(
+                                    self.selected_dialogue == Some(dialogue_index),
+                                    format!("{} ({} node(s))", dialogue.id, dialogue.nodes.len()),
+                                )
+                                .clicked()
+                            {
+                                pending_action = Some(PendingAssetAction::Dialogue {
+                                    dialogue_index,
+                                    label: dialogue.id.clone(),
+                                });
+                            }
+                            ui.small(self.asset_usage_summary("dialogue", &dialogue.id));
+                            if ui
+                                .small_button(if self.is_asset_favorite("dialogue", &dialogue.id) {
+                                    "Unstar"
+                                } else {
+                                    "Star"
+                                })
+                                .clicked()
                             {
                                 pending_action = Some(PendingAssetAction::ToggleFavorite {
                                     kind: "dialogue",
@@ -5996,41 +6725,53 @@ impl EditorApp {
             });
 
             if let Some(scene) = bundle.scenes.get(self.selected_scene) {
-                ui.collapsing(format!("Scripts in '{}' ({})", scene.id, scene.scripts.len()), |ui| {
-                    for script in &scene.scripts {
-                        if !filter_matches(&filter, &script.id) && !filter.is_empty() {
-                            continue;
-                        }
-                        ui.horizontal(|ui| {
-                            draw_text_thumbnail(
-                                ui,
-                                "Script",
-                                &script_preview_text(script),
-                                Color32::from_rgb(96, 208, 255),
-                            );
-                            ui.vertical(|ui| {
-                                if ui
-                                    .selectable_label(
-                                        false,
-                                        format!("{} ({} command(s))", script.id, script.commands.len()),
-                                    )
-                                    .clicked()
-                                {
-                                    pending_action = Some(PendingAssetAction::Status(format!(
-                                        "Script '{}' selected. A visual event editor would make this much faster to author.",
-                                        script.id
-                                    )));
-                                }
-                                ui.small(format!("Scene: {}", scene.id));
+                ui.collapsing(
+                    format!("Scripts in '{}' ({})", scene.id, scene.scripts.len()),
+                    |ui| {
+                        for (script_index, script) in scene.scripts.iter().enumerate() {
+                            if !filter_matches(&filter, &script.id) && !filter.is_empty() {
+                                continue;
+                            }
+                            ui.horizontal(|ui| {
+                                draw_text_thumbnail(
+                                    ui,
+                                    "Script",
+                                    &script_preview_text(script),
+                                    Color32::from_rgb(96, 208, 255),
+                                );
+                                ui.vertical(|ui| {
+                                    let label = format!(
+                                        "{} ({} command(s))",
+                                        script.id,
+                                        script.commands.len()
+                                    );
+                                    let response = ui.selectable_label(
+                                        self.selected_script == Some(script_index),
+                                        label,
+                                    );
+                                    if response.drag_started() {
+                                        self.asset_drag_payload = Some(AssetDragPayload::Script {
+                                            id: script.id.clone(),
+                                            label: script.id.clone(),
+                                        });
+                                    }
+                                    if response.clicked() {
+                                        pending_action = Some(PendingAssetAction::Script {
+                                            scene_index: self.selected_scene,
+                                            script_index,
+                                            label: script.id.clone(),
+                                        });
+                                    }
+                                    ui.small(format!("Scene: {}", scene.id));
+                                });
                             });
-                        });
-                    }
-                });
+                        }
+                    },
+                );
             }
 
-            ui.collapsing(
-                format!("Sprite Sources ({})", sprite_sources.len()),
-                |ui| match sprite_sources.is_empty() {
+            ui.collapsing(format!("Sprite Sources ({})", sprite_sources.len()), |ui| {
+                match sprite_sources.is_empty() {
                     true => {
                         ui.label("No project-local sprite sheets yet.");
                     }
@@ -6041,7 +6782,8 @@ impl EditorApp {
                                 continue;
                             }
                             ui.horizontal(|ui| {
-                                if let Some(texture) = self.sprite_source_preview_texture(ctx, path) {
+                                if let Some(texture) = self.sprite_source_preview_texture(ctx, path)
+                                {
                                     draw_sprite_source_thumbnail(ui, &texture, &label);
                                 } else {
                                     let (response, painter) =
@@ -6063,12 +6805,13 @@ impl EditorApp {
                                     }
                                 });
                                 if ui
-                                    .small_button(if self.is_asset_favorite("sprite_source", &label)
-                                    {
-                                        "Unstar"
-                                    } else {
-                                        "Star"
-                                    })
+                                    .small_button(
+                                        if self.is_asset_favorite("sprite_source", &label) {
+                                            "Unstar"
+                                        } else {
+                                            "Star"
+                                        },
+                                    )
                                     .clicked()
                                 {
                                     pending_action = Some(PendingAssetAction::ToggleFavorite {
@@ -6079,17 +6822,17 @@ impl EditorApp {
                             });
                         }
                     }
-                },
-            );
+                }
+            });
 
             ui.collapsing(
                 format!(
-                    "Scene Snippets ({})",
+                    "Legacy Scene Snippets ({})",
                     self.workspace_addons.scene_library.snippets.len()
                 ),
                 |ui| {
                     if self.workspace_addons.scene_library.snippets.is_empty() {
-                        ui.label("Save a selection as a snippet from the Scene tab.");
+                        ui.label("No legacy workspace snippets are stored for this project.");
                     } else {
                         for snippet in &self.workspace_addons.scene_library.snippets {
                             if !filter_matches(&filter, &snippet.name) && !filter.is_empty() {
@@ -6098,22 +6841,25 @@ impl EditorApp {
                             ui.horizontal(|ui| {
                                 draw_scene_snippet_thumbnail(ui, &bundle, snippet);
                                 ui.vertical(|ui| {
-                                    if ui
-                                        .selectable_label(
-                                            false,
-                                            format!(
-                                                "{} ({}x{} tiles, {} object(s))",
-                                                snippet.name,
-                                                snippet.size_tiles.width,
-                                                snippet.size_tiles.height,
-                                                snippet.spawns.len()
-                                                    + snippet.checkpoints.len()
-                                                    + snippet.entities.len()
-                                                    + snippet.triggers.len()
-                                            ),
-                                        )
-                                        .clicked()
-                                    {
+                                    let label = format!(
+                                        "{} ({}x{} tiles, {} object(s))",
+                                        snippet.name,
+                                        snippet.size_tiles.width,
+                                        snippet.size_tiles.height,
+                                        snippet.spawns.len()
+                                            + snippet.checkpoints.len()
+                                            + snippet.entities.len()
+                                            + snippet.triggers.len()
+                                    );
+                                    let response = ui.selectable_label(false, label);
+                                    if response.drag_started() {
+                                        self.asset_drag_payload =
+                                            Some(AssetDragPayload::LegacySnippet {
+                                                name: snippet.name.clone(),
+                                                label: snippet.name.clone(),
+                                            });
+                                    }
+                                    if response.clicked() {
                                         pending_action = Some(PendingAssetAction::LoadSnippet(
                                             snippet.name.clone(),
                                         ));
@@ -6123,6 +6869,12 @@ impl EditorApp {
                                             snippet.name.clone(),
                                         ));
                                     }
+                                    if ui.small_button("Promote").clicked() {
+                                        pending_action =
+                                            Some(PendingAssetAction::PromoteLegacySnippet(
+                                                snippet.name.clone(),
+                                            ));
+                                    }
                                 });
                             });
                         }
@@ -6131,7 +6883,10 @@ impl EditorApp {
             );
 
             ui.collapsing(
-                format!("Tile Brushes ({})", self.workspace_addons.scene_library.brushes.len()),
+                format!(
+                    "Tile Brushes ({})",
+                    self.workspace_addons.scene_library.brushes.len()
+                ),
                 |ui| {
                     if self.workspace_addons.scene_library.brushes.is_empty() {
                         ui.label("Save a selection as a brush from the Scene tab.");
@@ -6143,26 +6898,24 @@ impl EditorApp {
                             ui.horizontal(|ui| {
                                 draw_tile_brush_thumbnail(ui, brush);
                                 ui.vertical(|ui| {
-                                    if ui
-                                        .selectable_label(
-                                            false,
-                                            format!(
-                                                "{} ({}x{} tiles)",
-                                                brush.name,
-                                                brush.size_tiles.width,
-                                                brush.size_tiles.height
-                                            ),
-                                        )
-                                        .clicked()
-                                    {
-                                        pending_action = Some(PendingAssetAction::LoadBrush(
-                                            brush.name.clone(),
-                                        ));
+                                    let label = format!(
+                                        "{} ({}x{} tiles)",
+                                        brush.name, brush.size_tiles.width, brush.size_tiles.height
+                                    );
+                                    let response = ui.selectable_label(false, label);
+                                    if response.drag_started() {
+                                        self.asset_drag_payload = Some(AssetDragPayload::Brush {
+                                            name: brush.name.clone(),
+                                            label: brush.name.clone(),
+                                        });
+                                    }
+                                    if response.clicked() {
+                                        pending_action =
+                                            Some(PendingAssetAction::LoadBrush(brush.name.clone()));
                                     }
                                     if ui.small_button("Load").clicked() {
-                                        pending_action = Some(PendingAssetAction::LoadBrush(
-                                            brush.name.clone(),
-                                        ));
+                                        pending_action =
+                                            Some(PendingAssetAction::LoadBrush(brush.name.clone()));
                                     }
                                 });
                             });
@@ -6182,13 +6935,54 @@ impl EditorApp {
                     self.sync_selection();
                     self.status = format!("Selected scene '{}'", label);
                 }
+                PendingAssetAction::LoadPrefab(id) => {
+                    self.load_prefab_into_clipboard(&id);
+                }
+                PendingAssetAction::Metasprite {
+                    metasprite_index,
+                    label,
+                } => {
+                    self.selected_metasprite = Some(metasprite_index);
+                    self.selected_metasprite_piece = self
+                        .bundle
+                        .as_ref()
+                        .and_then(|bundle| bundle.metasprites.get(metasprite_index))
+                        .and_then(|metasprite| {
+                            sanitize_optional_index(Some(0), metasprite.pieces.len())
+                        });
+                    self.preview_focus = PreviewFocus::Metasprite;
+                    self.metasprite_drag_state = None;
+                    self.metasprite_place_mode = false;
+                    self.workspace.layout.show_tab(DockTab::Animation);
+                    self.status = format!("Selected metasprite '{}'", label);
+                }
                 PendingAssetAction::Animation {
                     animation_index,
                     label,
                 } => {
                     self.selected_animation = animation_index;
                     self.preview_focus = PreviewFocus::Animation;
+                    self.animation_preview_scrub_frame = 0;
+                    self.animation_preview_play_anchor_tick = 0;
+                    self.animation_preview_play_anchor_seconds = 0.0;
+                    self.metasprite_drag_state = None;
+                    self.metasprite_place_mode = false;
                     self.status = format!("Selected animation '{}'", label);
+                }
+                PendingAssetAction::Dialogue {
+                    dialogue_index,
+                    label,
+                } => {
+                    self.select_dialogue(dialogue_index);
+                    self.status = format!("Selected dialogue '{}'", label);
+                }
+                PendingAssetAction::Script {
+                    scene_index,
+                    script_index,
+                    label,
+                } => {
+                    self.select_script(scene_index, script_index);
+                    self.status = format!("Selected script '{}'", label);
                 }
                 PendingAssetAction::Status(message) => {
                     self.status = message;
@@ -6206,53 +7000,15 @@ impl EditorApp {
                 PendingAssetAction::LoadSnippet(name) => {
                     self.load_snippet_into_clipboard(&name);
                 }
+                PendingAssetAction::PromoteLegacySnippet(name) => {
+                    self.promote_legacy_snippet_to_prefab(&name);
+                }
             }
         }
     }
 
     fn draw_animation_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        let Some(bundle) = &self.bundle else {
-            ui.heading("Animation");
-            ui.label("Load a project to preview animations.");
-            return;
-        };
-
-        let metasprite_ids = bundle
-            .metasprites
-            .iter()
-            .map(|metasprite| metasprite.id.clone())
-            .collect::<Vec<_>>();
-        let animation_snapshot = bundle.animations.get(self.selected_animation).cloned();
-
-        ui.heading("Animation");
-        ui.label("Preview the active animation or entity context while editing frame data.");
-        ui.separator();
-        ui.label("Animations");
-        egui::ScrollArea::vertical().max_height(180.0).show(ui, |ui| {
-            for (index, animation) in bundle.animations.iter().enumerate() {
-                if ui
-                    .selectable_label(
-                        self.selected_animation == index,
-                        format!("{} ({} frame(s))", animation.id, animation.frames.len()),
-                    )
-                    .clicked()
-                {
-                    self.selected_animation = index;
-                    self.preview_focus = PreviewFocus::Animation;
-                }
-            }
-        });
-        ui.separator();
-        if self.has_context_preview() {
-            self.draw_context_preview(ui, ctx.input(|input| input.time) as f32);
-        } else if bundle.animations.get(self.selected_animation).is_some() {
-            self.preview_focus = PreviewFocus::Animation;
-            self.draw_context_preview(ui, ctx.input(|input| input.time) as f32);
-        } else {
-            ui.label("Select an animation to preview it here.");
-        }
-        ui.separator();
-        self.draw_animation_inspector(ui, animation_snapshot.as_ref(), &metasprite_ids);
+        draw_animation_tab_impl(self, ui, ctx);
     }
 
     fn draw_build_report_tab(&mut self, ui: &mut egui::Ui) {
@@ -6333,7 +7089,10 @@ impl EditorApp {
         });
     }
 
+    #[allow(unreachable_code)]
     fn draw_playtest_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        self.draw_playtest_tab_panel(ui, ctx);
+        return;
         let Some(bundle_snapshot) = self.bundle.clone() else {
             ui.heading("Playtest");
             ui.label("Load a project to use the in-editor playtest sandbox.");
@@ -6541,9 +7300,7 @@ impl EditorApp {
                         .changed();
                     ui.label("Jump Buffer");
                     changed |= ui
-                        .add(
-                            egui::DragValue::new(&mut edited.jump_buffer_frames).range(0..=16),
-                        )
+                        .add(egui::DragValue::new(&mut edited.jump_buffer_frames).range(0..=16))
                         .changed();
                 });
             });
@@ -6580,7 +7337,11 @@ impl EditorApp {
                     let mut duplicate = preset_snapshot.clone();
                     duplicate.id = next_unique_layer_id(&existing, &preset_snapshot.id);
                     self.playtest_state.selected_physics_id = duplicate.id.clone();
-                    bundle.manifest.gameplay.physics_presets.push(duplicate.clone());
+                    bundle
+                        .manifest
+                        .gameplay
+                        .physics_presets
+                        .push(duplicate.clone());
                     duplicated_label = Some(duplicate.id);
                     restart_session = true;
                 }
@@ -6600,8 +7361,7 @@ impl EditorApp {
                         .iter_mut()
                         .find(|preset| preset.id == preset_snapshot.id)
                     {
-                        *target =
-                            template_physics_profile(target.family, target.id.clone());
+                        *target = template_physics_profile(target.family, target.id.clone());
                         reset_label = Some(target.id.clone());
                         restart_session = true;
                     }
@@ -6637,10 +7397,7 @@ impl EditorApp {
         if let Some(profile) = self.selected_physics_profile() {
             ui.separator();
             ui.collapsing("Movement Trace", |ui| {
-                let trace = simulate_trace(
-                    &profile,
-                    &sample_platformer_trace_input(),
-                );
+                let trace = simulate_trace(&profile, &sample_platformer_trace_input());
                 draw_trace_chart(ui, &trace, "Y Position", |frame| frame.y_fp);
                 draw_trace_chart(ui, &trace, "Horizontal Speed", |frame| frame.vx_fp);
                 ui.label(format!(
@@ -6659,8 +7416,11 @@ impl EditorApp {
         let playtest_viewport = Vec2::new(ui.available_width(), 280.0);
         let mut camera_offset = Vec2::ZERO;
         if let (Some(scene), Some(state)) = (
-            bundle_snapshot.scenes.get(self.selected_scene),
-            self.playtest_state.session.as_ref().map(|session| session.state()),
+            bundle_snapshot.resolved_scene_by_index(self.selected_scene),
+            self.playtest_state
+                .session
+                .as_ref()
+                .map(|session| session.state()),
         ) {
             let focus_rect = RectI16 {
                 x: (state.x_fp >> snesmaker_project::FIXED_POINT_SHIFT) as i16,
@@ -6694,6 +7454,7 @@ impl EditorApp {
             self.selected_checkpoint,
             self.selected_entity,
             self.selected_trigger,
+            self.selected_prefab_instance,
             None,
             None,
             false,
@@ -6729,7 +7490,7 @@ impl EditorApp {
                 );
             }
 
-            if let Some(scene) = bundle_snapshot.scenes.get(self.selected_scene) {
+            if let Some(scene) = bundle_snapshot.resolved_scene_by_index(self.selected_scene) {
                 let player_rect = RectI16 {
                     x: (state.x_fp >> snesmaker_project::FIXED_POINT_SHIFT) as i16,
                     y: (state.y_fp >> snesmaker_project::FIXED_POINT_SHIFT) as i16,
@@ -6758,7 +7519,11 @@ impl EditorApp {
                 ui.label(format!(
                     "Entity state: {} active / {} inactive",
                     scene.entities.iter().filter(|entity| entity.active).count(),
-                    scene.entities.iter().filter(|entity| !entity.active).count()
+                    scene
+                        .entities
+                        .iter()
+                        .filter(|entity| !entity.active)
+                        .count()
                 ));
             }
         } else {
@@ -6817,10 +7582,7 @@ impl EditorApp {
                     if let Some(active_tab) = slot.active_tab() {
                         ui.menu_button("Dock", |ui| {
                             for target in DockArea::ALL {
-                                if ui
-                                    .button(format!("Move to {}", target.label()))
-                                    .clicked()
-                                {
+                                if ui.button(format!("Move to {}", target.label())).clicked() {
                                     pending_move_tab = Some((active_tab, target));
                                     ui.close();
                                 }
@@ -6863,6 +7625,7 @@ impl EditorApp {
                             DockTab::Outliner => self.draw_scene_outliner(ui),
                             DockTab::Assets => self.draw_asset_browser(ui, ctx),
                             DockTab::Animation => self.draw_animation_tab(ui, ctx),
+                            DockTab::Events => self.draw_events_tab(ui),
                             DockTab::Diagnostics => self.draw_diagnostics(ui),
                             DockTab::BuildReport => self.draw_build_report_tab(ui),
                             DockTab::Playtest => self.draw_playtest_tab(ui, ctx),
@@ -6984,25 +7747,30 @@ impl EditorApp {
             return;
         }
 
-        let (scene_label, entry_scene, active_layer_label, active_layer_locked, active_layer_hidden) =
-            {
-                let bundle = self.bundle.as_ref().expect("bundle");
-                let scene = bundle.scenes.get(self.selected_scene);
-                (
-                    scene
-                        .map(|scene| scene.id.clone())
-                        .unwrap_or_else(|| "no_scene".to_string()),
-                    bundle.manifest.gameplay.entry_scene.clone(),
-                    scene
-                        .and_then(|scene| scene.layers.get(self.selected_layer))
-                        .map(|layer| layer.id.clone())
-                        .unwrap_or_else(|| "no_layer".to_string()),
-                    self.active_layer_locked(),
-                    scene
-                        .and_then(|scene| scene.layers.get(self.selected_layer))
-                        .is_some_and(|layer| !layer.visible),
-                )
-            };
+        let (
+            scene_label,
+            entry_scene,
+            active_layer_label,
+            active_layer_locked,
+            active_layer_hidden,
+        ) = {
+            let bundle = self.bundle.as_ref().expect("bundle");
+            let scene = bundle.scenes.get(self.selected_scene);
+            (
+                scene
+                    .map(|scene| scene.id.clone())
+                    .unwrap_or_else(|| "no_scene".to_string()),
+                bundle.manifest.gameplay.entry_scene.clone(),
+                scene
+                    .and_then(|scene| scene.layers.get(self.selected_layer))
+                    .map(|layer| layer.id.clone())
+                    .unwrap_or_else(|| "no_layer".to_string()),
+                self.active_layer_locked(),
+                scene
+                    .and_then(|scene| scene.layers.get(self.selected_layer))
+                    .is_some_and(|layer| !layer.visible),
+            )
+        };
 
         ui.horizontal_wrapped(|ui| {
             ui.heading("Scene Preview");
@@ -7030,12 +7798,8 @@ impl EditorApp {
         let bundle = self.bundle.as_ref().expect("bundle");
         let content_size = scene_content_size(bundle, self.selected_scene, self.scene_zoom);
         if let Some(focus_rect) = self.pending_focus_rect.take() {
-            self.scene_scroll_offset = focus_offset_for_rect(
-                focus_rect,
-                self.scene_zoom,
-                viewport_size,
-                content_size,
-            );
+            self.scene_scroll_offset =
+                focus_offset_for_rect(focus_rect, self.scene_zoom, viewport_size, content_size);
         }
         self.scene_scroll_offset =
             clamp_scene_scroll_offset(self.scene_scroll_offset, content_size, viewport_size);
@@ -7054,6 +7818,7 @@ impl EditorApp {
             self.selected_checkpoint,
             self.selected_entity,
             self.selected_trigger,
+            self.selected_prefab_instance,
             self.selection.as_ref(),
             self.selection_drag_anchor,
             self.tool == EditorTool::Select,
@@ -7071,7 +7836,8 @@ impl EditorApp {
             && ctx
                 .input(|input| input.pointer.interact_pos())
                 .is_some_and(|position| !outcome.viewport_rect.contains(position));
-        if clicked_outside_view && (self.selection.is_some() || self.selection_drag_anchor.is_some())
+        if clicked_outside_view
+            && (self.selection.is_some() || self.selection_drag_anchor.is_some())
         {
             self.clear_selection();
             self.status = "Selection cleared".to_string();
@@ -7081,16 +7847,18 @@ impl EditorApp {
             ui.label(format!("Hovered tile: ({}, {})", x, y));
         }
 
-        if let Some(selection) = &self.selection {
+        if let Some(selection_rect) = self.selection.as_ref().map(|selection| selection.rect) {
             ui.add_space(6.0);
             ui.label(format!(
                 "Selection Actions for {}x{} region",
-                selection.rect.width_tiles(),
-                selection.rect.height_tiles()
+                selection_rect.width_tiles(),
+                selection_rect.height_tiles()
             ));
             ui.horizontal_wrapped(|ui| {
                 if ui.button("Fill Tiles").clicked() {
-                    self.apply_selection_action(SelectionAction::PaintTile(self.selected_tile as u16));
+                    self.apply_selection_action(SelectionAction::PaintTile(
+                        self.selected_tile as u16,
+                    ));
                 }
                 if ui.button("Clear Tiles").clicked() {
                     self.apply_selection_action(SelectionAction::PaintTile(0));
@@ -7131,8 +7899,11 @@ impl EditorApp {
                 if ui.button("Save Brush").clicked() {
                     self.save_selection_as_brush();
                 }
-                if ui.button("Save Snippet").clicked() {
-                    self.save_selection_as_snippet();
+                if ui.button("Save Prefab").clicked() {
+                    self.save_selection_as_prefab();
+                }
+                if ui.button("Rebuild Auto-Tiling").clicked() {
+                    self.rebuild_adjacency_for_rect(selection_rect, "the selection");
                 }
             });
         }
@@ -7140,12 +7911,13 @@ impl EditorApp {
         ui.add_space(12.0);
         ui.collapsing("Workflow", |ui| {
             ui.label("1. Use Select to drag a region and copy or paste tiles and objects.");
-            ui.label("2. Paint the stage with tiles, use selection actions for bulk edits, and mark solids, ladders, and hazards.");
+            ui.label("2. Paint the stage with tiles, use selection actions for bulk edits, and rebuild auto-tiling when you want rule-based cleanup.");
             ui.label("3. Add spawns, checkpoints, entities, and triggers from the inspector.");
             ui.label("4. Import a sprite sheet to create new metasprites and animations.");
             ui.label("5. Save, then build the ROM.");
         });
-        self.apply_canvas_outcome(outcome);
+        self.apply_canvas_outcome(&outcome);
+        self.handle_scene_asset_drop(ctx, &outcome);
     }
 
     fn apply_scene_view_gestures(
@@ -7193,8 +7965,13 @@ impl EditorApp {
             clamp_scene_scroll_offset(next_offset, next_content_size, viewport_rect.size());
     }
 
-    fn apply_canvas_outcome(&mut self, outcome: SceneCanvasOutcome) {
+    fn apply_canvas_outcome(&mut self, outcome: &SceneCanvasOutcome) {
         self.last_canvas_tile = outcome.hovered_tile;
+
+        if self.asset_drag_payload.is_some() {
+            self.active_canvas_cell = None;
+            return;
+        }
 
         if let Some(cell_index) = outcome.sampled_cell {
             self.sample_tile_from_cell(cell_index);
@@ -7231,6 +8008,7 @@ impl EditorApp {
         let selected_checkpoint = self.selected_checkpoint;
         let selected_entity = self.selected_entity;
         let selected_trigger = self.selected_trigger;
+        let selected_prefab_instance = self.selected_prefab_instance;
         let scene_pos = outcome.world_cell_position;
         let collision_value = outcome.primary_cell.is_some();
         let active_layer_locked = self.active_layer_locked();
@@ -7244,6 +8022,7 @@ impl EditorApp {
             MoveCheckpoint(usize, PointI16),
             MoveEntity(usize, PointI16),
             MoveTrigger(usize, PointI16),
+            MovePrefabInstance(usize, PointI16),
         }
 
         let pending = match tool {
@@ -7265,6 +8044,8 @@ impl EditorApp {
             EditorTool::Trigger => {
                 selected_trigger.map(|index| PendingSceneEdit::MoveTrigger(index, scene_pos))
             }
+            EditorTool::Prefab => selected_prefab_instance
+                .map(|index| PendingSceneEdit::MovePrefabInstance(index, scene_pos)),
         };
 
         if active_layer_locked && matches!(pending, Some(PendingSceneEdit::PaintTile(_))) {
@@ -7278,6 +8059,7 @@ impl EditorApp {
 
         let mut edited = false;
         let mut status = None;
+        let mut autotile_rect = None;
         if let Some(pending) = pending {
             self.capture_history();
             match pending {
@@ -7291,6 +8073,9 @@ impl EditorApp {
                             } else {
                                 format!("Painted tile {} into '{}'", tile_index, layer.id)
                             });
+                            autotile_rect = outcome
+                                .hovered_tile
+                                .map(|tile| TileSelectionRect::from_points(tile, tile));
                         }
                     }
                 }
@@ -7309,6 +8094,9 @@ impl EditorApp {
                             scene.collision.ladders[cell_index] = value;
                             edited = true;
                             status = Some("Updated ladder collision".to_string());
+                            autotile_rect = outcome
+                                .hovered_tile
+                                .map(|tile| TileSelectionRect::from_points(tile, tile));
                         }
                     }
                 }
@@ -7318,6 +8106,9 @@ impl EditorApp {
                             scene.collision.hazards[cell_index] = value;
                             edited = true;
                             status = Some("Updated hazard collision".to_string());
+                            autotile_rect = outcome
+                                .hovered_tile
+                                .map(|tile| TileSelectionRect::from_points(tile, tile));
                         }
                     }
                 }
@@ -7358,10 +8149,28 @@ impl EditorApp {
                         }
                     }
                 }
+                PendingSceneEdit::MovePrefabInstance(index, position) => {
+                    if let Some(scene) = self.current_scene_mut() {
+                        if let Some(instance) = scene.prefab_instances.get_mut(index) {
+                            instance.position = position;
+                            edited = true;
+                            status = Some(format!("Moved prefab instance '{}'", instance.id));
+                        }
+                    }
+                }
             }
         }
 
         if edited {
+            if let Some(rect) = autotile_rect {
+                let autotile_changes = self.apply_adjacency_rules_to_current_scene(rect);
+                if autotile_changes > 0 {
+                    status = Some(format!(
+                        "{} + auto-tiling",
+                        status.unwrap_or_else(|| "Updated scene".to_string())
+                    ));
+                }
+            }
             self.active_canvas_cell = Some(cell_index);
             self.mark_edited(status.unwrap_or_else(|| "Updated scene".to_string()));
         } else {
@@ -7373,6 +8182,36 @@ impl EditorApp {
         self.bundle
             .as_mut()
             .and_then(|bundle| bundle.scenes.get_mut(self.selected_scene))
+    }
+
+    fn select_dialogue(&mut self, dialogue_index: usize) {
+        self.selected_dialogue = Some(dialogue_index);
+        self.selected_dialogue_node = self
+            .bundle
+            .as_ref()
+            .and_then(|bundle| bundle.dialogues.get(dialogue_index))
+            .and_then(|dialogue| sanitize_optional_index(Some(0), dialogue.nodes.len()));
+        self.selected_script = None;
+        self.preview_focus = PreviewFocus::None;
+        self.workspace.layout.show_tab(DockTab::Events);
+    }
+
+    fn select_script(&mut self, scene_index: usize, script_index: usize) {
+        self.selected_scene = scene_index;
+        self.scene_scroll_offset = Vec2::ZERO;
+        self.sync_selection();
+        self.selected_script = sanitize_optional_index(
+            Some(script_index),
+            self.bundle
+                .as_ref()
+                .and_then(|bundle| bundle.scenes.get(scene_index))
+                .map(|scene| scene.scripts.len())
+                .unwrap_or(0),
+        );
+        self.selected_dialogue = None;
+        self.selected_dialogue_node = None;
+        self.preview_focus = PreviewFocus::None;
+        self.workspace.layout.show_tab(DockTab::Events);
     }
 
     fn draw_windows(&mut self, ctx: &egui::Context) {
@@ -7397,8 +8236,8 @@ impl EditorApp {
                     ui.label("Alt-click the canvas to sample a tile from the active layer.");
                     ui.label("Use two-finger horizontal or vertical scrolling to pan around larger scenes, and pinch to zoom in or out.");
                     ui.label("Use the Paint tool with the tile browser to build the stage.");
-                    ui.label("Use the selection action bar to fill or clear tiles and collision in bulk.");
-                    ui.label("Use Solid, Ladder, and Hazard to mark collision directly on the map.");
+                    ui.label("Use the selection action bar to fill or clear tiles and collision in bulk, then rebuild auto-tiling when needed.");
+                    ui.label("Use Solid, Ladder, and Hazard to mark collision directly on the map; auto-tiling rules can also drive ladder and hazard visuals.");
                     ui.label("Use Spawn, Checkpoint, Entity, and Trigger to place gameplay markers.");
                     ui.separator();
                     ui.heading("Sprite Sheet Import");
@@ -7406,8 +8245,9 @@ impl EditorApp {
                     ui.label("Imported frames become metasprites, and selected animations can now swap or reorder those metasprite frames in the inspector.");
                     ui.separator();
                     ui.heading("Current Scope");
-                    ui.label("The editor now supports project loading, save/export, preview, tile painting, collision painting, object placement, tile pixel editing, sprite-sheet import, validation, and ROM builds.");
-                    ui.label("Dialogue graphs and cutscene scripting are still authored in files for now.");
+                    ui.label("The editor now supports project loading, save/export, preview, tile painting, collision painting, auto-tiling, object placement, tile pixel editing, sprite-sheet import, validation, and ROM builds.");
+                    ui.label("Dialogues, scene scripts, and trigger bindings can now be edited from the Events tab.");
+                    ui.label("The Events workflow now includes a node graph canvas plus inline validator feedback for dialogue nodes, scripts, and trigger bindings.");
                 });
             self.show_help = open;
         }
@@ -7502,7 +8342,10 @@ impl EditorApp {
         }
     }
 
+    #[allow(unreachable_code)]
     fn draw_import_window(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        self.draw_import_window_panel(ui, ctx);
+        return;
         if self.bundle.is_none() {
             ui.label("Load a project before importing sprites.");
             return;
@@ -7638,6 +8481,7 @@ impl eframe::App for EditorApp {
         self.draw_menu_bar(ctx);
         self.draw_workspace(ctx);
         self.draw_windows(ctx);
+        self.draw_asset_drag_preview(ctx);
         if self.needs_animation_repaint() {
             ctx.request_repaint_after(Duration::from_millis(16));
         }
@@ -7672,7 +8516,7 @@ impl Default for SceneCanvasOutcome {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, unreachable_code)]
 fn draw_scene_canvas(
     ui: &mut egui::Ui,
     bundle: &ProjectBundle,
@@ -7688,6 +8532,7 @@ fn draw_scene_canvas(
     selected_checkpoint: Option<usize>,
     selected_entity: Option<usize>,
     selected_trigger: Option<usize>,
+    selected_prefab_instance: Option<usize>,
     current_selection: Option<&SceneSelection>,
     selection_drag_anchor: Option<(usize, usize)>,
     selection_mode: bool,
@@ -7699,10 +8544,38 @@ fn draw_scene_canvas(
     show_triggers: bool,
     time_seconds: f32,
 ) -> SceneCanvasOutcome {
-    let Some(scene) = bundle.scenes.get(scene_index) else {
+    return scene_canvas::draw_scene_canvas(
+        ui,
+        bundle,
+        scene_index,
+        zoom,
+        camera_offset,
+        viewport_size,
+        show_grid,
+        show_collision,
+        selected_layer,
+        selected_tile,
+        selected_spawn,
+        selected_checkpoint,
+        selected_entity,
+        selected_trigger,
+        selected_prefab_instance,
+        current_selection,
+        selection_drag_anchor,
+        selection_mode,
+        solo_layer,
+        solo_group,
+        show_spawns,
+        show_checkpoints,
+        show_entities,
+        show_triggers,
+        time_seconds,
+    );
+    let Some(raw_scene) = bundle.scenes.get(scene_index) else {
         ui.label("No scene selected.");
         return SceneCanvasOutcome::default();
     };
+    let scene = bundle.resolve_scene(raw_scene);
     if scene.layers.is_empty() {
         ui.label("Scene has no tile layer.");
         return SceneCanvasOutcome::default();
@@ -7856,13 +8729,23 @@ fn draw_scene_canvas(
             time_seconds,
         );
     }
+    if solo_group.is_none() || solo_group == Some(SceneObjectGroup::Prefabs) {
+        draw_prefab_instances(
+            &painter,
+            rect,
+            zoom,
+            bundle,
+            &raw_scene.prefab_instances,
+            selected_prefab_instance,
+        );
+    }
 
     if let Some(selection) = current_selection {
-        draw_scene_selection_overlay(&painter, rect, zoom, scene, selection);
+        draw_scene_selection_overlay(&painter, rect, zoom, raw_scene, selection);
     }
 
     let selected_rect =
-        selected_tile_preview_rect(rect, scene, selected_layer, selected_tile, zoom);
+        selected_tile_preview_rect(rect, &scene, selected_layer, selected_tile, zoom);
     if let Some(highlight) = selected_rect {
         painter.rect_stroke(
             highlight,
@@ -7874,19 +8757,19 @@ fn draw_scene_canvas(
 
     let hover_pos = response.hover_pos();
     let hovered_tile = hover_pos.and_then(|position| {
-        world_tile_from_pos(position, rect, scene, zoom).map(|(x, y, _)| (x, y))
+        world_tile_from_pos(position, rect, &scene, zoom).map(|(x, y, _)| (x, y))
     });
     let sampling_mode = !selection_mode && ui.input(|input| input.modifiers.alt);
     let sampled_cell = if sampling_mode && response.clicked_by(egui::PointerButton::Primary) {
         response.interact_pointer_pos().and_then(|position| {
-            world_tile_from_pos(position, rect, scene, zoom).map(|(_, _, index)| index)
+            world_tile_from_pos(position, rect, &scene, zoom).map(|(_, _, index)| index)
         })
     } else {
         None
     };
 
     let interact_tile = response.interact_pointer_pos().and_then(|position| {
-        world_tile_from_pos(position, rect, scene, zoom).map(|(x, y, _)| (x, y))
+        world_tile_from_pos(position, rect, &scene, zoom).map(|(x, y, _)| (x, y))
     });
 
     let selection_started = selection_mode.then_some(()).and_then(|_| {
@@ -7927,7 +8810,7 @@ fn draw_scene_canvas(
     let primary_cell =
         if !selection_mode && !sampling_mode && ui.input(|input| input.pointer.primary_down()) {
             hover_pos.and_then(|position| {
-                world_tile_from_pos(position, rect, scene, zoom).map(|(_, _, index)| index)
+                world_tile_from_pos(position, rect, &scene, zoom).map(|(_, _, index)| index)
             })
         } else {
             None
@@ -7935,14 +8818,14 @@ fn draw_scene_canvas(
 
     let secondary_cell = if !selection_mode && ui.input(|input| input.pointer.secondary_down()) {
         hover_pos.and_then(|position| {
-            world_tile_from_pos(position, rect, scene, zoom).map(|(_, _, index)| index)
+            world_tile_from_pos(position, rect, &scene, zoom).map(|(_, _, index)| index)
         })
     } else {
         None
     };
 
     let world_cell_position = hover_pos
-        .and_then(|position| world_tile_from_pos(position, rect, scene, zoom))
+        .and_then(|position| world_tile_from_pos(position, rect, &scene, zoom))
         .map(|(tile_x, tile_y, _)| PointI16 {
             x: (tile_x * 8) as i16,
             y: (tile_y * 8) as i16,
@@ -7962,87 +8845,12 @@ fn draw_scene_canvas(
     }
 }
 
-fn draw_animation_preview(
-    ui: &mut egui::Ui,
-    bundle: &ProjectBundle,
-    animation_index: usize,
-    time_seconds: f32,
-) {
-    let Some(animation) = bundle.animations.get(animation_index) else {
-        ui.label("No animation selected.");
-        return;
-    };
-    let Some(metasprite) = metasprite_for_animation_frame(bundle, animation, time_seconds) else {
-        ui.label("Animation has no renderable frames.");
-        return;
-    };
-
-    let Some(tileset) = find_tileset_for_metasprite(bundle, metasprite) else {
-        ui.label("No tileset found for the selected metasprite.");
-        return;
-    };
-    let Some(palette) = bundle.palette(&metasprite.palette_id) else {
-        ui.label("No palette found for the selected metasprite.");
-        return;
-    };
-
-    draw_metasprite_preview_canvas(ui, metasprite, tileset, palette, Facing::Right);
-}
-
-fn draw_entity_preview(
-    ui: &mut egui::Ui,
-    bundle: &ProjectBundle,
-    entity: &EntityPlacement,
-    time_seconds: f32,
-) {
-    let Some(metasprite) = metasprite_for_entity(bundle, entity, time_seconds) else {
-        ui.label("Selected entity has no animation or metasprite preview.");
-        return;
-    };
-    let Some(tileset) = find_tileset_for_metasprite(bundle, metasprite) else {
-        ui.label("No tileset found for the selected entity preview.");
-        return;
-    };
-    let Some(palette) = bundle.palette(&metasprite.palette_id) else {
-        ui.label("No palette found for the selected entity preview.");
-        return;
-    };
-
-    draw_metasprite_preview_canvas(ui, metasprite, tileset, palette, entity.facing);
-}
-
-fn draw_metasprite_preview_canvas(
-    ui: &mut egui::Ui,
-    metasprite: &MetaspriteResource,
-    tileset: &TilesetResource,
-    palette: &PaletteResource,
-    facing: Facing,
-) {
-    let desired = Vec2::new(192.0, 192.0);
-    let (response, painter) = ui.allocate_painter(desired, Sense::hover());
-    painter.rect_filled(response.rect, 6.0, Color32::from_rgb(18, 26, 34));
-    draw_metasprite(
-        &painter,
-        response.rect.center() - Vec2::new(32.0, 32.0),
-        metasprite,
-        tileset,
-        palette,
-        4.0,
-        facing,
-        true,
-    );
-}
-
-fn draw_text_thumbnail(
-    ui: &mut egui::Ui,
-    title: &str,
-    body: &str,
-    accent: Color32,
-) {
+fn draw_text_thumbnail(ui: &mut egui::Ui, title: &str, body: &str, accent: Color32) {
     let desired = Vec2::new(96.0, 56.0);
     let (response, painter) = ui.allocate_painter(desired, Sense::hover());
     painter.rect_filled(response.rect, 6.0, Color32::from_rgb(18, 26, 34));
-    let accent_rect = Rect::from_min_size(response.rect.min, Vec2::new(4.0, response.rect.height()));
+    let accent_rect =
+        Rect::from_min_size(response.rect.min, Vec2::new(4.0, response.rect.height()));
     painter.rect_filled(accent_rect, 4.0, accent);
     painter.text(
         response.rect.min + Vec2::new(10.0, 8.0),
@@ -8061,43 +8869,11 @@ fn draw_text_thumbnail(
 }
 
 fn dialogue_preview_text(dialogue: &DialogueGraph) -> String {
-    dialogue
-        .nodes
-        .iter()
-        .find(|node| node.id == dialogue.opening_node)
-        .or_else(|| dialogue.nodes.first())
-        .map(|node| {
-            if node.speaker.trim().is_empty() {
-                node.text.clone()
-            } else {
-                format!("{}: {}", node.speaker, node.text)
-            }
-        })
-        .unwrap_or_else(|| "Empty dialogue".to_string())
-}
-
-fn event_command_label(command: &EventCommand) -> &'static str {
-    match command {
-        EventCommand::ShowDialogue { .. } => "ShowDialogue",
-        EventCommand::SetFlag { .. } => "SetFlag",
-        EventCommand::Wait { .. } => "Wait",
-        EventCommand::MoveCamera { .. } => "MoveCamera",
-        EventCommand::FreezePlayer { .. } => "FreezePlayer",
-        EventCommand::SpawnEntity { .. } => "SpawnEntity",
-        EventCommand::LoadScene { .. } => "LoadScene",
-        EventCommand::StartBattleScene { .. } => "StartBattleScene",
-        EventCommand::PlayCutscene { .. } => "PlayCutscene",
-        EventCommand::EmitCheckpoint { .. } => "EmitCheckpoint",
-    }
+    dialogue_preview_text_impl(dialogue)
 }
 
 fn script_preview_text(script: &EventScript) -> String {
-    script
-        .commands
-        .first()
-        .map(event_command_label)
-        .map(|label| format!("{} command(s), starts with {}", script.commands.len(), label))
-        .unwrap_or_else(|| "No commands".to_string())
+    script_preview_text_impl(script)
 }
 
 fn truncate_preview_text(value: &str, max_chars: usize) -> String {
@@ -8400,13 +9176,83 @@ fn draw_scene_snippet_thumbnail(
     for y in 0..grid_height.min(4) {
         for x in 0..grid_width.min(4) {
             let index = y * grid_width + x;
-            let Some(tile) = layer.tiles.get(index).and_then(|tile_index| {
-                tileset.tiles.get(*tile_index as usize)
-            }) else {
+            let Some(tile) = layer
+                .tiles
+                .get(index)
+                .and_then(|tile_index| tileset.tiles.get(*tile_index as usize))
+            else {
                 continue;
             };
             let cell = Rect::from_min_size(
-                Pos2::new(rect.left() + x as f32 * tile_size.x, rect.top() + y as f32 * tile_size.y),
+                Pos2::new(
+                    rect.left() + x as f32 * tile_size.x,
+                    rect.top() + y as f32 * tile_size.y,
+                ),
+                tile_size,
+            );
+            draw_tile_pixels(&painter, cell, tile, palette);
+        }
+    }
+}
+
+fn draw_prefab_thumbnail(ui: &mut egui::Ui, bundle: &ProjectBundle, prefab: &PrefabResource) {
+    let (response, painter) = draw_asset_thumbnail_frame(ui, Vec2::new(92.0, 54.0));
+    let rect = response.rect.shrink(4.0);
+    let Some(layer) = prefab.layers.first() else {
+        painter.text(
+            rect.center(),
+            Align2::CENTER_CENTER,
+            "Empty",
+            FontId::proportional(12.0),
+            Color32::from_rgb(170, 180, 190),
+        );
+        return;
+    };
+    let Some(tileset) = bundle.tileset(&layer.tileset_id) else {
+        painter.text(
+            rect.center(),
+            Align2::CENTER_CENTER,
+            "No tileset",
+            FontId::proportional(12.0),
+            Color32::from_rgb(180, 160, 160),
+        );
+        return;
+    };
+    let Some(palette) = bundle.palette(&tileset.palette_id) else {
+        painter.text(
+            rect.center(),
+            Align2::CENTER_CENTER,
+            "No palette",
+            FontId::proportional(12.0),
+            Color32::from_rgb(180, 160, 160),
+        );
+        return;
+    };
+
+    let grid_width = prefab.size_tiles.width.max(1) as usize;
+    let grid_height = prefab.size_tiles.height.max(1) as usize;
+    let tile_scale = Vec2::new(
+        rect.width() / grid_width as f32 / 8.0,
+        rect.height() / grid_height as f32 / 8.0,
+    );
+    let scale = tile_scale.x.min(tile_scale.y).clamp(1.0, 4.0);
+    let tile_size = Vec2::splat(8.0 * scale);
+
+    for y in 0..grid_height.min(4) {
+        for x in 0..grid_width.min(4) {
+            let index = y * grid_width + x;
+            let Some(tile) = layer
+                .tiles
+                .get(index)
+                .and_then(|tile_index| tileset.tiles.get(*tile_index as usize))
+            else {
+                continue;
+            };
+            let cell = Rect::from_min_size(
+                Pos2::new(
+                    rect.left() + x as f32 * tile_size.x,
+                    rect.top() + y as f32 * tile_size.y,
+                ),
                 tile_size,
             );
             draw_tile_pixels(&painter, cell, tile, palette);
@@ -8438,10 +9284,17 @@ fn draw_tile_brush_thumbnail(ui: &mut egui::Ui, brush: &SavedTileBrush) {
             let value = brush.tiles.get(index).copied().unwrap_or_default();
             let hue = ((value as u32 * 37) % 255) as u8;
             let cell = Rect::from_min_size(
-                Pos2::new(rect.left() + x as f32 * cell_w, rect.top() + y as f32 * cell_h),
+                Pos2::new(
+                    rect.left() + x as f32 * cell_w,
+                    rect.top() + y as f32 * cell_h,
+                ),
                 Vec2::new(cell_w - 2.0, cell_h - 2.0),
             );
-            painter.rect_filled(cell, 2.0, Color32::from_rgb(60 + hue / 3, 70 + hue / 4, 100 + hue / 5));
+            painter.rect_filled(
+                cell,
+                2.0,
+                Color32::from_rgb(60 + hue / 3, 70 + hue / 4, 100 + hue / 5),
+            );
             painter.rect_stroke(
                 cell,
                 2.0,
@@ -8452,11 +9305,7 @@ fn draw_tile_brush_thumbnail(ui: &mut egui::Ui, brush: &SavedTileBrush) {
     }
 }
 
-fn draw_sprite_source_thumbnail(
-    ui: &mut egui::Ui,
-    texture: &TextureHandle,
-    label: &str,
-) {
+fn draw_sprite_source_thumbnail(ui: &mut egui::Ui, texture: &TextureHandle, label: &str) {
     let (response, painter) = draw_asset_thumbnail_frame(ui, Vec2::new(92.0, 54.0));
     let rect = response.rect.shrink(4.0);
     let image_rect = Rect::from_center_size(rect.center(), Vec2::new(rect.width(), rect.height()));
@@ -8524,13 +9373,18 @@ fn draw_scene_thumbnail(ui: &mut egui::Ui, bundle: &ProjectBundle, scene: &Scene
     for y in 0..grid_height.min(4) {
         for x in 0..grid_width.min(4) {
             let index = y * grid_width + x;
-            let Some(tile) = layer.tiles.get(index).and_then(|tile_index| {
-                tileset.tiles.get(*tile_index as usize)
-            }) else {
+            let Some(tile) = layer
+                .tiles
+                .get(index)
+                .and_then(|tile_index| tileset.tiles.get(*tile_index as usize))
+            else {
                 continue;
             };
             let cell = Rect::from_min_size(
-                Pos2::new(rect.left() + x as f32 * tile_size.x, rect.top() + y as f32 * tile_size.y),
+                Pos2::new(
+                    rect.left() + x as f32 * tile_size.x,
+                    rect.top() + y as f32 * tile_size.y,
+                ),
                 tile_size,
             );
             draw_tile_pixels(&painter, cell, tile, palette);
@@ -8773,6 +9627,59 @@ fn draw_entities(
     }
 }
 
+fn draw_prefab_instances(
+    painter: &egui::Painter,
+    rect: Rect,
+    zoom: f32,
+    bundle: &ProjectBundle,
+    prefab_instances: &[PrefabInstance],
+    selected: Option<usize>,
+) {
+    for (index, instance) in prefab_instances.iter().enumerate() {
+        let (width_pixels, height_pixels, color, label) =
+            if let Some(prefab) = bundle.prefab(&instance.prefab_id) {
+                (
+                    prefab.size_tiles.width.max(1) as f32 * 8.0,
+                    prefab.size_tiles.height.max(1) as f32 * 8.0,
+                    if selected == Some(index) {
+                        Color32::from_rgb(255, 212, 96)
+                    } else {
+                        Color32::from_rgb(176, 132, 255)
+                    },
+                    format!("{} [{}]", instance.id, prefab.name),
+                )
+            } else {
+                (
+                    16.0,
+                    16.0,
+                    Color32::from_rgb(224, 92, 92),
+                    format!("{} [missing:{}]", instance.id, instance.prefab_id),
+                )
+            };
+        let instance_rect = Rect::from_min_size(
+            rect.min
+                + Vec2::new(
+                    instance.position.x as f32 * zoom,
+                    instance.position.y as f32 * zoom,
+                ),
+            Vec2::new(width_pixels * zoom, height_pixels * zoom),
+        );
+        painter.rect_filled(
+            instance_rect,
+            2.0,
+            color.linear_multiply(if selected == Some(index) { 0.2 } else { 0.1 }),
+        );
+        painter.rect_stroke(instance_rect, 2.0, (2.0, color), StrokeKind::Inside);
+        painter.text(
+            instance_rect.min + Vec2::new(4.0, 4.0),
+            Align2::LEFT_TOP,
+            label,
+            FontId::proportional(12.0),
+            color,
+        );
+    }
+}
+
 fn draw_scene_selection_overlay(
     painter: &egui::Painter,
     rect: Rect,
@@ -8892,7 +9799,10 @@ fn draw_metasprite(
         .max()
         .unwrap_or(8) as f32;
 
-    for piece in &metasprite.pieces {
+    let mut draw_order = metasprite.pieces.iter().enumerate().collect::<Vec<_>>();
+    draw_order.sort_by_key(|(index, piece)| (piece.priority.min(3), *index));
+
+    for (_, piece) in draw_order {
         let Some(tile) = tileset.tiles.get(piece.tile_index as usize) else {
             continue;
         };
@@ -9187,6 +10097,53 @@ fn next_unique_copy_id(existing: &mut BTreeSet<String>, base: &str) -> String {
     }
 }
 
+fn prefab_entity_override_is_empty(override_entry: &PrefabEntityOverride) -> bool {
+    override_entry.position.is_none()
+        && override_entry.facing.is_none()
+        && override_entry.active.is_none()
+        && override_entry.one_shot.is_none()
+}
+
+fn upsert_prefab_entity_override(
+    overrides: &mut Vec<PrefabEntityOverride>,
+    override_entry: PrefabEntityOverride,
+) {
+    if let Some(index) = overrides
+        .iter()
+        .position(|entry| entry.entity_id == override_entry.entity_id)
+    {
+        if prefab_entity_override_is_empty(&override_entry) {
+            overrides.remove(index);
+        } else {
+            overrides[index] = override_entry;
+        }
+    } else if !prefab_entity_override_is_empty(&override_entry) {
+        overrides.push(override_entry);
+    }
+}
+
+fn prefab_trigger_override_is_empty(override_entry: &PrefabTriggerOverride) -> bool {
+    override_entry.position.is_none() && override_entry.script_id.is_none()
+}
+
+fn upsert_prefab_trigger_override(
+    overrides: &mut Vec<PrefabTriggerOverride>,
+    override_entry: PrefabTriggerOverride,
+) {
+    if let Some(index) = overrides
+        .iter()
+        .position(|entry| entry.trigger_id == override_entry.trigger_id)
+    {
+        if prefab_trigger_override_is_empty(&override_entry) {
+            overrides.remove(index);
+        } else {
+            overrides[index] = override_entry;
+        }
+    } else if !prefab_trigger_override_is_empty(&override_entry) {
+        overrides.push(override_entry);
+    }
+}
+
 fn clamp_scene_scroll_offset(offset: Vec2, content_size: Vec2, viewport_size: Vec2) -> Vec2 {
     let max_x = (content_size.x - viewport_size.x).max(0.0);
     let max_y = (content_size.y - viewport_size.y).max(0.0);
@@ -9303,13 +10260,6 @@ fn metasprite_for_entity<'a>(
         .and_then(|animation| metasprite_for_animation_frame(bundle, animation, time_seconds))
 }
 
-fn entity_has_animation(bundle: &ProjectBundle, entity: &EntityPlacement) -> bool {
-    bundle.animation(&entity.archetype).is_some()
-        || bundle
-            .animation(&format!("{}_idle", entity.archetype))
-            .is_some()
-}
-
 fn find_tileset_for_metasprite<'a>(
     bundle: &'a ProjectBundle,
     metasprite: &MetaspriteResource,
@@ -9380,208 +10330,6 @@ fn load_sheet_preview(ctx: &egui::Context, path: &Path) -> Result<LoadedSheetPre
     })
 }
 
-fn import_sprite_sheet_into_bundle(
-    bundle: &mut ProjectBundle,
-    state: &SpriteSheetImportState,
-    rgba: &[u8],
-    size: [usize; 2],
-) -> Result<String> {
-    if state.base_id.trim().is_empty() || state.animation_id.trim().is_empty() {
-        bail!("Base id and animation id are required.");
-    }
-    if state.frame_width_px == 0
-        || state.frame_height_px == 0
-        || state.frame_width_px % 8 != 0
-        || state.frame_height_px % 8 != 0
-    {
-        bail!("Frame width and height must be non-zero multiples of 8 pixels.");
-    }
-    if state.frame_count == 0 || state.columns == 0 {
-        bail!("Frame count and columns must be greater than zero.");
-    }
-
-    let sheet = RgbaImage::from_raw(size[0] as u32, size[1] as u32, rgba.to_vec())
-        .ok_or_else(|| anyhow!("failed to decode sprite sheet pixels"))?;
-    let frame_width_px = state.frame_width_px;
-    let frame_height_px = state.frame_height_px;
-
-    let mut reserved_ids = bundle
-        .unique_ids()
-        .into_iter()
-        .map(str::to_string)
-        .collect::<BTreeSet<_>>();
-    if reserved_ids.contains(state.animation_id.as_str()) {
-        bail!(
-            "Animation id '{}' already exists. Choose a unique id before importing.",
-            state.animation_id
-        );
-    }
-
-    let tileset_index = bundle
-        .tilesets
-        .iter()
-        .position(|tileset| tileset.id == state.target_tileset_id)
-        .ok_or_else(|| anyhow!("target tileset '{}' is missing", state.target_tileset_id))?;
-    let palette_index = bundle
-        .palettes
-        .iter()
-        .position(|palette| palette.id == state.target_palette_id)
-        .ok_or_else(|| anyhow!("target palette '{}' is missing", state.target_palette_id))?;
-
-    reserved_ids.insert(state.animation_id.clone());
-    let palette_id = bundle
-        .palettes
-        .get(palette_index)
-        .ok_or_else(|| anyhow!("palette index out of range"))?
-        .id
-        .clone();
-
-    let (new_metasprites, animation_frames) = {
-        let palette = bundle
-            .palettes
-            .get_mut(palette_index)
-            .ok_or_else(|| anyhow!("palette index out of range"))?;
-        let tileset = bundle
-            .tilesets
-            .get_mut(tileset_index)
-            .ok_or_else(|| anyhow!("tileset index out of range"))?;
-
-        let mut metasprites = Vec::with_capacity(state.frame_count);
-        let mut frames = Vec::with_capacity(state.frame_count);
-        for frame_index in 0..state.frame_count {
-            let metasprite_id = if state.frame_count == 1 {
-                state.base_id.clone()
-            } else {
-                format!("{}_{:02}", state.base_id, frame_index + 1)
-            };
-            if reserved_ids.contains(metasprite_id.as_str()) {
-                bail!(
-                    "Metasprite id '{}' already exists. Choose a different base id.",
-                    metasprite_id
-                );
-            }
-            reserved_ids.insert(metasprite_id.clone());
-
-            let frame_x = (frame_index % state.columns) as u32 * frame_width_px;
-            let frame_y = (frame_index / state.columns) as u32 * frame_height_px;
-            if frame_x + frame_width_px > sheet.width()
-                || frame_y + frame_height_px > sheet.height()
-            {
-                bail!(
-                    "Frame {} exceeds the sprite sheet bounds. Check the frame size, count, or column count.",
-                    frame_index + 1
-                );
-            }
-
-            let frame_tiles_x = frame_width_px / 8;
-            let frame_tiles_y = frame_height_px / 8;
-            let mut pieces = Vec::with_capacity((frame_tiles_x * frame_tiles_y) as usize);
-
-            for tile_y in 0..frame_tiles_y {
-                for tile_x in 0..frame_tiles_x {
-                    let tile = extract_tile_from_sheet(
-                        &sheet,
-                        palette,
-                        frame_x + tile_x * 8,
-                        frame_y + tile_y * 8,
-                    )?;
-                    let tile_index = tileset.tiles.len() as u16;
-                    tileset.tiles.push(tile);
-                    pieces.push(SpriteTileRef {
-                        tile_index,
-                        x: (tile_x * 8) as i16,
-                        y: (tile_y * 8) as i16,
-                        palette_slot: 0,
-                        h_flip: false,
-                        v_flip: false,
-                    });
-                }
-            }
-
-            metasprites.push(MetaspriteResource {
-                id: metasprite_id.clone(),
-                palette_id: palette_id.clone(),
-                pieces,
-            });
-            frames.push(AnimationFrame {
-                metasprite_id,
-                duration_frames: state.frame_duration.max(1),
-            });
-        }
-
-        (metasprites, frames)
-    };
-
-    bundle.metasprites.extend(new_metasprites);
-    bundle.animations.push(AnimationResource {
-        id: state.animation_id.clone(),
-        frames: animation_frames,
-    });
-
-    Ok(format!(
-        "Imported {} frame(s) into '{}' and created animation '{}'",
-        state.frame_count, state.target_tileset_id, state.animation_id
-    ))
-}
-
-fn extract_tile_from_sheet(
-    image: &RgbaImage,
-    palette: &mut PaletteResource,
-    start_x: u32,
-    start_y: u32,
-) -> Result<Tile8> {
-    let mut pixels = Vec::with_capacity(64);
-    for y in 0..8 {
-        for x in 0..8 {
-            let rgba = image.get_pixel(start_x + x, start_y + y).0;
-            pixels.push(palette_index_for_rgba(palette, rgba));
-        }
-    }
-    Ok(Tile8 { pixels })
-}
-
-fn palette_index_for_rgba(palette: &mut PaletteResource, rgba: [u8; 4]) -> u8 {
-    if rgba[3] < 16 {
-        return 0;
-    }
-
-    let color = RgbaColor {
-        r: rgba[0],
-        g: rgba[1],
-        b: rgba[2],
-        a: rgba[3],
-    };
-
-    if let Some(index) = palette
-        .colors
-        .iter()
-        .position(|existing| *existing == color)
-    {
-        return index as u8;
-    }
-
-    if palette.colors.len() < 16 {
-        palette.colors.push(color);
-        return (palette.colors.len() - 1) as u8;
-    }
-
-    palette
-        .colors
-        .iter()
-        .enumerate()
-        .skip(1)
-        .min_by_key(|(_, existing)| color_distance_squared(existing, &color))
-        .map(|(index, _)| index as u8)
-        .unwrap_or(0)
-}
-
-fn color_distance_squared(a: &RgbaColor, b: &RgbaColor) -> u32 {
-    let dr = a.r as i32 - b.r as i32;
-    let dg = a.g as i32 - b.g as i32;
-    let db = a.b as i32 - b.b as i32;
-    (dr * dr + dg * dg + db * db) as u32
-}
-
 fn fit_size(size: Vec2, max: Vec2) -> Vec2 {
     let scale = (max.x / size.x).min(max.y / size.y).min(1.0);
     size * scale
@@ -9597,8 +10345,19 @@ fn to_color32(color: &RgbaColor) -> Color32 {
 
 #[cfg(test)]
 mod tests {
-    use super::UndoHistory;
-    use snesmaker_project::demo_bundle;
+    use super::{EditorApp, PlaytestStartMode, SpriteSheetImportState, UndoHistory};
+    use camino::Utf8PathBuf;
+    use snesmaker_assets::import_sprite_sheet_into_bundle;
+    use snesmaker_project::{ProjectBundle, demo_bundle};
+    use snesmaker_validator::{Diagnostic, MAX_COLORS_PER_PALETTE, Severity};
+
+    fn load_app_with_demo_bundle() -> (tempfile::TempDir, EditorApp) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("utf8 tempdir");
+        demo_bundle().save(&root).expect("save demo bundle");
+        let app = EditorApp::new(root);
+        (dir, app)
+    }
 
     #[test]
     fn undo_history_round_trips_project_state() {
@@ -9614,5 +10373,159 @@ mod tests {
 
         assert!(history.redo(&mut current));
         assert_eq!(current.manifest.meta.name, "Changed Name");
+    }
+
+    #[test]
+    fn imported_metasprite_edits_round_trip_through_save() {
+        let mut bundle = demo_bundle();
+        let mut import = SpriteSheetImportState::with_defaults();
+        import.base_id = "editor_round_trip".to_string();
+        import.animation_id = "editor_round_trip_anim".to_string();
+        import.frame_width_px = 8;
+        import.frame_height_px = 8;
+        import.frame_count = 1;
+        import.columns = 1;
+        import.frame_duration = 6;
+        import.target_tileset_id = bundle.tilesets[0].id.clone();
+        import.target_palette_id = bundle.palettes[0].id.clone();
+
+        let mut rgba = vec![0_u8; 8 * 8 * 4];
+        for pixel in rgba.chunks_exact_mut(4) {
+            pixel.copy_from_slice(&[255, 0, 0, 255]);
+        }
+
+        let message =
+            import_sprite_sheet_into_bundle(&mut bundle, &import.to_request(), &rgba, [8, 8])
+                .expect("import sprite sheet");
+        assert_eq!(message.animation_id, "editor_round_trip_anim");
+
+        let imported = bundle
+            .metasprites
+            .iter_mut()
+            .find(|metasprite| metasprite.id == "editor_round_trip")
+            .expect("imported metasprite");
+        let piece = imported.pieces.first_mut().expect("imported piece");
+        piece.x = 12;
+        piece.y = -4;
+        piece.palette_slot = 2;
+        piece.priority = 1;
+        piece.h_flip = true;
+        piece.v_flip = true;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("utf8 tempdir");
+        bundle.save(&root).expect("save bundle");
+
+        let loaded = ProjectBundle::load(&root).expect("load bundle");
+        let loaded_metasprite = loaded
+            .metasprite("editor_round_trip")
+            .expect("loaded metasprite");
+        let loaded_piece = loaded_metasprite.pieces.first().expect("loaded piece");
+        assert_eq!(loaded_piece.x, 12);
+        assert_eq!(loaded_piece.y, -4);
+        assert_eq!(loaded_piece.palette_slot, 2);
+        assert_eq!(loaded_piece.priority, 1);
+        assert!(loaded_piece.h_flip);
+        assert!(loaded_piece.v_flip);
+        assert_eq!(
+            loaded
+                .animation("editor_round_trip_anim")
+                .expect("loaded animation")
+                .frames[0]
+                .metasprite_id,
+            "editor_round_trip"
+        );
+    }
+
+    #[test]
+    fn playtest_reset_session_honors_selected_start_modes() {
+        let (_dir, mut app) = load_app_with_demo_bundle();
+
+        app.selected_spawn = Some(0);
+        app.playtest_state.start_mode = PlaytestStartMode::SelectedSpawn;
+        app.reset_playtest_session();
+        assert!(app.playtest_state.session.is_some());
+        assert!(
+            app.playtest_state.last_status.contains("spawn 'start'"),
+            "unexpected status: {}",
+            app.playtest_state.last_status
+        );
+
+        app.selected_checkpoint = Some(0);
+        app.playtest_state.start_mode = PlaytestStartMode::SelectedCheckpoint;
+        app.reset_playtest_session();
+        assert!(app.playtest_state.session.is_some());
+        assert!(
+            app.playtest_state
+                .last_status
+                .contains("checkpoint 'midpoint'"),
+            "unexpected status: {}",
+            app.playtest_state.last_status
+        );
+    }
+
+    #[test]
+    fn diagnostic_quick_fix_trims_palette_overflow() {
+        let (_dir, mut app) = load_app_with_demo_bundle();
+        let palette_id = app.bundle.as_ref().expect("bundle").palettes[0].id.clone();
+        if let Some(palette) = app
+            .bundle
+            .as_mut()
+            .and_then(|bundle| bundle.palettes.first_mut())
+        {
+            palette
+                .colors
+                .resize(MAX_COLORS_PER_PALETTE + 5, palette.colors[0]);
+        }
+
+        app.apply_diagnostic_quick_fix(&Diagnostic {
+            severity: Severity::Error,
+            code: "asset.palette_too_large".to_string(),
+            message: "Palette exceeds SNES color budget".to_string(),
+            path: Some(format!("palette:{palette_id}")),
+        });
+
+        let palette = &app.bundle.as_ref().expect("bundle").palettes[0];
+        assert_eq!(palette.colors.len(), MAX_COLORS_PER_PALETTE);
+        assert!(app.status.contains("Trimmed palette"));
+    }
+
+    #[test]
+    fn diagnostic_quick_fix_adds_missing_trigger_scripts() {
+        let (_dir, mut app) = load_app_with_demo_bundle();
+        let scene_id = app.bundle.as_ref().expect("bundle").scenes[0].id.clone();
+        if let Some(scene) = app
+            .bundle
+            .as_mut()
+            .and_then(|bundle| bundle.scenes.first_mut())
+        {
+            scene.triggers.push(snesmaker_project::TriggerVolume {
+                id: "door".to_string(),
+                kind: snesmaker_events::TriggerKind::Touch,
+                rect: snesmaker_project::RectI16 {
+                    x: 16,
+                    y: 16,
+                    width: 16,
+                    height: 16,
+                },
+                script_id: "door_script".to_string(),
+            });
+        }
+
+        app.apply_diagnostic_quick_fix(&Diagnostic {
+            severity: Severity::Error,
+            code: "scene.trigger_missing_script".to_string(),
+            message: "Trigger references a missing script".to_string(),
+            path: Some(format!("scene:{scene_id}:trigger:door")),
+        });
+
+        let scene = &app.bundle.as_ref().expect("bundle").scenes[0];
+        assert!(
+            scene
+                .scripts
+                .iter()
+                .any(|script| script.id == "door_script")
+        );
+        assert!(app.status.contains("missing script stub"));
     }
 }

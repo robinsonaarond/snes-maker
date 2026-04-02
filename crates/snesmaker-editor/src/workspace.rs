@@ -43,19 +43,21 @@ pub enum DockTab {
     Outliner,
     Assets,
     Animation,
+    Events,
     Diagnostics,
     BuildReport,
     Playtest,
 }
 
 impl DockTab {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::Toolbox,
         Self::Scene,
         Self::Inspector,
         Self::Outliner,
         Self::Assets,
         Self::Animation,
+        Self::Events,
         Self::Diagnostics,
         Self::BuildReport,
         Self::Playtest,
@@ -69,6 +71,7 @@ impl DockTab {
             Self::Outliner => "Outliner",
             Self::Assets => "Assets",
             Self::Animation => "Animation",
+            Self::Events => "Events",
             Self::Diagnostics => "Diagnostics",
             Self::BuildReport => "Build Report",
             Self::Playtest => "Playtest",
@@ -79,7 +82,7 @@ impl DockTab {
         match self {
             Self::Toolbox | Self::Outliner => DockArea::Left,
             Self::Scene => DockArea::Center,
-            Self::Inspector | Self::Animation => DockArea::Right,
+            Self::Inspector | Self::Animation | Self::Events => DockArea::Right,
             Self::Assets | Self::Diagnostics | Self::BuildReport | Self::Playtest => {
                 DockArea::Bottom
             }
@@ -262,6 +265,118 @@ impl DockLayout {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkspacePreset {
+    LevelDesign,
+    Animation,
+    Eventing,
+    Debug,
+    Custom,
+}
+
+impl WorkspacePreset {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::LevelDesign => "Level Design",
+            Self::Animation => "Animation",
+            Self::Eventing => "Eventing",
+            Self::Debug => "Debug",
+            Self::Custom => "Custom",
+        }
+    }
+
+    pub fn layout(self) -> DockLayout {
+        match self {
+            Self::LevelDesign => DockLayout {
+                show_status_bar: true,
+                left: DockSlot::new(320.0, vec![DockTab::Toolbox, DockTab::Outliner], 0),
+                center: DockSlot::new(0.0, vec![DockTab::Scene], 0),
+                right: DockSlot::new(
+                    380.0,
+                    vec![DockTab::Inspector, DockTab::Animation, DockTab::Events],
+                    0,
+                ),
+                bottom: DockSlot::new(
+                    280.0,
+                    vec![
+                        DockTab::Assets,
+                        DockTab::Diagnostics,
+                        DockTab::BuildReport,
+                        DockTab::Playtest,
+                    ],
+                    0,
+                ),
+            },
+            Self::Animation => DockLayout {
+                show_status_bar: true,
+                left: DockSlot::new(320.0, vec![DockTab::Assets, DockTab::Toolbox], 0),
+                center: DockSlot::new(0.0, vec![DockTab::Scene], 0),
+                right: DockSlot::new(
+                    380.0,
+                    vec![DockTab::Animation, DockTab::Events, DockTab::Inspector],
+                    0,
+                ),
+                bottom: DockSlot::new(260.0, vec![DockTab::Diagnostics, DockTab::BuildReport], 0),
+            },
+            Self::Eventing => DockLayout {
+                show_status_bar: true,
+                left: DockSlot::new(320.0, vec![DockTab::Outliner, DockTab::Assets], 0),
+                center: DockSlot::new(0.0, vec![DockTab::Scene], 0),
+                right: DockSlot::new(
+                    380.0,
+                    vec![DockTab::Inspector, DockTab::Events, DockTab::Diagnostics],
+                    0,
+                ),
+                bottom: DockSlot::new(260.0, vec![DockTab::BuildReport, DockTab::Playtest], 0),
+            },
+            Self::Debug => DockLayout {
+                show_status_bar: true,
+                left: DockSlot::new(320.0, vec![DockTab::Toolbox, DockTab::Outliner], 1),
+                center: DockSlot::new(0.0, vec![DockTab::Scene], 0),
+                right: DockSlot::new(
+                    380.0,
+                    vec![DockTab::Inspector, DockTab::Animation, DockTab::Events],
+                    0,
+                ),
+                bottom: DockSlot::new(
+                    300.0,
+                    vec![
+                        DockTab::Diagnostics,
+                        DockTab::BuildReport,
+                        DockTab::Playtest,
+                        DockTab::Assets,
+                    ],
+                    0,
+                ),
+            },
+            Self::Custom => WorkspacePreset::LevelDesign.layout(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct WorkspaceState {
+    pub layout: DockLayout,
+    pub saved_layouts: Vec<SavedDockLayout>,
+    pub active_saved_layout: Option<String>,
+}
+
+impl WorkspaceState {
+    pub fn for_preset(preset: WorkspacePreset) -> Self {
+        Self {
+            layout: preset.layout(),
+            saved_layouts: Vec::new(),
+            active_saved_layout: None,
+        }
+    }
+}
+
+#[derive(Default)]
+pub struct SaveLayoutState {
+    pub open: bool,
+    pub name: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SavedDockLayout {
     pub name: String,
@@ -273,6 +388,8 @@ pub struct SavedDockLayout {
 pub struct EditorFavorites {
     #[serde(default)]
     pub scenes: Vec<String>,
+    #[serde(default)]
+    pub prefabs: Vec<String>,
     #[serde(default)]
     pub palettes: Vec<String>,
     #[serde(default)]
@@ -290,6 +407,7 @@ pub struct EditorFavorites {
 impl EditorFavorites {
     pub fn normalize(&mut self) {
         normalize_name_list(&mut self.scenes);
+        normalize_name_list(&mut self.prefabs);
         normalize_name_list(&mut self.palettes);
         normalize_name_list(&mut self.tilesets);
         normalize_name_list(&mut self.metasprites);

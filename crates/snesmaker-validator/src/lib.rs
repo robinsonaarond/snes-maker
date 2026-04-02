@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 
 use serde::{Deserialize, Serialize};
 use snesmaker_events::{EventCommand, reserved_unimplemented_commands};
@@ -221,6 +221,19 @@ impl Validator for SceneValidator {
 
     fn validate(&self, bundle: &ProjectBundle, report: &mut ValidationReport) {
         let mut scene_ids = BTreeSet::new();
+        let mut prefab_ids = BTreeSet::new();
+
+        for prefab in &bundle.prefabs {
+            if !prefab_ids.insert(prefab.id.as_str()) {
+                report.push(
+                    Severity::Error,
+                    "prefab.duplicate_id",
+                    format!("prefab '{}' is defined more than once", prefab.id),
+                    Some(format!("prefab:{}", prefab.id)),
+                );
+            }
+        }
+
         for scene in &bundle.scenes {
             if !scene_ids.insert(scene.id.as_str()) {
                 report.push(
@@ -231,8 +244,10 @@ impl Validator for SceneValidator {
                 );
             }
 
-            validate_scene_shape(scene, report);
-            validate_scene_scripts(scene, bundle, report);
+            validate_prefab_instances(scene, bundle, report);
+            let resolved_scene = bundle.resolve_scene(scene);
+            validate_scene_shape(&resolved_scene, report);
+            validate_scene_scripts(&resolved_scene, bundle, report);
         }
     }
 }
@@ -361,6 +376,54 @@ impl Validator for DialogueValidator {
                 );
             }
 
+            let node_ids = dialogue
+                .nodes
+                .iter()
+                .map(|node| node.id.as_str())
+                .collect::<BTreeSet<_>>();
+            let mut seen_node_ids = BTreeSet::new();
+            for node in &dialogue.nodes {
+                if !seen_node_ids.insert(node.id.as_str()) {
+                    report.push(
+                        Severity::Error,
+                        "dialogue.duplicate_node_id",
+                        format!(
+                            "dialogue '{}' node '{}' is defined more than once",
+                            dialogue.id, node.id
+                        ),
+                        Some(format!("dialogue:{}:node:{}", dialogue.id, node.id)),
+                    );
+                }
+
+                if let Some(next) = &node.next {
+                    if !node_ids.contains(next.as_str()) {
+                        report.push(
+                            Severity::Error,
+                            "dialogue.node_next_missing",
+                            format!(
+                                "dialogue '{}' node '{}' points to missing next node '{}'",
+                                dialogue.id, node.id, next
+                            ),
+                            Some(format!("dialogue:{}:node:{}", dialogue.id, node.id)),
+                        );
+                    }
+                }
+
+                for choice in &node.choices {
+                    if !node_ids.contains(choice.next.as_str()) {
+                        report.push(
+                            Severity::Error,
+                            "dialogue.choice_target_missing",
+                            format!(
+                                "dialogue '{}' node '{}' has choice '{}' pointing to missing node '{}'",
+                                dialogue.id, node.id, choice.text, choice.next
+                            ),
+                            Some(format!("dialogue:{}:node:{}", dialogue.id, node.id)),
+                        );
+                    }
+                }
+            }
+
             if dialogue
                 .nodes
                 .iter()
@@ -374,6 +437,18 @@ impl Validator for DialogueValidator {
                         dialogue.id, dialogue.opening_node
                     ),
                     Some(format!("dialogue:{}", dialogue.id)),
+                );
+            }
+
+            for node_id in unreachable_dialogue_nodes(dialogue) {
+                report.push(
+                    Severity::Warning,
+                    "dialogue.unreachable_node",
+                    format!(
+                        "dialogue '{}' node '{}' is unreachable from opening node '{}'",
+                        dialogue.id, node_id, dialogue.opening_node
+                    ),
+                    Some(format!("dialogue:{}:node:{}", dialogue.id, node_id)),
                 );
             }
         }
@@ -533,11 +608,36 @@ fn validate_scene_scripts(
     bundle: &ProjectBundle,
     report: &mut ValidationReport,
 ) {
-    let script_ids: BTreeSet<&str> = scene
-        .scripts
-        .iter()
-        .map(|script| script.id.as_str())
-        .collect();
+    let mut trigger_ids = BTreeSet::new();
+    let mut script_ids = BTreeSet::new();
+
+    for trigger in &scene.triggers {
+        if !trigger_ids.insert(trigger.id.as_str()) {
+            report.push(
+                Severity::Error,
+                "scene.trigger_duplicate_id",
+                format!(
+                    "scene '{}' trigger '{}' is defined more than once",
+                    scene.id, trigger.id
+                ),
+                Some(format!("scene:{}:trigger:{}", scene.id, trigger.id)),
+            );
+        }
+    }
+
+    for script in &scene.scripts {
+        if !script_ids.insert(script.id.as_str()) {
+            report.push(
+                Severity::Error,
+                "script.duplicate_id",
+                format!(
+                    "scene '{}' script '{}' is defined more than once",
+                    scene.id, script.id
+                ),
+                Some(format!("scene:{}:script:{}", scene.id, script.id)),
+            );
+        }
+    }
 
     for trigger in &scene.triggers {
         if !script_ids.contains(trigger.script_id.as_str()) {
@@ -548,7 +648,7 @@ fn validate_scene_scripts(
                     "scene '{}' trigger '{}' references missing script '{}'",
                     scene.id, trigger.id, trigger.script_id
                 ),
-                Some(format!("scene:{}", scene.id)),
+                Some(format!("scene:{}:trigger:{}", scene.id, trigger.id)),
             );
         }
     }
@@ -562,14 +662,31 @@ fn validate_scene_scripts(
                     "scene '{}' script '{}' uses reserved command '{}'; the export pipeline will keep this as a placeholder",
                     scene.id, script.id, reserved
                 ),
-                Some(format!("scene:{}", scene.id)),
+                Some(format!("scene:{}:script:{}", scene.id, script.id)),
             );
         }
 
         for command in &script.commands {
             match command {
-                EventCommand::ShowDialogue { dialogue_id, .. } => {
-                    if bundle.dialogue(dialogue_id).is_none() {
+                EventCommand::ShowDialogue {
+                    dialogue_id,
+                    node_id,
+                } => {
+                    if let Some(dialogue) = bundle.dialogue(dialogue_id) {
+                        if let Some(node_id) = node_id {
+                            if dialogue.nodes.iter().all(|node| node.id != *node_id) {
+                                report.push(
+                                    Severity::Error,
+                                    "script.dialogue_node_missing",
+                                    format!(
+                                        "scene '{}' script '{}' references missing dialogue node '{}' in dialogue '{}'",
+                                        scene.id, script.id, node_id, dialogue_id
+                                    ),
+                                    Some(format!("scene:{}:script:{}", scene.id, script.id)),
+                                );
+                            }
+                        }
+                    } else {
                         report.push(
                             Severity::Error,
                             "script.dialogue_missing",
@@ -577,7 +694,7 @@ fn validate_scene_scripts(
                                 "scene '{}' script '{}' references missing dialogue '{}'",
                                 scene.id, script.id, dialogue_id
                             ),
-                            Some(format!("scene:{}", scene.id)),
+                            Some(format!("scene:{}:script:{}", scene.id, script.id)),
                         );
                     }
                 }
@@ -590,7 +707,7 @@ fn validate_scene_scripts(
                                 "scene '{}' script '{}' references missing scene '{}'",
                                 scene.id, script.id, scene_id
                             ),
-                            Some(format!("scene:{}", scene.id)),
+                            Some(format!("scene:{}:script:{}", scene.id, script.id)),
                         );
                     }
                 }
@@ -598,6 +715,119 @@ fn validate_scene_scripts(
             }
         }
     }
+}
+
+fn validate_prefab_instances(
+    scene: &SceneResource,
+    bundle: &ProjectBundle,
+    report: &mut ValidationReport,
+) {
+    let mut instance_ids = BTreeSet::new();
+
+    for instance in &scene.prefab_instances {
+        if !instance_ids.insert(instance.id.as_str()) {
+            report.push(
+                Severity::Error,
+                "scene.prefab_instance_duplicate_id",
+                format!(
+                    "scene '{}' prefab instance '{}' is defined more than once",
+                    scene.id, instance.id
+                ),
+                Some(format!("scene:{}:prefab:{}", scene.id, instance.id)),
+            );
+        }
+
+        let Some(prefab) = bundle.prefab(&instance.prefab_id) else {
+            report.push(
+                Severity::Error,
+                "scene.prefab_missing",
+                format!(
+                    "scene '{}' prefab instance '{}' references missing prefab '{}'",
+                    scene.id, instance.id, instance.prefab_id
+                ),
+                Some(format!("scene:{}:prefab:{}", scene.id, instance.id)),
+            );
+            continue;
+        };
+
+        let entity_ids = prefab
+            .entities
+            .iter()
+            .map(|entity| entity.id.as_str())
+            .collect::<BTreeSet<_>>();
+        for override_entry in &instance.entity_overrides {
+            if !entity_ids.contains(override_entry.entity_id.as_str()) {
+                report.push(
+                    Severity::Error,
+                    "scene.prefab_entity_override_missing_target",
+                    format!(
+                        "scene '{}' prefab instance '{}' overrides missing prefab entity '{}'",
+                        scene.id, instance.id, override_entry.entity_id
+                    ),
+                    Some(format!("scene:{}:prefab:{}", scene.id, instance.id)),
+                );
+            }
+        }
+
+        let trigger_ids = prefab
+            .triggers
+            .iter()
+            .map(|trigger| trigger.id.as_str())
+            .collect::<BTreeSet<_>>();
+        for override_entry in &instance.trigger_overrides {
+            if !trigger_ids.contains(override_entry.trigger_id.as_str()) {
+                report.push(
+                    Severity::Error,
+                    "scene.prefab_trigger_override_missing_target",
+                    format!(
+                        "scene '{}' prefab instance '{}' overrides missing prefab trigger '{}'",
+                        scene.id, instance.id, override_entry.trigger_id
+                    ),
+                    Some(format!("scene:{}:prefab:{}", scene.id, instance.id)),
+                );
+            }
+        }
+    }
+}
+
+fn unreachable_dialogue_nodes(dialogue: &snesmaker_events::DialogueGraph) -> Vec<String> {
+    let node_lookup = dialogue
+        .nodes
+        .iter()
+        .map(|node| node.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut visited = BTreeSet::new();
+    let mut queue = VecDeque::new();
+
+    if node_lookup.contains(dialogue.opening_node.as_str()) {
+        queue.push_back(dialogue.opening_node.as_str());
+    }
+
+    while let Some(node_id) = queue.pop_front() {
+        if !visited.insert(node_id) {
+            continue;
+        }
+        let Some(node) = dialogue.nodes.iter().find(|node| node.id == node_id) else {
+            continue;
+        };
+        if let Some(next) = &node.next {
+            if node_lookup.contains(next.as_str()) {
+                queue.push_back(next.as_str());
+            }
+        }
+        for choice in &node.choices {
+            if node_lookup.contains(choice.next.as_str()) {
+                queue.push_back(choice.next.as_str());
+            }
+        }
+    }
+
+    dialogue
+        .nodes
+        .iter()
+        .filter(|node| !visited.contains(node.id.as_str()))
+        .map(|node| node.id.clone())
+        .collect()
 }
 
 fn estimate_budgets(bundle: &ProjectBundle) -> BuildBudgets {
@@ -652,7 +882,7 @@ fn estimate_budgets(bundle: &ProjectBundle) -> BuildBudgets {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use snesmaker_project::{PaletteResource, ProjectBundle, RgbaColor};
+    use snesmaker_project::{PaletteResource, ProjectBundle, RgbaColor, demo_bundle};
 
     #[test]
     fn catches_palette_overflow() {
@@ -678,6 +908,131 @@ mod tests {
                 .errors
                 .iter()
                 .any(|diagnostic| diagnostic.code == "asset.palette_too_large")
+        );
+    }
+
+    #[test]
+    fn scopes_unreachable_dialogue_nodes_to_node_paths() {
+        let mut bundle = demo_bundle();
+        bundle.dialogues[0]
+            .nodes
+            .push(snesmaker_events::DialogueNode {
+                id: "secret".to_string(),
+                speaker: String::new(),
+                text: String::new(),
+                commands: Vec::new(),
+                choices: Vec::new(),
+                next: None,
+            });
+
+        let report = validate_project(&bundle);
+        let diagnostic = report
+            .warnings
+            .iter()
+            .find(|diagnostic| diagnostic.code == "dialogue.unreachable_node")
+            .expect("unreachable node warning");
+
+        assert_eq!(
+            diagnostic.path.as_deref(),
+            Some("dialogue:intro:node:secret")
+        );
+    }
+
+    #[test]
+    fn scopes_missing_trigger_scripts_to_trigger_paths() {
+        let mut bundle = demo_bundle();
+        bundle.scenes[0].triggers[0].script_id = "missing_script".to_string();
+
+        let report = validate_project(&bundle);
+        let diagnostic = report
+            .errors
+            .iter()
+            .find(|diagnostic| diagnostic.code == "scene.trigger_missing_script")
+            .expect("missing trigger script diagnostic");
+
+        assert_eq!(
+            diagnostic.path.as_deref(),
+            Some("scene:intro_stage:trigger:intro_dialogue")
+        );
+    }
+
+    #[test]
+    fn scopes_missing_dialogue_node_overrides_to_script_paths() {
+        let mut bundle = demo_bundle();
+        if let EventCommand::ShowDialogue { node_id, .. } =
+            &mut bundle.scenes[0].scripts[0].commands[1]
+        {
+            *node_id = Some("missing_node".to_string());
+        }
+
+        let report = validate_project(&bundle);
+        let diagnostic = report
+            .errors
+            .iter()
+            .find(|diagnostic| diagnostic.code == "script.dialogue_node_missing")
+            .expect("missing dialogue node diagnostic");
+
+        assert_eq!(
+            diagnostic.path.as_deref(),
+            Some("scene:intro_stage:script:start_dialogue")
+        );
+    }
+
+    #[test]
+    fn scopes_missing_prefabs_to_instance_paths() {
+        let mut bundle = demo_bundle();
+        bundle.scenes[0]
+            .prefab_instances
+            .push(snesmaker_project::PrefabInstance {
+                id: "broken_prefab".to_string(),
+                prefab_id: "missing_prefab".to_string(),
+                position: snesmaker_project::PointI16 { x: 0, y: 0 },
+                entity_overrides: Vec::new(),
+                trigger_overrides: Vec::new(),
+            });
+
+        let report = validate_project(&bundle);
+        let diagnostic = report
+            .errors
+            .iter()
+            .find(|diagnostic| diagnostic.code == "scene.prefab_missing")
+            .expect("missing prefab diagnostic");
+
+        assert_eq!(
+            diagnostic.path.as_deref(),
+            Some("scene:intro_stage:prefab:broken_prefab")
+        );
+    }
+
+    #[test]
+    fn scopes_missing_prefab_override_targets_to_instance_paths() {
+        let mut bundle = demo_bundle();
+        bundle.scenes[0]
+            .prefab_instances
+            .push(snesmaker_project::PrefabInstance {
+                id: "broken_override".to_string(),
+                prefab_id: "npc_hint_spot".to_string(),
+                position: snesmaker_project::PointI16 { x: 0, y: 0 },
+                entity_overrides: vec![snesmaker_project::PrefabEntityOverride {
+                    entity_id: "missing_entity".to_string(),
+                    position: None,
+                    facing: None,
+                    active: Some(false),
+                    one_shot: None,
+                }],
+                trigger_overrides: Vec::new(),
+            });
+
+        let report = validate_project(&bundle);
+        let diagnostic = report
+            .errors
+            .iter()
+            .find(|diagnostic| diagnostic.code == "scene.prefab_entity_override_missing_target")
+            .expect("missing prefab override target diagnostic");
+
+        assert_eq!(
+            diagnostic.path.as_deref(),
+            Some("scene:intro_stage:prefab:broken_override")
         );
     }
 }
