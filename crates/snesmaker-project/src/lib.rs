@@ -93,6 +93,8 @@ pub struct PlayerSettings {
     pub max_health: u8,
     pub starting_health: u8,
     pub health_hud: HealthHudStyle,
+    #[serde(default)]
+    pub combat: PlayerCombatSettings,
 }
 
 impl Default for PlayerSettings {
@@ -101,6 +103,34 @@ impl Default for PlayerSettings {
             max_health: 6,
             starting_health: 6,
             health_hud: HealthHudStyle::MegaPipsTopLeft,
+            combat: PlayerCombatSettings::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum AimMode {
+    #[default]
+    ForwardOnly,
+    FourWay,
+    EightWay,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PlayerCombatSettings {
+    pub aim_mode: AimMode,
+    pub projectile_limit: u8,
+    pub projectile_speed: u8,
+    pub fire_cooldown_frames: u8,
+}
+
+impl Default for PlayerCombatSettings {
+    fn default() -> Self {
+        Self {
+            aim_mode: AimMode::ForwardOnly,
+            projectile_limit: 3,
+            projectile_speed: 4,
+            fire_cooldown_frames: 0,
         }
     }
 }

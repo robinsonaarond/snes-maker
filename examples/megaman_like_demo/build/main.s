@@ -1,6 +1,6 @@
 ; Shared SNES runtime bootstrap for the demo milestone.
 ; It renders the stage plus a simple object table with enemies, pickups,
-; switches, solid props, a selectable health HUD, and up to three shots.
+; switches, solid props, a selectable health HUD, and configurable shots.
 
 .setcpu "65816"
 .smart on
@@ -8,9 +8,10 @@
 .i16
 
 MAX_RUNTIME_ENTITIES = 16
-MAX_BULLETS = 3
+MAX_BULLETS = 8
 PLAYER_WIDTH = 16
 PLAYER_HEIGHT = 16
+FIXED_ONE = 256
 ACTION_NONE = 0
 ACTION_HEAL_PLAYER = 1
 ACTION_SET_ENTITY_ACTIVE = 2
@@ -21,9 +22,25 @@ KIND_SWITCH = 3
 KIND_SOLID = 4
 MOVEMENT_NONE = 0
 MOVEMENT_PATROL = 1
+COLLISION_SOLID = 1
+COLLISION_LADDER = 2
+COLLISION_HAZARD = 4
+AIM_FORWARD_ONLY = 0
+AIM_FOUR_WAY = 1
+AIM_EIGHT_WAY = 2
+DIR_RIGHT = 0
+DIR_LEFT = 1
+DIR_UP = 2
+DIR_UP_RIGHT = 3
+DIR_UP_LEFT = 4
+DIR_DOWN_RIGHT = 5
+DIR_DOWN_LEFT = 6
+DIR_DOWN = 7
 
 .segment "ZEROPAGE"
+joypad_low:          .res 1
 joypad_high:         .res 1
+prev_joypad_low:     .res 1
 prev_joypad_high:    .res 1
 frame_counter:       .res 1
 draw_visual_index:   .res 1
@@ -54,9 +71,18 @@ camera_x:            .res 2
 player_x:            .res 2
 player_prev_x:       .res 2
 player_y:            .res 2
+player_prev_y:       .res 2
+player_vx:           .res 2
 player_vy:           .res 2
+player_subx:         .res 2
+player_suby:         .res 2
 player_facing:       .res 1
+player_aim_dir:      .res 1
 player_on_ground:    .res 1
+player_on_ladder:    .res 1
+player_coyote_left:  .res 1
+player_jump_buf_left:.res 1
+player_fire_cooldown:.res 1
 player_health:       .res 1
 player_invuln:       .res 1
 
@@ -64,6 +90,8 @@ bullet_x_lo:         .res MAX_BULLETS
 bullet_x_hi:         .res MAX_BULLETS
 bullet_y_lo:         .res MAX_BULLETS
 bullet_y_hi:         .res MAX_BULLETS
+bullet_dx:           .res MAX_BULLETS
+bullet_dy:           .res MAX_BULLETS
 bullet_dir:          .res MAX_BULLETS
 bullet_active:       .res MAX_BULLETS
 
@@ -129,6 +157,8 @@ MainLoop:
     jsr WaitForVBlank
     jsr UploadOam
     jsr ApplyScroll
+    lda joypad_low
+    sta prev_joypad_low
     lda joypad_high
     sta prev_joypad_high
     jsr ReadJoypad
@@ -137,6 +167,10 @@ MainLoop:
     beq @no_invuln_tick
     dec player_invuln
 @no_invuln_tick:
+    lda player_fire_cooldown
+    beq @no_fire_cooldown_tick
+    dec player_fire_cooldown
+@no_fire_cooldown_tick:
     jsr UpdatePlayer
     jsr ResolveSolidCollisions
     jsr UpdateEnemies
@@ -170,7 +204,9 @@ InitPPU:
 
 InitGameState:
     stz frame_counter
+    stz joypad_low
     stz joypad_high
+    stz prev_joypad_low
     stz prev_joypad_high
     stz camera_x
     stz camera_x+1
@@ -187,12 +223,23 @@ ResetPlayerState:
     sta player_prev_x
     lda #PROJECT_PLAYER_START_Y
     sta player_y
+    sta player_prev_y
+    stz player_vx
     stz player_vy
+    stz player_subx
+    stz player_suby
     sep #$20
 .a8
     stz player_facing
+    lda #DIR_RIGHT
+    sta player_aim_dir
     lda #$01
     sta player_on_ground
+    stz player_on_ladder
+    lda #PROJECT_PHYSICS_COYOTE_FRAMES
+    sta player_coyote_left
+    stz player_jump_buf_left
+    stz player_fire_cooldown
     lda #PROJECT_PLAYER_STARTING_HEALTH
     sta player_health
     stz player_invuln
@@ -205,6 +252,8 @@ ResetBullets:
     stz bullet_x_hi, x
     stz bullet_y_lo, x
     stz bullet_y_hi, x
+    stz bullet_dx, x
+    stz bullet_dy, x
     stz bullet_dir, x
     stz bullet_active, x
     inx
@@ -334,6 +383,8 @@ WaitForVBlank:
     rts
 
 ReadJoypad:
+    lda $4218
+    sta joypad_low
     lda $4219
     sta joypad_high
     rts
@@ -343,105 +394,465 @@ UpdatePlayer:
 .a16
     lda player_x
     sta player_prev_x
+    lda player_y
+    sta player_prev_y
     sep #$20
 .a8
+    jsr UpdateJumpBuffer
+    jsr UpdateCoyoteCounter
+    jsr UpdatePlayerAim
+    jsr UpdateHorizontalControl
+    jsr UpdateLadderState
+    jsr UpdateVerticalControl
+    jsr ApplyPlayerHorizontalVelocity
+    jsr ResolvePlayerHorizontalTiles
+    jsr ApplyPlayerVerticalVelocity
+    jsr ResolvePlayerVerticalTiles
+    jsr CheckPlayerHazards
+    rts
 
-    lda joypad_high
+UpdateJumpBuffer:
+    jsr JumpPressed
+    bcc @tick
+    lda #PROJECT_PHYSICS_JUMP_BUFFER_FRAMES
+    sta player_jump_buf_left
+    rts
+@tick:
+    lda player_jump_buf_left
+    beq @done
+    dec player_jump_buf_left
+@done:
+    rts
+
+UpdateCoyoteCounter:
+    lda player_on_ground
+    beq @tick
+    lda #PROJECT_PHYSICS_COYOTE_FRAMES
+    sta player_coyote_left
+    rts
+@tick:
+    lda player_on_ladder
+    bne @done
+    lda player_coyote_left
+    beq @done
+    dec player_coyote_left
+@done:
+    rts
+
+UpdatePlayerAim:
+    lda joypad_low
     and #$01
     beq @check_left
-    lda joypad_high
+    lda joypad_low
     and #$02
-    bne @check_jump
+    bne @after_facing
+    stz player_facing
+    bra @after_facing
+@check_left:
+    lda joypad_low
+    and #$02
+    beq @after_facing
+    lda #$01
+    sta player_facing
+@after_facing:
+    lda player_facing
+    beq @default_right
+    lda #DIR_LEFT
+    bra @store_default
+@default_right:
+    lda #DIR_RIGHT
+@store_default:
+    sta player_aim_dir
+    lda #PROJECT_PLAYER_AIM_MODE
+    beq @done
+
+    lda joypad_low
+    and #$08
+    beq @check_down
+    lda #PROJECT_PLAYER_AIM_MODE
+    cmp #AIM_FOUR_WAY
+    beq @straight_up
+    lda joypad_low
+    and #$02
+    beq @check_up_right
+    lda joypad_low
+    and #$01
+    bne @straight_up
+    lda #DIR_UP_LEFT
+    sta player_aim_dir
+    rts
+@check_up_right:
+    lda joypad_low
+    and #$01
+    beq @straight_up
+    lda #DIR_UP_RIGHT
+    sta player_aim_dir
+    rts
+@straight_up:
+    lda #DIR_UP
+    sta player_aim_dir
+    rts
+
+@check_down:
+    lda #PROJECT_PLAYER_AIM_MODE
+    cmp #AIM_EIGHT_WAY
+    bne @done
+    lda joypad_low
+    and #$04
+    beq @done
+    lda joypad_low
+    and #$02
+    beq @check_down_right
+    lda joypad_low
+    and #$01
+    bne @check_down_right
+    lda #DIR_DOWN_LEFT
+    sta player_aim_dir
+    rts
+@check_down_right:
+    lda joypad_low
+    and #$01
+    beq @check_straight_down
+    lda joypad_low
+    and #$02
+    bne @check_straight_down
+    lda #DIR_DOWN_RIGHT
+    sta player_aim_dir
+    rts
+@check_straight_down:
+    lda player_on_ladder
+    beq @done
+    lda #DIR_DOWN
+    sta player_aim_dir
+@done:
+    rts
+
+UpdateHorizontalControl:
+    lda joypad_low
+    and #$01
+    beq @check_left
+    lda joypad_low
+    and #$02
+    bne @friction
+    jsr AcceleratePlayerRight
+    rts
+@check_left:
+    lda joypad_low
+    and #$02
+    beq @friction
+    jsr AcceleratePlayerLeft
+    rts
+@friction:
+    jsr ApplyPlayerFriction
+    rts
+
+LoadCurrentAccel:
+    lda player_on_ground
+    bne @ground
     rep #$20
 .a16
-    lda player_x
-    cmp #PROJECT_PLAYER_MAX_X
-    bcs @done_right
-    clc
-    adc #2
-    cmp #(PROJECT_PLAYER_MAX_X + 1)
-    bcc @store_right
-    lda #PROJECT_PLAYER_MAX_X
-@store_right:
-    sta player_x
-@done_right:
+    lda #PROJECT_PHYSICS_AIR_ACCEL_FP
+    sta temp16
     sep #$20
 .a8
-    stz player_facing
-
-@check_left:
-    lda joypad_high
-    and #$02
-    beq @check_jump
-    lda joypad_high
-    and #$01
-    bne @check_jump
+    rts
+@ground:
     rep #$20
 .a16
-    lda player_x
-    beq @done_left
+    lda #PROJECT_PHYSICS_GROUND_ACCEL_FP
+    sta temp16
+    sep #$20
+.a8
+    rts
+
+AcceleratePlayerRight:
+    jsr LoadCurrentAccel
+    rep #$20
+.a16
+    lda player_vx
+    clc
+    adc temp16
+    cmp #PROJECT_PHYSICS_MAX_RUN_SPEED_FP
+    bcc @store
+    lda #PROJECT_PHYSICS_MAX_RUN_SPEED_FP
+@store:
+    sta player_vx
+    sep #$20
+.a8
+    rts
+
+AcceleratePlayerLeft:
+    jsr LoadCurrentAccel
+    rep #$20
+.a16
+    lda player_vx
     sec
-    sbc #2
-    bcs @store_left
+    sbc temp16
+    sta temp16_b
+    lda temp16_b
+    bmi @check_negative_clamp
+    sta player_vx
+    sep #$20
+.a8
+    rts
+@check_negative_clamp:
+    rep #$20
+.a16
+    eor #$FFFF
+    inc
+    cmp #(PROJECT_PHYSICS_MAX_RUN_SPEED_FP + 1)
+    bcc @store_candidate
+    beq @store_candidate
+    lda #(($10000 - PROJECT_PHYSICS_MAX_RUN_SPEED_FP) & $FFFF)
+    sta player_vx
+    sep #$20
+.a8
+    rts
+@store_candidate:
+    rep #$20
+.a16
+    lda temp16_b
+    sta player_vx
+    sep #$20
+.a8
+    rts
+
+ApplyPlayerFriction:
+    jsr LoadCurrentAccel
+    rep #$20
+.a16
+    lda player_vx
+    beq @zero
+    bmi @negative
+    sec
+    sbc temp16
+    bpl @store
     lda #0
-@store_left:
-    sta player_x
-@done_left:
+    bra @store
+@negative:
+    clc
+    adc temp16
+    bmi @store
+    lda #0
+@store:
+    sta player_vx
+@zero:
+    sep #$20
+.a8
+    rts
+
+UpdateLadderState:
+    jsr PlayerOverlapsLadder
+    bcc @clear_if_left
+    lda player_on_ladder
+    bne @done
+    lda joypad_low
+    and #$0C
+    beq @done
+    rep #$20
+.a16
+    stz player_vy
+    stz player_suby
     sep #$20
 .a8
     lda #$01
-    sta player_facing
+    sta player_on_ladder
+    stz player_on_ground
+    rts
+@clear_if_left:
+    stz player_on_ladder
+@done:
+    rts
 
-@check_jump:
-    lda joypad_high
-    and #$80
-    beq @apply_physics
-    lda prev_joypad_high
-    and #$80
-    bne @apply_physics
-    lda player_on_ground
-    beq @apply_physics
+UpdateVerticalControl:
+    lda player_on_ladder
+    beq @check_jump_start
+    jsr JumpPressed
+    bcc @move_ladder
     rep #$20
 .a16
-    lda #$FFF7
+    lda #(PROJECT_PHYSICS_JUMP_VELOCITY_FP & $FFFF)
+    sta player_vy
+    stz player_suby
+    sep #$20
+.a8
+    stz player_on_ladder
+    stz player_on_ground
+    stz player_coyote_left
+    stz player_jump_buf_left
+    rts
+@move_ladder:
+    rep #$20
+.a16
+    stz player_vy
+    stz player_suby
+    sep #$20
+.a8
+    lda joypad_low
+    and #$08
+    beq @check_ladder_down
+    rep #$20
+.a16
+    lda #(($10000 - PROJECT_PHYSICS_LADDER_SPEED_FP) & $FFFF)
     sta player_vy
     sep #$20
 .a8
-    stz player_on_ground
+    rts
+@check_ladder_down:
+    lda joypad_low
+    and #$04
+    beq @done_ladder
+    rep #$20
+.a16
+    lda #PROJECT_PHYSICS_LADDER_SPEED_FP
+    sta player_vy
+    sep #$20
+.a8
+@done_ladder:
+    rts
 
-@apply_physics:
+@check_jump_start:
+    lda player_jump_buf_left
+    beq @apply_gravity
     lda player_on_ground
-    bne @done
+    bne @start_jump
+    lda player_coyote_left
+    beq @apply_gravity
+@start_jump:
+    rep #$20
+.a16
+    lda #(PROJECT_PHYSICS_JUMP_VELOCITY_FP & $FFFF)
+    sta player_vy
+    stz player_suby
+    sep #$20
+.a8
+    stz player_on_ground
+    stz player_on_ladder
+    stz player_coyote_left
+    stz player_jump_buf_left
+    rts
+
+@apply_gravity:
     rep #$20
 .a16
     lda player_vy
     clc
-    adc #1
-    bmi @store_vy
-    cmp #9
-    bcc @store_vy
-    lda #8
-@store_vy:
+    adc #PROJECT_PHYSICS_GRAVITY_FP
+    cmp #PROJECT_PHYSICS_MAX_FALL_SPEED_FP
+    bcc @store_gravity
+    lda #PROJECT_PHYSICS_MAX_FALL_SPEED_FP
+@store_gravity:
     sta player_vy
-    lda player_y
-    clc
-    adc player_vy
-    sta player_y
-    cmp #PROJECT_PLAYER_GROUND_Y
-    bcc @still_airborne
-    lda #PROJECT_PLAYER_GROUND_Y
-    sta player_y
-    stz player_vy
     sep #$20
 .a8
-    lda #$01
-    sta player_on_ground
     rts
 
-@still_airborne:
+ApplyPlayerHorizontalVelocity:
+    rep #$20
+.a16
+    lda player_subx
+    clc
+    adc player_vx
+    sta player_subx
+@positive_loop:
+    lda player_subx
+    bmi @negative_check
+    cmp #FIXED_ONE
+    bcc @done16
+    sec
+    sbc #FIXED_ONE
+    sta player_subx
+    lda player_x
+    cmp #PROJECT_PLAYER_MAX_X
+    bcs @clamp_right
+    inc
+    sta player_x
+    bra @positive_loop
+@clamp_right:
+    lda #PROJECT_PLAYER_MAX_X
+    sta player_x
+    stz player_vx
+    stz player_subx
+    bra @done16
+@negative_check:
     sep #$20
 .a8
-    stz player_on_ground
+    lda player_subx+1
+    cmp #$FF
+    bcc @negative_step
+    bne @done
+    lda player_subx
+    beq @negative_step
+    bra @done
+@negative_step:
+    rep #$20
+.a16
+    lda player_subx
+    clc
+    adc #FIXED_ONE
+    sta player_subx
+    lda player_x
+    beq @clamp_left
+    dec
+    sta player_x
+    bra @positive_loop
+@clamp_left:
+    stz player_x
+    stz player_vx
+    stz player_subx
+@done16:
+    sep #$20
+.a8
+@done:
+    rts
+
+ApplyPlayerVerticalVelocity:
+    rep #$20
+.a16
+    lda player_suby
+    clc
+    adc player_vy
+    sta player_suby
+@positive_loop:
+    lda player_suby
+    bmi @negative_check
+    cmp #FIXED_ONE
+    bcc @done16
+    sec
+    sbc #FIXED_ONE
+    sta player_suby
+    lda player_y
+    inc
+    sta player_y
+    bra @positive_loop
+@negative_check:
+    sep #$20
+.a8
+    lda player_suby+1
+    cmp #$FF
+    bcc @negative_step
+    bne @done
+    lda player_suby
+    beq @negative_step
+    bra @done
+@negative_step:
+    rep #$20
+.a16
+    lda player_suby
+    clc
+    adc #FIXED_ONE
+    sta player_suby
+    lda player_y
+    beq @clamp_top
+    dec
+    sta player_y
+    bra @positive_loop
+@clamp_top:
+    stz player_y
+    stz player_suby
+@done16:
+    sep #$20
+.a8
 @done:
     rts
 
@@ -474,6 +885,8 @@ ResolveSolidCollisions:
     lda rect_right
     sta player_x
 @restore_done:
+    stz player_vx
+    stz player_subx
     sep #$20
 .a8
 @next:
@@ -538,15 +951,7 @@ UpdateEnemies:
     rts
 
 UpdateBullets:
-    lda joypad_high
-    and #$40
-    beq @move
-    lda prev_joypad_high
-    and #$40
-    bne @move
-    jsr SpawnBullet
-
-@move:
+    jsr MaybeSpawnBullet
     ldx #0
 @loop:
     cpx #MAX_BULLETS
@@ -554,37 +959,10 @@ UpdateBullets:
     lda bullet_active, x
     beq @next
     lda bullet_dir, x
-    beq @move_right
-
-    lda bullet_x_lo, x
-    cmp #4
-    bcc @deactivate
-    sec
-    sbc #4
-    sta bullet_x_lo, x
-    lda bullet_x_hi, x
-    sbc #0
-    sta bullet_x_hi, x
-    bra @check_collisions
-
-@move_right:
-    lda bullet_x_lo, x
-    clc
-    adc #4
-    sta bullet_x_lo, x
-    lda bullet_x_hi, x
-    adc #0
-    sta bullet_x_hi, x
-    lda bullet_x_hi, x
-    cmp #>(PROJECT_WORLD_WIDTH_PIXELS)
-    bcc @check_collisions
-    bne @deactivate
-    lda bullet_x_lo, x
-    cmp #<(PROJECT_WORLD_WIDTH_PIXELS)
-    bcc @check_collisions
-    bra @deactivate
-
-@check_collisions:
+    jsr ApplyBulletVelocity
+    bcs @deactivate
+    jsr CheckBulletWorldBounds
+    bcs @deactivate
     jsr CheckBulletAgainstEntities
     bra @next
 
@@ -596,7 +974,36 @@ UpdateBullets:
 @done:
     rts
 
+MaybeSpawnBullet:
+    jsr ShootPressed
+    bcs @spawn
+    lda #PROJECT_PLAYER_FIRE_COOLDOWN_FRAMES
+    beq @done
+    jsr ShootHeld
+    bcc @done
+    lda player_fire_cooldown
+    bne @done
+@spawn:
+    jsr SpawnBullet
+@done:
+    rts
+
 SpawnBullet:
+    ldy #0
+    ldx #0
+@count_loop:
+    cpx #MAX_BULLETS
+    bcs @check_limit
+    lda bullet_active, x
+    beq @count_next
+    iny
+@count_next:
+    inx
+    bra @count_loop
+
+@check_limit:
+    cpy #PROJECT_PLAYER_PROJECTILE_LIMIT
+    bcs @done
     ldx #0
 @find_slot:
     cpx #MAX_BULLETS
@@ -609,38 +1016,20 @@ SpawnBullet:
 @spawn_here:
     lda #$01
     sta bullet_active, x
-    lda player_facing
+    lda player_aim_dir
     sta bullet_dir, x
     rep #$20
 .a16
     lda player_x
     clc
-    adc #14
+    adc #8
     sta temp16
     lda player_y
     clc
-    adc #6
+    adc #8
     sta temp16_b
     sep #$20
 .a8
-    lda player_facing
-    beq @store
-    lda temp16
-    cmp #4
-    bcs @shift_left
-    lda #0
-    sta temp16
-    bra @store
-@shift_left:
-    rep #$20
-.a16
-    lda temp16
-    sec
-    sbc #4
-    sta temp16
-    sep #$20
-.a8
-@store:
     lda temp16
     sta bullet_x_lo, x
     lda temp16+1
@@ -649,7 +1038,213 @@ SpawnBullet:
     sta bullet_y_lo, x
     lda temp16_b+1
     sta bullet_y_hi, x
+    jsr ConfigureBulletVelocity
+    lda #PROJECT_PLAYER_FIRE_COOLDOWN_FRAMES
+    sta player_fire_cooldown
 @done:
+    rts
+
+ConfigureBulletVelocity:
+    stz bullet_dx, x
+    stz bullet_dy, x
+    lda bullet_dir, x
+    cmp #DIR_RIGHT
+    beq @right
+    cmp #DIR_LEFT
+    beq @left
+    cmp #DIR_UP
+    beq @up
+    cmp #DIR_UP_RIGHT
+    beq @up_right
+    cmp #DIR_UP_LEFT
+    beq @up_left
+    cmp #DIR_DOWN_RIGHT
+    beq @down_right
+    cmp #DIR_DOWN_LEFT
+    beq @down_left
+    lda #PROJECT_PLAYER_PROJECTILE_SPEED
+    sta bullet_dy, x
+    rts
+@right:
+    lda #PROJECT_PLAYER_PROJECTILE_SPEED
+    sta bullet_dx, x
+    rts
+@left:
+    lda #(($100 - PROJECT_PLAYER_PROJECTILE_SPEED) & $FF)
+    sta bullet_dx, x
+    rts
+@up:
+    lda #(($100 - PROJECT_PLAYER_PROJECTILE_SPEED) & $FF)
+    sta bullet_dy, x
+    rts
+@up_right:
+    lda #PROJECT_PLAYER_PROJECTILE_SPEED
+    sta bullet_dx, x
+    lda #(($100 - PROJECT_PLAYER_PROJECTILE_SPEED) & $FF)
+    sta bullet_dy, x
+    rts
+@up_left:
+    lda #(($100 - PROJECT_PLAYER_PROJECTILE_SPEED) & $FF)
+    sta bullet_dx, x
+    lda #(($100 - PROJECT_PLAYER_PROJECTILE_SPEED) & $FF)
+    sta bullet_dy, x
+    rts
+@down_right:
+    lda #PROJECT_PLAYER_PROJECTILE_SPEED
+    sta bullet_dx, x
+    lda #PROJECT_PLAYER_PROJECTILE_SPEED
+    sta bullet_dy, x
+    rts
+@down_left:
+    lda #(($100 - PROJECT_PLAYER_PROJECTILE_SPEED) & $FF)
+    sta bullet_dx, x
+    lda #PROJECT_PLAYER_PROJECTILE_SPEED
+    sta bullet_dy, x
+    rts
+
+ApplyBulletVelocity:
+    lda bullet_dx, x
+    beq @move_y
+    bmi @move_left
+    clc
+    adc bullet_x_lo, x
+    sta bullet_x_lo, x
+    lda bullet_x_hi, x
+    adc #0
+    sta bullet_x_hi, x
+    bra @move_y
+@move_left:
+    eor #$FF
+    clc
+    adc #1
+    sta temp16
+    lda bullet_x_lo, x
+    cmp temp16
+    bcs @store_left
+    sec
+    rts
+@store_left:
+    sec
+    sbc temp16
+    sta bullet_x_lo, x
+    lda bullet_x_hi, x
+    sbc #0
+    sta bullet_x_hi, x
+
+@move_y:
+    lda bullet_dy, x
+    beq @done
+    bmi @move_up
+    clc
+    adc bullet_y_lo, x
+    sta bullet_y_lo, x
+    lda bullet_y_hi, x
+    adc #0
+    sta bullet_y_hi, x
+    bra @done
+@move_up:
+    eor #$FF
+    clc
+    adc #1
+    sta temp16
+    lda bullet_y_lo, x
+    cmp temp16
+    bcs @store_up
+    sec
+    rts
+@store_up:
+    sec
+    sbc temp16
+    sta bullet_y_lo, x
+    lda bullet_y_hi, x
+    sbc #0
+    sta bullet_y_hi, x
+@done:
+    clc
+    rts
+
+CheckBulletWorldBounds:
+    lda bullet_x_hi, x
+    bmi @out
+    lda bullet_y_hi, x
+    bmi @out
+    lda bullet_x_hi, x
+    cmp #>(PROJECT_WORLD_WIDTH_PIXELS)
+    bcc @check_y
+    bne @out
+    lda bullet_x_lo, x
+    cmp #<(PROJECT_WORLD_WIDTH_PIXELS)
+    bcc @check_y
+    bra @out
+@check_y:
+    lda bullet_y_hi, x
+    cmp #>(PROJECT_WORLD_HEIGHT_PIXELS)
+    bcc @inside
+    bne @out
+    lda bullet_y_lo, x
+    cmp #<(PROJECT_WORLD_HEIGHT_PIXELS)
+    bcc @inside
+@out:
+    sec
+    rts
+@inside:
+    clc
+    rts
+
+JumpPressed:
+    jsr JumpHeld
+    bcc @no
+    lda prev_joypad_low
+    and #$80
+    bne @no
+    lda prev_joypad_high
+    and #$80
+    bne @no
+    sec
+    rts
+@no:
+    clc
+    rts
+
+JumpHeld:
+    lda joypad_low
+    and #$80
+    bne @yes
+    lda joypad_high
+    and #$80
+    bne @yes
+    clc
+    rts
+@yes:
+    sec
+    rts
+
+ShootPressed:
+    jsr ShootHeld
+    bcc @no
+    lda prev_joypad_low
+    and #$40
+    bne @no
+    lda prev_joypad_high
+    and #$40
+    bne @no
+    sec
+    rts
+@no:
+    clc
+    rts
+
+ShootHeld:
+    lda joypad_low
+    and #$40
+    bne @yes
+    lda joypad_high
+    and #$40
+    bne @yes
+    clc
+    rts
+@yes:
+    sec
     rts
 
 UpdateEntityInteractions:
@@ -932,7 +1527,7 @@ DrawPlayer:
     sta draw_visual_index
     bra @visual_ready
 @check_idle_blink:
-    lda joypad_high
+    lda joypad_low
     and #$03
     bne @visual_ready
     lda player_on_ground
@@ -982,7 +1577,18 @@ DrawBullets:
     lda #PROJECT_BULLET_VISUAL
     sta draw_visual_index
     lda bullet_dir, x
+    cmp #DIR_LEFT
+    beq @face_left
+    cmp #DIR_UP_LEFT
+    beq @face_left
+    cmp #DIR_DOWN_LEFT
+    beq @face_left
+    stz draw_facing
+    bra @draw_bullet
+@face_left:
+    lda #$01
     sta draw_facing
+@draw_bullet:
     jsr DrawVisualAtBase
     bra @next
 @skip:
@@ -1267,6 +1873,410 @@ UploadOam:
     sta $4306
     lda #$01
     sta $420B
+    rts
+
+ResolvePlayerHorizontalTiles:
+    jsr PlayerOverlapsSolid
+    bcc @done
+    rep #$20
+.a16
+    lda player_x
+    cmp player_prev_x
+    beq @restore
+    bcc @move_left
+@move_right:
+@right_loop:
+    lda player_x
+    beq @restore
+    dec
+    sta player_x
+    sep #$20
+.a8
+    jsr PlayerOverlapsSolid
+    bcs @right_continue
+    rep #$20
+.a16
+    stz player_vx
+    stz player_subx
+    sep #$20
+.a8
+    rts
+@right_continue:
+    rep #$20
+.a16
+    bra @right_loop
+@move_left:
+@left_loop:
+    lda player_x
+    cmp #PROJECT_PLAYER_MAX_X
+    bcs @restore
+    inc
+    sta player_x
+    sep #$20
+.a8
+    jsr PlayerOverlapsSolid
+    bcs @left_continue
+    rep #$20
+.a16
+    stz player_vx
+    stz player_subx
+    sep #$20
+.a8
+    rts
+@left_continue:
+    rep #$20
+.a16
+    bra @left_loop
+@restore:
+    lda player_prev_x
+    sta player_x
+    stz player_vx
+    stz player_subx
+    sep #$20
+.a8
+@done:
+    rts
+
+ResolvePlayerVerticalTiles:
+    rep #$20
+.a16
+    lda player_y
+    bmi @clamp_top
+    cmp #(PROJECT_WORLD_HEIGHT_PIXELS - PLAYER_HEIGHT)
+    bcc @check_overlap
+    lda #(PROJECT_WORLD_HEIGHT_PIXELS - PLAYER_HEIGHT)
+    sta player_y
+    stz player_vy
+    stz player_suby
+    sep #$20
+.a8
+    lda #$01
+    sta player_on_ground
+    rts
+@clamp_top:
+    lda #0
+    sta player_y
+    stz player_vy
+    stz player_suby
+    sep #$20
+.a8
+    stz player_on_ground
+    rts
+@check_overlap:
+    sep #$20
+.a8
+    jsr PlayerOverlapsSolid
+    bcc @check_ground
+    rep #$20
+.a16
+    lda player_y
+    cmp player_prev_y
+    bcc @move_up
+@move_down_loop:
+    lda player_y
+    beq @down_done
+    dec
+    sta player_y
+    sep #$20
+.a8
+    jsr PlayerOverlapsSolid
+    bcs @down_continue
+@down_done:
+    stz player_vy
+    stz player_suby
+    lda #$01
+    sta player_on_ground
+    rts
+@down_continue:
+    rep #$20
+.a16
+    bra @move_down_loop
+@move_up:
+@move_up_loop:
+    lda player_y
+    inc
+    sta player_y
+    sep #$20
+.a8
+    jsr PlayerOverlapsSolid
+    bcs @up_continue
+    stz player_vy
+    stz player_suby
+    stz player_on_ground
+    rts
+@up_continue:
+    rep #$20
+.a16
+    bra @move_up_loop
+@check_ground:
+    jsr PlayerTouchesSolidBelow
+    bcc @airborne
+    lda #$01
+    sta player_on_ground
+    rts
+@airborne:
+    stz player_on_ground
+    rts
+
+CheckPlayerHazards:
+    lda player_invuln
+    bne @done
+    jsr PlayerOverlapsHazard
+    bcc @done
+    lda #1
+    jsr DamagePlayer
+@done:
+    rts
+
+PlayerTouchesSolidBelow:
+    rep #$20
+.a16
+    lda player_x
+    sta temp16
+    lda player_y
+    clc
+    adc #PLAYER_HEIGHT
+    sta temp16_b
+    sep #$20
+.a8
+    jsr GetTileFlagsAtPoint
+    and #COLLISION_SOLID
+    bne @yes
+    rep #$20
+.a16
+    lda player_x
+    clc
+    adc #(PLAYER_WIDTH - 1)
+    sta temp16
+    lda player_y
+    clc
+    adc #PLAYER_HEIGHT
+    sta temp16_b
+    sep #$20
+.a8
+    jsr GetTileFlagsAtPoint
+    and #COLLISION_SOLID
+    bne @yes
+    clc
+    rts
+@yes:
+    sec
+    rts
+
+PlayerOverlapsSolid:
+    rep #$20
+.a16
+    lda player_x
+    sta temp16
+    lda player_y
+    sta temp16_b
+    sep #$20
+.a8
+    jsr GetTileFlagsAtPoint
+    and #COLLISION_SOLID
+    bne @yes
+    rep #$20
+.a16
+    lda player_x
+    clc
+    adc #(PLAYER_WIDTH - 1)
+    sta temp16
+    lda player_y
+    sta temp16_b
+    sep #$20
+.a8
+    jsr GetTileFlagsAtPoint
+    and #COLLISION_SOLID
+    bne @yes
+    rep #$20
+.a16
+    lda player_x
+    sta temp16
+    lda player_y
+    clc
+    adc #(PLAYER_HEIGHT - 1)
+    sta temp16_b
+    sep #$20
+.a8
+    jsr GetTileFlagsAtPoint
+    and #COLLISION_SOLID
+    bne @yes
+    rep #$20
+.a16
+    lda player_x
+    clc
+    adc #(PLAYER_WIDTH - 1)
+    sta temp16
+    lda player_y
+    clc
+    adc #(PLAYER_HEIGHT - 1)
+    sta temp16_b
+    sep #$20
+.a8
+    jsr GetTileFlagsAtPoint
+    and #COLLISION_SOLID
+    bne @yes
+    clc
+    rts
+@yes:
+    sec
+    rts
+
+PlayerOverlapsLadder:
+    rep #$20
+.a16
+    lda player_x
+    sta temp16
+    lda player_y
+    sta temp16_b
+    sep #$20
+.a8
+    jsr GetTileFlagsAtPoint
+    and #COLLISION_LADDER
+    bne @yes
+    rep #$20
+.a16
+    lda player_x
+    clc
+    adc #(PLAYER_WIDTH - 1)
+    sta temp16
+    lda player_y
+    sta temp16_b
+    sep #$20
+.a8
+    jsr GetTileFlagsAtPoint
+    and #COLLISION_LADDER
+    bne @yes
+    rep #$20
+.a16
+    lda player_x
+    sta temp16
+    lda player_y
+    clc
+    adc #(PLAYER_HEIGHT - 1)
+    sta temp16_b
+    sep #$20
+.a8
+    jsr GetTileFlagsAtPoint
+    and #COLLISION_LADDER
+    bne @yes
+    rep #$20
+.a16
+    lda player_x
+    clc
+    adc #(PLAYER_WIDTH - 1)
+    sta temp16
+    lda player_y
+    clc
+    adc #(PLAYER_HEIGHT - 1)
+    sta temp16_b
+    sep #$20
+.a8
+    jsr GetTileFlagsAtPoint
+    and #COLLISION_LADDER
+    bne @yes
+    clc
+    rts
+@yes:
+    sec
+    rts
+
+PlayerOverlapsHazard:
+    rep #$20
+.a16
+    lda player_x
+    sta temp16
+    lda player_y
+    sta temp16_b
+    sep #$20
+.a8
+    jsr GetTileFlagsAtPoint
+    and #COLLISION_HAZARD
+    bne @yes
+    rep #$20
+.a16
+    lda player_x
+    clc
+    adc #(PLAYER_WIDTH - 1)
+    sta temp16
+    lda player_y
+    sta temp16_b
+    sep #$20
+.a8
+    jsr GetTileFlagsAtPoint
+    and #COLLISION_HAZARD
+    bne @yes
+    rep #$20
+.a16
+    lda player_x
+    sta temp16
+    lda player_y
+    clc
+    adc #(PLAYER_HEIGHT - 1)
+    sta temp16_b
+    sep #$20
+.a8
+    jsr GetTileFlagsAtPoint
+    and #COLLISION_HAZARD
+    bne @yes
+    rep #$20
+.a16
+    lda player_x
+    clc
+    adc #(PLAYER_WIDTH - 1)
+    sta temp16
+    lda player_y
+    clc
+    adc #(PLAYER_HEIGHT - 1)
+    sta temp16_b
+    sep #$20
+.a8
+    jsr GetTileFlagsAtPoint
+    and #COLLISION_HAZARD
+    bne @yes
+    clc
+    rts
+@yes:
+    sec
+    rts
+
+GetTileFlagsAtPoint:
+    rep #$20
+.a16
+    lda temp16
+    bmi @solid
+    cmp #PROJECT_WORLD_WIDTH_PIXELS
+    bcs @solid
+    lda temp16_b
+    bmi @solid
+    cmp #PROJECT_WORLD_HEIGHT_PIXELS
+    bcs @solid
+    lda temp16_b
+    lsr
+    lsr
+    lsr
+    asl
+    asl
+    asl
+    asl
+    asl
+    asl
+    sta temp16_c
+    lda temp16
+    lsr
+    lsr
+    lsr
+    clc
+    adc temp16_c
+    tax
+    sep #$20
+.a8
+    lda PROJECT_COLLISION_FLAG_BYTES, x
+    rts
+@solid:
+    sep #$20
+.a8
+    lda #COLLISION_SOLID
     rts
 
 BuildEntityRect:

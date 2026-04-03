@@ -1,0 +1,13 @@
+(
+    id: "player_idle",
+    frames: [
+        (
+            metasprite_id: "player_idle",
+            duration_frames: 10,
+        ),
+        (
+            metasprite_id: "player_idle_burst",
+            duration_frames: 6,
+        ),
+    ],
+)

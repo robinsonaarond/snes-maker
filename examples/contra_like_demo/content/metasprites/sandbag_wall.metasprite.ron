@@ -1,0 +1,38 @@
+(
+    id: "sandbag_wall",
+    palette_id: "contra_palette",
+    pieces: [
+        (
+            tile_index: 11,
+            x: 0,
+            y: 0,
+            palette_slot: 0,
+            h_flip: false,
+            v_flip: false,
+        ),
+        (
+            tile_index: 11,
+            x: 8,
+            y: 0,
+            palette_slot: 0,
+            h_flip: false,
+            v_flip: false,
+        ),
+        (
+            tile_index: 12,
+            x: 0,
+            y: 8,
+            palette_slot: 0,
+            h_flip: false,
+            v_flip: false,
+        ),
+        (
+            tile_index: 12,
+            x: 8,
+            y: 8,
+            palette_slot: 0,
+            h_flip: false,
+            v_flip: false,
+        ),
+    ],
+)

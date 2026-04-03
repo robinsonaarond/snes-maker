@@ -1,0 +1,38 @@
+(
+    id: "blast_gate",
+    palette_id: "contra_palette",
+    pieces: [
+        (
+            tile_index: 41,
+            x: 0,
+            y: 0,
+            palette_slot: 0,
+            h_flip: false,
+            v_flip: false,
+        ),
+        (
+            tile_index: 42,
+            x: 8,
+            y: 0,
+            palette_slot: 0,
+            h_flip: false,
+            v_flip: false,
+        ),
+        (
+            tile_index: 43,
+            x: 0,
+            y: 8,
+            palette_slot: 0,
+            h_flip: false,
+            v_flip: false,
+        ),
+        (
+            tile_index: 44,
+            x: 8,
+            y: 8,
+            palette_slot: 0,
+            h_flip: false,
+            v_flip: false,
+        ),
+    ],
+)

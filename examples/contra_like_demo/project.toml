@@ -1,0 +1,60 @@
+[meta]
+name = "Contra Like Demo"
+slug = "contra_like_demo"
+version = "0.1.0"
+default_genre = "SideScroller"
+
+[build]
+mapper = "LoRom"
+region = "Ntsc"
+rom_bank_count = 8
+output_dir = "build"
+
+[build.assembler]
+ca65_path = "ca65"
+ld65_path = "ld65"
+
+[editor]
+strict_mode = true
+show_budget_overlay = true
+preferred_emulator = "ares"
+
+[gameplay]
+entry_scene = "jungle_assault"
+
+[[gameplay.physics_presets]]
+id = "contra_like"
+family = "Custom"
+gravity_fp = 80
+max_fall_speed_fp = 1152
+ground_accel_fp = 76
+air_accel_fp = 52
+max_run_speed_fp = 520
+jump_velocity_fp = -930
+coyote_frames = 2
+jump_buffer_frames = 2
+ladder_speed_fp = 224
+
+[[gameplay.physics_presets]]
+id = "megaman_like"
+family = "Custom"
+gravity_fp = 80
+max_fall_speed_fp = 1152
+ground_accel_fp = 76
+air_accel_fp = 52
+max_run_speed_fp = 520
+jump_velocity_fp = -930
+coyote_frames = 2
+jump_buffer_frames = 2
+ladder_speed_fp = 224
+
+[gameplay.player]
+max_health = 6
+starting_health = 4
+health_hud = "CellsTopCenter"
+
+[gameplay.player.combat]
+aim_mode = "EightWay"
+projectile_limit = 6
+projectile_speed = 5
+fire_cooldown_frames = 6

@@ -1,0 +1,22 @@
+(
+    id: "mission_briefing",
+    opening_node: "orders",
+    nodes: [
+        (
+            id: "orders",
+            speaker: "Command",
+            text: "Push east through the jungle outpost. Clear the patrols and hit the red consoles to unlock each blast gate.",
+            commands: [],
+            choices: [],
+            next: Some("support"),
+        ),
+        (
+            id: "support",
+            speaker: "Command",
+            text: "Field kits restore health. Reach the extraction pad on the far right when the base line collapses.",
+            commands: [],
+            choices: [],
+            next: None,
+        ),
+    ],
+)

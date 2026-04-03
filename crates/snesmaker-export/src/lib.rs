@@ -7,9 +7,9 @@ use camino::{Utf8Path, Utf8PathBuf};
 use serde::{Deserialize, Serialize};
 use snesmaker_platformer::PlatformerGenreModule;
 use snesmaker_project::{
-    AnimationResource, CompiledScene, EntityAction, EntityKind, GenreModule, HealthHudStyle,
-    MetaspriteResource, MovementPattern, PaletteResource, ProjectBundle, SceneResource, Tile8,
-    TileLayer, TilesetResource,
+    AimMode, AnimationResource, CompiledScene, EntityAction, EntityKind, GenreModule,
+    HealthHudStyle, MetaspriteResource, MovementPattern, PhysicsProfile, PaletteResource,
+    ProjectBundle, SceneResource, Tile8, TileLayer, TilesetResource,
 };
 use snesmaker_validator::{ValidationReport, validate_project};
 
@@ -218,6 +218,8 @@ fn write_generated_project_data(
 ) -> Result<()> {
     let bg_assets = build_bg_assets(bundle)?;
     let player_assets = build_player_assets(bundle)?;
+    let physics_profile = selected_physics_profile(bundle);
+    let combat_settings = &bundle.manifest.gameplay.player.combat;
     let mut text = String::new();
     text.push_str("PROJECT_TITLE_DATA:\n");
     text.push_str(&format_byte_directive(
@@ -268,6 +270,23 @@ fn write_generated_project_data(
     text.push_str(&format_byte_directive(
         "    .byte ",
         &bg_assets.tilemap_bytes,
+    ));
+    text.push_str(&format!(
+        "PROJECT_COLLISION_MAP_WIDTH_TILES = {}\n",
+        bg_assets.map_width_tiles
+    ));
+    text.push_str(&format!(
+        "PROJECT_COLLISION_MAP_HEIGHT_TILES = {}\n",
+        bg_assets.map_height_tiles
+    ));
+    text.push_str(&format!(
+        "PROJECT_COLLISION_FLAG_BYTE_LEN = {}\n",
+        bg_assets.collision_flag_bytes.len()
+    ));
+    text.push_str("PROJECT_COLLISION_FLAG_BYTES:\n");
+    text.push_str(&format_byte_directive(
+        "    .byte ",
+        &bg_assets.collision_flag_bytes,
     ));
     text.push_str(&format!(
         "PROJECT_OBJ_PALETTE_BYTE_LEN = {}\n",
@@ -322,6 +341,10 @@ fn write_generated_project_data(
         player_assets.world_width_pixels
     ));
     text.push_str(&format!(
+        "PROJECT_WORLD_HEIGHT_PIXELS = {}\n",
+        bg_assets.map_height_tiles * 8
+    ));
+    text.push_str(&format!(
         "PROJECT_PLAYER_MAX_X = {}\n",
         player_assets.player_max_x
     ));
@@ -368,6 +391,58 @@ fn write_generated_project_data(
     text.push_str(&format!(
         "PROJECT_PLAYER_STARTING_HEALTH = {}\n",
         player_assets.player_starting_health
+    ));
+    text.push_str(&format!(
+        "PROJECT_PHYSICS_GRAVITY_FP = {}\n",
+        physics_profile.gravity_fp
+    ));
+    text.push_str(&format!(
+        "PROJECT_PHYSICS_MAX_FALL_SPEED_FP = {}\n",
+        physics_profile.max_fall_speed_fp
+    ));
+    text.push_str(&format!(
+        "PROJECT_PHYSICS_GROUND_ACCEL_FP = {}\n",
+        physics_profile.ground_accel_fp
+    ));
+    text.push_str(&format!(
+        "PROJECT_PHYSICS_AIR_ACCEL_FP = {}\n",
+        physics_profile.air_accel_fp
+    ));
+    text.push_str(&format!(
+        "PROJECT_PHYSICS_MAX_RUN_SPEED_FP = {}\n",
+        physics_profile.max_run_speed_fp
+    ));
+    text.push_str(&format!(
+        "PROJECT_PHYSICS_JUMP_VELOCITY_FP = {}\n",
+        physics_profile.jump_velocity_fp
+    ));
+    text.push_str(&format!(
+        "PROJECT_PHYSICS_COYOTE_FRAMES = {}\n",
+        physics_profile.coyote_frames
+    ));
+    text.push_str(&format!(
+        "PROJECT_PHYSICS_JUMP_BUFFER_FRAMES = {}\n",
+        physics_profile.jump_buffer_frames
+    ));
+    text.push_str(&format!(
+        "PROJECT_PHYSICS_LADDER_SPEED_FP = {}\n",
+        physics_profile.ladder_speed_fp
+    ));
+    text.push_str(&format!(
+        "PROJECT_PLAYER_AIM_MODE = {}\n",
+        encode_aim_mode(combat_settings.aim_mode)
+    ));
+    text.push_str(&format!(
+        "PROJECT_PLAYER_PROJECTILE_LIMIT = {}\n",
+        combat_settings.projectile_limit.clamp(1, 8)
+    ));
+    text.push_str(&format!(
+        "PROJECT_PLAYER_PROJECTILE_SPEED = {}\n",
+        combat_settings.projectile_speed.max(1)
+    ));
+    text.push_str(&format!(
+        "PROJECT_PLAYER_FIRE_COOLDOWN_FRAMES = {}\n",
+        combat_settings.fire_cooldown_frames
     ));
     text.push_str(&format!(
         "PROJECT_HEALTH_HUD_STYLE = {}\n",
@@ -640,6 +715,7 @@ struct BgAssets {
     palette_bytes: Vec<u8>,
     tile_bytes: Vec<u8>,
     tilemap_bytes: Vec<u8>,
+    collision_flag_bytes: Vec<u8>,
     map_width_tiles: usize,
     map_height_tiles: usize,
     max_scroll_x_pixels: usize,
@@ -717,6 +793,7 @@ fn build_bg_assets(bundle: &ProjectBundle) -> Result<BgAssets> {
     let palette_bytes = encode_palette_bytes(palette);
     let tile_bytes = encode_4bpp_tiles(tileset)?;
     let tilemap = build_display_tilemap(&scene, layer, tileset)?;
+    let collision_flag_bytes = build_display_collision_flags(&scene)?;
     let tilemap_bytes = tilemap
         .iter()
         .flat_map(|entry| entry.to_le_bytes())
@@ -728,6 +805,7 @@ fn build_bg_assets(bundle: &ProjectBundle) -> Result<BgAssets> {
         palette_bytes,
         tile_bytes,
         tilemap_bytes,
+        collision_flag_bytes,
         map_width_tiles: DISPLAY_MAP_WIDTH_TILES,
         map_height_tiles: DISPLAY_MAP_HEIGHT_TILES,
         max_scroll_x_pixels,
@@ -932,6 +1010,24 @@ fn build_player_assets(bundle: &ProjectBundle) -> Result<PlayerAssets> {
         world_width_pixels,
         player_max_x: world_width_pixels.saturating_sub(16),
     })
+}
+
+fn selected_physics_profile(bundle: &ProjectBundle) -> PhysicsProfile {
+    bundle
+        .manifest
+        .gameplay
+        .physics_presets
+        .first()
+        .cloned()
+        .unwrap_or_else(snesmaker_project::default_megaman_like_physics)
+}
+
+fn encode_aim_mode(mode: AimMode) -> u8 {
+    match mode {
+        AimMode::ForwardOnly => 0,
+        AimMode::FourWay => 1,
+        AimMode::EightWay => 2,
+    }
 }
 
 fn encode_palette_bytes(palette: &PaletteResource) -> Vec<u8> {
@@ -1150,6 +1246,54 @@ fn build_display_tilemap(
                 32 * 32 + y * 32 + (x - 32)
             };
             entries[screen_index] = tile_index;
+        }
+    }
+
+    Ok(entries)
+}
+
+fn build_display_collision_flags(scene: &SceneResource) -> Result<Vec<u8>> {
+    let src_width = scene.size_tiles.width as usize;
+    let src_height = scene.size_tiles.height as usize;
+    if src_width == 0 || src_height == 0 {
+        bail!("scene '{}' has an invalid zero-sized collision map", scene.id);
+    }
+
+    let mut entries = vec![0_u8; DISPLAY_MAP_WIDTH_TILES * DISPLAY_MAP_HEIGHT_TILES];
+    for y in 0..DISPLAY_MAP_HEIGHT_TILES {
+        let src_y = (y * src_height) / DISPLAY_MAP_HEIGHT_TILES;
+        for x in 0..DISPLAY_MAP_WIDTH_TILES {
+            let src_x = (x * src_width) / DISPLAY_MAP_WIDTH_TILES;
+            let source_index = src_y * src_width + src_x;
+            let mut flags = 0_u8;
+            if scene
+                .collision
+                .solids
+                .get(source_index)
+                .copied()
+                .unwrap_or(false)
+            {
+                flags |= 0x01;
+            }
+            if scene
+                .collision
+                .ladders
+                .get(source_index)
+                .copied()
+                .unwrap_or(false)
+            {
+                flags |= 0x02;
+            }
+            if scene
+                .collision
+                .hazards
+                .get(source_index)
+                .copied()
+                .unwrap_or(false)
+            {
+                flags |= 0x04;
+            }
+            entries[y * DISPLAY_MAP_WIDTH_TILES + x] = flags;
         }
     }
 
@@ -1437,6 +1581,60 @@ mod tests {
                 .expect("build runtime visual");
 
         assert_eq!(visual.pieces[0].attr, 0xDA);
+    }
+
+    #[test]
+    fn builds_display_collision_flags_from_scene_collision() {
+        let mut bundle = snesmaker_project::demo_bundle();
+        let scene = bundle.scenes.first_mut().expect("demo scene");
+        scene.size_tiles = snesmaker_project::GridSize {
+            width: 2,
+            height: 2,
+        };
+        scene.layers[0].tiles = vec![0; 4];
+        scene.collision.solids = vec![true, false, false, false];
+        scene.collision.ladders = vec![false, true, false, false];
+        scene.collision.hazards = vec![false, false, true, false];
+
+        let flags = build_display_collision_flags(scene).expect("collision flags");
+
+        assert_eq!(flags.len(), DISPLAY_MAP_WIDTH_TILES * DISPLAY_MAP_HEIGHT_TILES);
+        assert_eq!(flags[0], 0x01);
+        assert_eq!(flags[DISPLAY_MAP_WIDTH_TILES / 2], 0x02);
+        assert_eq!(flags[(DISPLAY_MAP_HEIGHT_TILES / 2) * DISPLAY_MAP_WIDTH_TILES], 0x04);
+    }
+
+    #[test]
+    fn selects_first_manifest_physics_profile_for_rom_runtime() {
+        let mut bundle = snesmaker_project::demo_bundle();
+        bundle.manifest.gameplay.physics_presets = vec![
+            snesmaker_project::PhysicsProfile {
+                id: "contra_like".to_string(),
+                family: snesmaker_project::PhysicsFamily::Custom,
+                gravity_fp: 99,
+                max_fall_speed_fp: 888,
+                ground_accel_fp: 77,
+                air_accel_fp: 55,
+                max_run_speed_fp: 666,
+                jump_velocity_fp: -777,
+                coyote_frames: 2,
+                jump_buffer_frames: 3,
+                ladder_speed_fp: 222,
+            },
+            snesmaker_project::default_megaman_like_physics(),
+        ];
+
+        let selected = selected_physics_profile(&bundle);
+
+        assert_eq!(selected.id, "contra_like");
+        assert_eq!(selected.max_run_speed_fp, 666);
+    }
+
+    #[test]
+    fn encodes_aim_modes_for_generated_project_data() {
+        assert_eq!(encode_aim_mode(AimMode::ForwardOnly), 0);
+        assert_eq!(encode_aim_mode(AimMode::FourWay), 1);
+        assert_eq!(encode_aim_mode(AimMode::EightWay), 2);
     }
 
     #[test]

@@ -1,0 +1,14 @@
+(
+    id: "ration_pack",
+    palette_id: "contra_palette",
+    pieces: [
+        (
+            tile_index: 39,
+            x: 0,
+            y: 0,
+            palette_slot: 0,
+            h_flip: false,
+            v_flip: false,
+        ),
+    ],
+)
